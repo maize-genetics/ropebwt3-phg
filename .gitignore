@@ -5,3 +5,9 @@ Makefile.bak
 
 # compiled binary
 /ropebwt3
+
+# generated example index artifacts
+docs/examples/*.fmd
+docs/examples/*.fmd.ssa
+docs/examples/*.fmd.len.gz
+.DS_Store

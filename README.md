@@ -164,6 +164,9 @@ Options:
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
 
+See [docs/usage.md](docs/usage.md) for a full guide and a runnable example
+([docs/examples/](docs/examples/), `sh docs/examples/run.sh`).
+
 ### <a name="build"></a>Indexing
 
 Ropebwt3 implements two algorithms for BWT construction. Although both
