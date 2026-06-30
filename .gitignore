@@ -20,3 +20,6 @@ experiments/ref-sensitivity/data/
 experiments/ref-sensitivity/e4/*.fa
 experiments/ref-sensitivity/e4/*.mem
 experiments/ref-sensitivity/e4/*.time
+experiments/ref-sensitivity/e4/*.tsv
+experiments/ref-sensitivity/e4/__pycache__/
+experiments/ref-sensitivity/e4/param_log.txt
