@@ -50,6 +50,28 @@ reads skip the walk). The walk itself is untouched — the real speed lever is t
 planned **E4 synteny prior** (use the carrier coordinate the SSA already returns
 to skip/shorten the walk and reject off-diagonal carriers).
 
+## `--max-occ` sweep (knee finding)
+
+precision = correct/placed; recall = correct/100k; B73ctrl = B73-control %correct.
+
+| --max-occ | solo prec | solo recall | +two-flank prec | +two-flank recall | B73 ctrl |
+|---:|---:|---:|---:|---:|---:|
+| 3 | 85.9% | 37.5% | 96.9% | 31.6% | 68.7% |
+| **4** (=#taxa) | 84.2% | **54.0%** | **96.0%** | 45.5% | 81.3% |
+| 6 | 76.6% | 55.3% | 94.2% | 47.1% | 83.3% |
+| 8 | 72.5% | 55.8% | 92.6% | 48.0% | 84.4% |
+| 12 | 68.5% | 55.9% | 90.4% | 48.6% | 85.2% |
+| 16 | 66.5% | 56.0% | 89.0% | 48.9% | 85.6% |
+
+**Verdict: `--max-occ = n_taxa` (auto default) is the knee.** Recall plateaus at
+occ=4 (solo 54.0% → only 56.0% at occ=16) while precision falls steadily
+(84→66%) — reads occurring 5–16× are overwhelmingly repeats that place wrong, so
+raising the cap buys wrong placements, not recall. The earlier guess that a
+higher cap would recover recall was wrong. The one real lever: with `--two-flank`,
+occ 6–8 trades ~3 pt precision for ~2.5 pt recall and recovers a little B73
+control (81→84%) — a recall-leaning operating point if wanted. Default stays
+`auto` (=4 here).
+
 ---
 
 # E0 baseline — full result
