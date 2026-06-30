@@ -7,14 +7,28 @@ reads (25k/line, seed 7), `-t 20`. The scoreboards accumulate one row per varian
 
 ## Scoreboard — sensitivity (tol ±5 Mb)
 
-| ID | Variant | %correct (ALL) | B73 ctrl | carriers | wrong-chr | unplaced | precision\* |
-|---|---|---:|---:|---:|---:|---:|---:|
-| **E0** | baseline | **54.55%** | 86.64% | 43.85% | 35,768 | 4,782 | 54.9% |
-| E1 | + two-flank concordance | _tbd_ | | | | | |
-| E2 | + uniqueness `--max-occ` | _tbd_ | | | | | |
-| E3 | E1 + E2 | _tbd_ | | | | | |
+precision = correct / placed; recall = correct / 100,000; placed = reads asserting
+a coordinate (not UNPLACED/MULTI). Canonical numbers from `analyze.py` ALL row.
 
-\*precision = correct / (reads − UNPLACED) = 54,545 / 99,274.
+| ID | Variant | placed | correct | wrong-chr | **precision** | recall |
+|---|---|---:|---:|---:|---:|---:|
+| **E0** | baseline | 95,218 | 54,545 | 35,768 | **57.3%** | 54.6% |
+| **E1** | `--two-flank` | 66,555 | 49,736 | 14,263 | **74.7%** | 49.7% |
+| **E2** | `--max-occ=4` | 56,858 | 50,083 | 5,219 | **88.1%** | 50.1% |
+| **E3** | `--two-flank --max-occ=4` | 47,337 | 45,459 | **920** | **96.0%** | 45.5% |
+| E4 | + synteny prior (planned) | _tbd_ | | | | |
+
+**Takeaways.** Both fixes do exactly what the diagnosis predicted, and stack:
+- **E1** removes `ONE_SIDE`: wrong-chr 35.8k → 14.3k (−60%), precision 57→75%, at
+  ~10% recall cost.
+- **E2** removes retro/repeat reads (18,062 flagged `MULTI`): wrong-chr → 5.2k
+  (−85%) at almost **no** recall cost (54.5→50.1%) — repeats were nearly all
+  wrong anyway, so filtering them is close to free. Best precision-per-recall.
+- **E3** (both): wrong-chr **35,768 → 920 (−97%)**, **precision 96.0%**, recall
+  45.5%. The right operating point for genotyping (precision ≫ recall).
+- `--max-occ=4` (= #taxa) also trims B73 control 86.6→81.3% — a few correctly
+  placed shared loci (occ 5–8) get flagged `MULTI`; a slightly higher threshold
+  would recover them. **Sweep `--max-occ ∈ {4,6,8,…}` is the obvious next tuning.**
 
 ## Scoreboard — speed (100k reads, `-t 20`)
 
@@ -23,14 +37,18 @@ reads (25k/line, seed 7), `-t 20`. The scoreboards accumulate one row per varian
 | — | `mem` (SMEM+locate) | 1.16 s | 86,207 | 973% | 11.3 | 2.1 GB | 1× |
 | — | `sw` (local align) | 9.44 s | 10,593 | 1816% | 171.4 | 2.8 GB | 8.1× |
 | **E0** | `refmap` baseline | 40.44 s | 2,473 | 1948% | 787.8 | 2.5 GB | **35× wall / 70× CPU** |
-| E1 | `refmap` + 2-flank | _tbd_ | | | | | |
-| E2 | `refmap` + max-occ | _tbd_ | | | | | |
-| E3 | `refmap` E1+E2 | _tbd_ | | | | | |
+| **E1** | `refmap --two-flank` | 39.50 s | 2,532 | — | — | — | 34× |
+| **E2** | `refmap --max-occ=4` | 37.44 s | 2,671 | — | — | — | 32× |
+| **E3** | `refmap` E1+E2 | 37.47 s | 2,669 | — | — | — | 32× |
 
 Speed read: `refmap` is ~35× slower than `mem` by wall (≈70× by CPU-seconds, since
 `mem` finishes too fast at 1.16 s to fully use 20 threads) and ~4.3× slower than
 `sw`. 60% of reads are `EXACT` (fast `mem`-like path); the wall time is paid by
-the ~40% that walk + anchor, i.e. ≈1 ms/read on the placement path.
+the ~40% that walk + anchor, i.e. ≈1 ms/read on the placement path. **The E1–E3
+precision fixes are essentially speed-neutral** (E2/E3 slightly faster: `MULTI`
+reads skip the walk). The walk itself is untouched — the real speed lever is the
+planned **E4 synteny prior** (use the carrier coordinate the SSA already returns
+to skip/shorten the walk and reject off-diagonal carriers).
 
 ---
 

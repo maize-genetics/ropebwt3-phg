@@ -143,7 +143,7 @@ def main():
     out.append("")
 
     out.append("## Status mix per line")
-    statuses = ["EXACT", "PLACED", "ONE_SIDE", "UNPLACED"]
+    statuses = ["EXACT", "PLACED", "ONE_SIDE", "MULTI", "UNPLACED"]
     out.append(f"{'line':8} " + " ".join(f"{s:>9}" for s in statuses) + f" {'avgCarr':>8}")
     for line in lines:
         n = line_total(line)

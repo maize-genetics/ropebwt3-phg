@@ -28,6 +28,9 @@ typedef struct {
 	char *ref_prefix;  // refmap: reference sequences are those whose name starts with this
 	int32_t max_walk;  // refmap: max bases to walk outward along carriers, per flank
 	int8_t walk_mode;  // refmap: RB3_WALK_*
+	int64_t max_occ;   // refmap: reject reads/anchors occurring > max_occ times (0 = off; <0 = auto = #taxa)
+	int64_t max_bracket; // refmap: reject a PLACED if |cR-cL| > max_bracket (0 = off)
+	int8_t two_flank;  // refmap: require both flanks to anchor concordantly (1 = on)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -43,6 +46,9 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->algo = RB3_SA_MEM_TG;
 	opt->max_walk = 5000;
 	opt->walk_mode = RB3_WALK_CONSENSUS;
+	opt->max_occ = 0;     // off by default (E0 baseline)
+	opt->max_bracket = 0; // off by default
+	opt->two_flank = 0;   // off by default
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -87,6 +93,7 @@ typedef struct {
 #define RB3_RM_PLACED   1
 #define RB3_RM_ONE_SIDE 2
 #define RB3_RM_EXACT    3
+#define RB3_RM_MULTI    4 // query occurs > max_occ times (repeat/retro): not placed
 
 typedef struct refmap_rst_s {
 	int8_t status;       // RB3_RM_*
@@ -293,12 +300,17 @@ static void refmap_place(void *km, const pipeline_t *p, const m_seq_t *s, const 
 	gotL = refmap_anchor_flank(km, p, Lf, Ll, 0, &sidL, &strandL, &coordL, &mlenL);
 	gotR = refmap_anchor_flank(km, p, Rf, Rl, 1, &sidR, &strandR, &coordR, &mlenR);
 	kfree(km, Lf); kfree(km, Rf);
-	if (gotL && gotR && sidL == sidR && strandL == strandR) {
+	int concord = (gotL && gotR && sidL == sidR && strandL == strandR);
+	if (concord && o->max_bracket > 0) { // E1 collinearity: the two anchors must bracket a small zone
+		int64_t lo = coordL < coordR? coordL : coordR, hi = coordL < coordR? coordR : coordL;
+		if (hi - lo > o->max_bracket) concord = 0; // anchors too far apart -> paralogous, not collinear
+	}
+	if (concord) {
 		r->status = RB3_RM_PLACED, r->ref_sid = sidL, r->strand = strandL;
 		r->cL = coordL < coordR? coordL : coordR;
 		r->cR = coordL < coordR? coordR : coordL;
 		r->ins_size = (int64_t)(Ll - mlenL) + s->len + (Rl - mlenR);
-	} else if (gotL || gotR) {
+	} else if (!o->two_flank && (gotL || gotR)) { // E1: with two_flank, a lone anchor is not trusted
 		r->status = RB3_RM_ONE_SIDE;
 		if (gotL) r->ref_sid = sidL, r->strand = strandL, r->cL = coordL;
 		else      r->ref_sid = sidR, r->strand = strandR, r->cR = coordR;
@@ -359,6 +371,10 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 		}
 	}
 	if (best_len < min_len) return 0; // too short to anchor confidently
+	// E2: the anchor must be (near-)single-copy across taxa, not a repeat. best_iv is the longest
+	// reference-matching stretch, so it has the smallest interval; if even that exceeds max_occ the
+	// flank is stuck in a repeat and the located coordinate cannot be trusted.
+	if (p->opt->max_occ > 0 && best_iv.size > p->opt->max_occ) return 0;
 	if (rb3_ssa_multi_ref(km, f, f->ssa, best_iv.x[0], best_iv.x[0] + best_iv.size, p->is_ref, 1, 1<<16, pos) <= 0)
 		return 0;
 	pos_stranded(f->sid, &pos[0], best_len, &clen, &rst, &ren);
@@ -397,6 +413,13 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		kfree(km, mem.a);
 		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
+	}
+
+	// E2: an informative read maps at most once per taxon; a read occurring > max_occ times is a
+	// repeat/retro and cannot be placed confidently (it would be reported at one arbitrary copy).
+	if (p->opt->max_occ > 0 && Iq.size > p->opt->max_occ) {
+		r->status = RB3_RM_MULTI;
+		return;
 	}
 
 	// locate a sample of occurrences; separate reference hits (exact) from carriers
@@ -514,7 +537,7 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 
 static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r)
 {
-	static const char *status_str[4] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT" };
+	static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
 	int32_t k;
 	out->l = 0;
 	write_name(out, s);
@@ -766,6 +789,9 @@ static ko_longopt_t long_options[] = {
 	{ "ref-prefix",      ko_required_argument, 307 },
 	{ "max-walk",        ko_required_argument, 308 },
 	{ "walk-mode",       ko_required_argument, 309 },
+	{ "max-occ",         ko_required_argument, 310 },
+	{ "two-flank",       ko_no_argument,       311 },
+	{ "max-bracket",     ko_required_argument, 312 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -822,6 +848,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			else if (strcmp(o.arg, "per-carrier") == 0) opt.walk_mode = RB3_WALK_PERCARRIER;
 			else { fprintf(stderr, "ERROR: --walk-mode must be consensus, strict or per-carrier\n"); return 1; }
 		}
+		else if (c == 310) opt.max_occ = atol(o.arg);     // E2: occurrence cap; <0 = auto (#taxa)
+		else if (c == 311) opt.two_flank = 1;             // E1: require both flanks to anchor
+		else if (c == 312) opt.max_bracket = rb3_parse_num(o.arg); // E1: max |cR-cL| for a PLACED
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -863,6 +892,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
 			fprintf(stderr, "  --max-walk=NUM    max bases to walk outward along carriers per flank [%d]\n", opt.max_walk);
 			fprintf(stderr, "  --walk-mode=STR   carrier path: consensus|strict|per-carrier [consensus]\n");
+			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
+			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
+			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
@@ -936,6 +968,24 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (rb3_verbose >= 3)
 			fprintf(stderr, "[M::%s] %ld of %ld sequences marked as reference\n", __func__, (long)p.n_ref, (long)p.fmi.sid->n_seq);
+		// count distinct taxa (sequence-name prefixes before '_') for the auto --max-occ default
+		if (opt.max_occ < 0) {
+			int64_t k, m, n_taxa = 0;
+			char **pre = RB3_CALLOC(char*, p.fmi.sid->n_seq);
+			for (k = 0; k < p.fmi.sid->n_seq; ++k) {
+				const char *nm = p.fmi.sid->name[k];
+				const char *us = strchr(nm, '_');
+				int32_t plen = us? (int32_t)(us - nm) : (int32_t)strlen(nm), dup = 0;
+				for (m = 0; m < n_taxa; ++m)
+					if ((int32_t)strlen(pre[m]) == plen && strncmp(pre[m], nm, plen) == 0) { dup = 1; break; }
+				if (!dup) { pre[n_taxa] = RB3_MALLOC(char, plen + 1); memcpy(pre[n_taxa], nm, plen); pre[n_taxa][plen] = 0; ++n_taxa; }
+			}
+			for (m = 0; m < n_taxa; ++m) free(pre[m]);
+			free(pre);
+			opt.max_occ = n_taxa;
+			if (rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s] auto --max-occ = %ld (distinct taxa)\n", __func__, (long)opt.max_occ);
+		}
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");

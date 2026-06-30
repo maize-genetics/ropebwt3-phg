@@ -84,12 +84,28 @@ slowdown over `mem`/`sw` quantifies the cost of the walk + flank-anchoring.
 motivated by the baseline diagnosis (see [`results-maize.md`](results-maize.md)),
 each behind a flag, re-run on the **same** index + 100k reads.
 
-| ID | Variant | Change | Hypothesis |
-|---|---|---|---|
-| **E0** | baseline | current `refmap` | reference: precision low, `ONE_SIDE` dominates error |
-| **E1** | two-flank concordance | require both flanks anchored + same chr + collinear; demote lone `ONE_SIDE` to low-confidence | kills the bucket that is ~60% of all errors; precision ↑, yield ↓ |
-| **E2** | uniqueness filter `--max-occ` | anchor extended until reference interval `< n_taxa`; read flagged `MULTI` if whole-query occ `≥ n_taxa` (default = #taxa, here 4) | removes retro/repeat mis-placements; precision ↑, especially on high-occ reads |
-| **E3** | E1 + E2 | both | best precision; measure the recall cost and the speed change (uniqueness early-exit may also speed anchoring) |
+| ID | Variant | Flag | Hypothesis | Result |
+|---|---|---|---|---|
+| **E0** | baseline | — | precision low, `ONE_SIDE` dominates error | prec 57.3% |
+| **E1** | two-flank concordance | `--two-flank` (+ `--max-bracket`) | kills the bucket that is ~60% of errors; precision ↑, yield ↓ | **prec 74.7%**, wrong-chr −60% ✓ |
+| **E2** | uniqueness filter | `--max-occ=N` (`-1`=auto=#taxa) | removes retro/repeat mis-placements; precision ↑ at low recall cost | **prec 88.1%**, wrong-chr −85%, ~free recall ✓ |
+| **E3** | E1 + E2 | both | best precision; measure recall + speed | **prec 96.0%**, wrong-chr −97% ✓ |
+| **E4** | synteny prior (planned) | _tbd_ | use the carrier coordinate the SSA already returns + a coarse per-carrier→B73 offset map to skip/shorten the walk and reject off-diagonal carriers | speed ↑↑ (attacks the walk) and precision ↑ |
+
+Implemented flags (E1–E3), all default-off so E0 is reproducible:
+- `--two-flank` — require both flanks to anchor concordantly (same chr + strand);
+  a lone anchor yields `UNPLACED` instead of `ONE_SIDE`.
+- `--max-bracket=NUM` — with `--two-flank`, reject a `PLACED` whose two anchors
+  bracket > NUM bp (collinearity guard; 0 = off).
+- `--max-occ=N` — drop reads (status `MULTI`) and flank anchors occurring > N
+  times; `N<0` = auto = number of taxa (distinct name prefixes); 0 = off.
+
+E4 is motivated by the speed analysis: E1–E3 are precision fixes and leave the
+walk (the 35× cost) intact. The SSA returns the exact *carrier* coordinate for
+free at the locate step; projecting it through a small precomputed
+carrier→reference offset map gives an approximate B73 band without walking, and
+simultaneously enables an off-diagonal (paralog) rejection — see
+[`handoff.md`](handoff.md) open-question #2.
 
 **Biological basis for E2:** ~40% of sequence is not shared between two maize
 lines, but retrotransposons are shared and high-copy. A single-copy (informative)
