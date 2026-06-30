@@ -15,3 +15,8 @@ docs/examples/*.fmd.len.gz
 # ref-sensitivity experiment data (genomes, index, queries) — too large to commit
 experiments/ref-sensitivity/data/
 /ropebwt3-omp
+
+# ref-sensitivity E4 prototype data (anchors, mem outputs) — keep only .py/.md
+experiments/ref-sensitivity/e4/*.fa
+experiments/ref-sensitivity/e4/*.mem
+experiments/ref-sensitivity/e4/*.time
