@@ -1,0 +1,119 @@
+# Benchmark — `refmap` at maize-pangenome scale
+
+The synthetic locus in [`experiments.md`](experiments.md) proves correctness on a
+known breakpoint. This benchmark measures **sensitivity** and **speed** on real
+data: four NAM maize founders indexed together, with 100k synthetic-but-grounded
+reads whose true origin is known. Results (and a running scoreboard across
+variants) live in [`results-maize.md`](results-maize.md).
+
+Driver script: [`../experiments/ref-sensitivity/server-run.sh`](../experiments/ref-sensitivity/server-run.sh).
+
+## Data
+
+Four NAM founder assemblies from MaizeGDB, chr1–chr10 only, renamed `<LINE>_chrN`:
+
+| Line | role | chr1–10 size (fwd) |
+|---|---|---|
+| B73 | **reference** (`--ref-prefix=B73`) | 2.13 Gbp |
+| B97 | carrier | ~2.14 Gbp |
+| Ki3 | carrier | ~2.14 Gbp |
+| CML247 | carrier | ~2.14 Gbp |
+
+Total input: **~8.5 Gbp forward → 17.10 G both-strand symbols** (per-genome
+symbol counts from `build.log`: 4.264 + 4.270 + 4.279 + 4.286 G).
+
+## Index build (one big-RAM box, 20 threads)
+
+```sh
+NCORES=20 MEM_BATCH=60G sh experiments/ref-sensitivity/server-run.sh
+```
+
+| Step | Command (key flags) | Wall | Peak RAM | Output |
+|---|---|---:|---:|---|
+| build FMD | `build -d -t20 -p20 -m60G` | 32:23 | 38.8 GB | `nam4.fmd` 2.13 GB |
+| sampled SA | `ssa -t20 -s8` | 9:24 | 3.0 GB | `nam4.fmd.ssa` 510 MiB |
+| len table | (awk over the FASTAs) | <1 min | — | `nam4.fmd.len.gz` (40 seqs) |
+
+Notes:
+- `-m 60G` exceeds the 17.1 G both-strand input, so libsais runs per-file and
+  merges across the 4 files (4 batches); RAM peak 38.8 GB ≪ box.
+- `ssa` is **kthread-parallel** (`-t`), not OpenMP. At the default `-t4` it was
+  the pipeline long pole (>40 min); `-t20` cuts it to 9:24. Size is a flat
+  8 bytes × (symbols / 2⁸) ≈ 510 MiB, deterministic from `-s8`.
+
+## Queries (deterministic)
+
+```sh
+gen_queries.py --n 25000 --len 150 --seed 7 \
+  B73:… B97:… Ki3:… CML247:…        # --n is PER GENOME
+```
+
+→ **100,000 reads** (25k each × 4 lines), 150 bp, no `N`. The read name encodes
+ground truth `LINE|chr|pos0|len`; `truth.tsv` is the join key.
+
+## Metrics
+
+### Sensitivity (`analyze.py`, tol = ±5 Mb)
+
+A placement is **correct** when refmap's reference chromosome equals the read's
+source chromosome **and** `min(|cL−src|,|cR−src|) ≤ tol`. NAM founders are
+largely collinear with B73, so the source coordinate is a *proxy* for the
+expected B73 coordinate and the tolerance absorbs indel drift.
+
+- `%correct` — correct / reads (per line and overall).
+- `wrong_chr` — placed on the wrong chromosome (**genuine error**; drift cannot
+  move a read to another chromosome).
+- `far(>tol)` — right chromosome, > tol away (partly real inter-genome drift, so
+  this bucket slightly *under*-counts true accuracy).
+- **precision** = correct / (reads − UNPLACED); **recall/yield** = placed / reads.
+  For genotyping, precision is the figure of merit.
+
+Report also stratifies by **status** (EXACT / PLACED / ONE_SIDE / UNPLACED) and
+by **read multiplicity** (occurrence count from `ropebwt3 mem` col 4 = SA-interval
+size), which is the single best predictor of correctness (see results).
+
+### Speed (`/usr/bin/time -v`, `-t 20`, same 100k reads + index)
+
+Compare `refmap` against the regular mappers `mem` (SMEM+locate) and `sw` (local
+align). Record wall, reads/sec, CPU% (scaling), CPU-seconds, peak RSS. `refmap`'s
+slowdown over `mem`/`sw` quantifies the cost of the walk + flank-anchoring.
+
+## Experiment matrix
+
+`E0` is the current baseline (measured). `E1–E3` test the precision fixes
+motivated by the baseline diagnosis (see [`results-maize.md`](results-maize.md)),
+each behind a flag, re-run on the **same** index + 100k reads.
+
+| ID | Variant | Change | Hypothesis |
+|---|---|---|---|
+| **E0** | baseline | current `refmap` | reference: precision low, `ONE_SIDE` dominates error |
+| **E1** | two-flank concordance | require both flanks anchored + same chr + collinear; demote lone `ONE_SIDE` to low-confidence | kills the bucket that is ~60% of all errors; precision ↑, yield ↓ |
+| **E2** | uniqueness filter `--max-occ` | anchor extended until reference interval `< n_taxa`; read flagged `MULTI` if whole-query occ `≥ n_taxa` (default = #taxa, here 4) | removes retro/repeat mis-placements; precision ↑, especially on high-occ reads |
+| **E3** | E1 + E2 | both | best precision; measure the recall cost and the speed change (uniqueness early-exit may also speed anchoring) |
+
+**Biological basis for E2:** ~40% of sequence is not shared between two maize
+lines, but retrotransposons are shared and high-copy. A single-copy (informative)
+locus contributes at most one hit per taxon, so an informative read maps
+**< (number of taxa)** times; a retro maps ≫ taxa. Occurrence count therefore
+separates informative loci from repeats, and the threshold scales with the panel
+(≈4 here, ≈24 for the full NAM pangenome).
+
+Success criteria per variant: report **precision, wrong-chr rate, yield**, and
+**reads/sec**; a variant "wins" if it raises precision materially without
+collapsing yield, at acceptable speed.
+
+## Reproduce
+
+```sh
+# 0. build tool + index + ssa + len + queries  (≈45 min on 20 cores)
+NCORES=20 MEM_BATCH=60G sh experiments/ref-sensitivity/server-run.sh
+
+# 1. baseline sensitivity already emitted as data/report.txt; speed:
+D=experiments/ref-sensitivity/data
+for cmd in "refmap --ref-prefix=B73" mem sw; do
+  /usr/bin/time -v ./ropebwt3 $cmd -t 20 $D/nam4.fmd $D/queries.fa \
+    > $D/${cmd%% *}.out 2> $D/${cmd%% *}.time
+done
+python3 experiments/ref-sensitivity/analyze.py \
+  --refmap $D/refmap.out --truth $D/truth.tsv --tol 5000000
+```
