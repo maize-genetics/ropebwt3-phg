@@ -1,7 +1,7 @@
 # Handoff — `refmap`
 
-Status: **implemented, tested, builds clean, ASAN-clean.** On branch
-`feature/refmap`.
+Status: **implemented, tested, builds clean, ASAN-clean.** Merged to `master`
+and published at `maize-genetics/ropebwt3-phg` (a fork of `lh3/ropebwt3`).
 
 ## What it does
 
@@ -10,6 +10,11 @@ multi-genome (pangenome) index, including when the query is absent from the
 reference because it falls inside an insertion / reference-side deletion. See
 `docs/plan.md` for the design and `docs/experiments.md` + `docs/results.md` for
 testing.
+
+The algorithm in one picture — [`docs/refmap-walk.svg`](refmap-walk.svg): the
+query never touches the reference, so refmap locates it in the carriers, walks
+outward through a carrier to the insertion breakpoints, and re-anchors the shared
+flanks (longest reference-matching prefix / suffix) back onto the reference.
 
 ## Build
 
@@ -93,8 +98,69 @@ are untouched.
   the kb-scale insertions targeted here; for very long flanks at full
   pangenome scale, switch to exponential+binary search on the anchor length.
 
-## Suggested next steps
+## Open questions / next investigations
 
-1. Validate on a real maize pangenome index (24 genomes); profile `refmap` time.
-2. If slow, optimize `refmap_anchor_flank` membership search (see above).
-3. Optional: emit BED/PAF-style output; multi-locus handling for rearrangements.
+These are research directions for the next person, not yet started. The first
+three are the priorities flagged after the initial implementation.
+
+### 1. Speed and the locate tradeoff on real genomes
+
+The synthetic tests are tiny; the real cost is unknown on maize-scale data
+(chromosome-length sequences × ~24 genomes). The likely hot spot is
+`refmap_anchor_flank`, which today does a base-by-base reference-membership check
+(`rb3_ssa_multi_ref` per extension step) — `O(flank length)` locate calls, each a
+BWT walk bounded by `max_scan`. The knobs that trade speed against memory/quality:
+
+* **SSA sample rate** (`ssa -s`): denser sampling → faster `locate`, larger
+  `.ssa`. ropebwt3 itself notes locate is its slow operation.
+* **`--max-walk`**: caps walk length; larger handles bigger SVs but costs more.
+* **`max_scan`** budget inside `rb3_ssa_multi_ref` (currently `1<<16`).
+* **Anchoring search**: replace the linear per-step membership scan with
+  exponential + binary search on the anchor length → `O(log flank)` locates.
+
+Needs a real benchmark: build a true multi-genome index, time `refmap` across
+query sets, and profile where time goes (walk vs. membership-locate vs. the final
+locate). Record index/SSA/`.len.gz` sizes and peak RSS. **These tradeoffs need
+careful, measured consideration before scaling** — don't tune blind.
+
+### 2. Is the BWT global, or can it be biased toward synteny?
+
+The BWT is **global**: ropebwt3 concatenates all sequences (both strands) and
+sorts suffixes lexicographically. It has no notion of synteny or position — a
+match is found wherever the exact string occurs, in any genome. Build ordering
+options (`build -s` RLO, `-r` RCLO) change run-length compression but **not** which
+matches exist. So you cannot make the index itself "syntenic." Emphasis on
+syntenic regions would have to live in a layer *around* the BWT, e.g.:
+
+* constrain carriers/anchors to be **collinear** with the reference anchor
+  (chain the located flank positions; reject off-diagonal carriers) — a
+  query-time synteny constraint;
+* partition genomes into synteny blocks and index per block;
+* filter carriers by chromosome via name prefix before walking.
+
+Open question worth scoping: does adding a collinearity check in `refmap_place`
+(compare each carrier's flank coordinates against the reference anchor) improve
+placement in repeat-rich / paralogous regions?
+
+### 3. Quantify the "messiness" of the sequence among the query's carriers
+
+The outward walk already sees, at every backward-extension step, the distribution
+of child-interval sizes — i.e. how many carriers agree on the next base
+(`refmap_extract_flank`: consensus picks the largest child, strict stops at the
+first disagreement). That signal can be turned into a **divergence score** for the
+locus, for example:
+
+* fraction of walk steps where carriers disagreed (consensus ≠ unanimous);
+* per-step base-distribution entropy, summarised over the flank;
+* number of distinct carrier alleles (from `--walk-mode=per-carrier`);
+* **spread of `cL`/`cR` across carriers** in per-carrier mode — consistent
+  breakpoints = clean locus, scattered = messy/ambiguous.
+
+Concretely: add an output column (e.g. divergent-step count or allele count) fed
+from the size distribution in `refmap_extract_flank`, and/or compare the
+consensus result against the per-carrier results to flag noisy loci.
+
+### Also
+
+* Emit BED/PAF-style output; multi-locus handling for large rearrangements.
+* Offer `refmap` upstream to `lh3/ropebwt3` as a PR if of general interest.
