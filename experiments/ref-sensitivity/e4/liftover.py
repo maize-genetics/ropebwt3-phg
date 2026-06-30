@@ -15,7 +15,7 @@ rather not place than place wrong.
 Self-test: leave-one-out over the anchors themselves -- project each anchor from
 its neighbours and compare to its own known B73 position.
 """
-import argparse, sys, bisect
+import argparse, sys, bisect, statistics
 from collections import defaultdict
 
 
@@ -91,6 +91,48 @@ def project(idx, car, cchr, pos, slope_tol=0.5, max_gap=2_000_000):
         return None                      # not locally collinear -> NULL
     bpos = b0 + slope * (pos - p0)
     return c1, int(bpos)
+
+
+def _median(xs):
+    return statistics.median(xs)
+
+
+def project_robust(idx, car, cchr, pos, win=500000, min_support=4, max_mad=200000):
+    """Windowed, slope=+/-1 robust projection. Gather anchors within +-win bp of
+    pos, take the majority B73 chr, decide orientation (+1/-1) by which gives the
+    tighter residual b-/+c, and project pos with the median intercept. NULL unless
+    enough collinear support (>=min_support) and the residual MAD is small
+    (<=max_mad) -- the MAD gate is what protects precision in messy regions."""
+    key = (car, cchr)
+    if key not in idx:
+        return None
+    cpos, arr = idx[key]
+    lo = bisect.bisect_left(cpos, pos - win)
+    hi = bisect.bisect_right(cpos, pos + win)
+    window = arr[lo:hi]
+    if len(window) < min_support:
+        return None
+    from collections import Counter
+    cc = Counter(a[1] for a in window)
+    bestc, bestn = cc.most_common(1)[0]
+    if bestn < min_support:
+        return None
+    pts = [(a[0], a[2]) for a in window if a[1] == bestc]
+    # orientation: slope +1 -> b-c constant; slope -1 -> b+c constant. Pick tighter.
+    res_p = [b - c for c, b in pts]
+    res_m = [b + c for c, b in pts]
+    def mad(xs):
+        m = _median(xs)
+        return _median([abs(x - m) for x in xs])
+    mad_p, mad_m = mad(res_p), mad(res_m)
+    if mad_p <= mad_m:
+        sign, res, m = 1, res_p, mad_p
+    else:
+        sign, res, m = -1, res_m, mad_m
+    if m > max_mad:
+        return None                      # not locally collinear -> NULL
+    intercept = _median(res)
+    return bestc, int(sign * pos + intercept)
 
 
 def main():

@@ -15,7 +15,7 @@ same precision/recall/wrong-chr as the refmap E0-E3 runs for direct comparison.
 import argparse, sys, bisect, statistics
 from collections import defaultdict
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
-from liftover import parse_pos, load_anchors, make_index, project
+from liftover import parse_pos, load_anchors, make_index, project, project_robust
 
 
 def main():
@@ -27,7 +27,12 @@ def main():
     ap.add_argument("--agree-tol", type=float, default=5e6)
     ap.add_argument("--tol", type=float, default=5e6)
     ap.add_argument("--ref", default="B73")
+    ap.add_argument("--robust", action="store_true", help="windowed slope=+/-1 robust projection")
+    ap.add_argument("--win", type=float, default=500000)
+    ap.add_argument("--max-mad", type=float, default=200000)
     a = ap.parse_args()
+    proj_fn = (lambda car, c, p: project_robust(idx, car, c, p, int(a.win), max_mad=a.max_mad)) if a.robust \
+              else (lambda car, c, p: project(idx, car, c, p))
 
     truth = {}
     with open(a.truth) as f:
@@ -78,7 +83,7 @@ def main():
                     for (tx, c, st, p) in poss:
                         if tx == a.ref:
                             continue
-                        r = project(idx, tx, c, p)
+                        r = proj_fn(tx, c, p)
                         if r is not None:
                             proj.append(r)
                     if proj:

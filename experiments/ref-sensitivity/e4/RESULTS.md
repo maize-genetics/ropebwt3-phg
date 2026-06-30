@@ -41,4 +41,54 @@ once. The carrier-projected PLACED bucket is 94.5% correct vs refmap's 14.7%
 ONE_SIDE. Recall +18 pts over E3 at the same ~96% precision, ~15× faster.
 
 ## Parameter experiments
-(running — denser anchors, E4 max_occ sweep, agree-tol)
+
+### Two-anchor projection: stride × max_occ
+- `max_occ=4` (=#taxa) is the knee for E4 too: precision 95.9→94.4% as occ 4→8,
+  and recall *falls* (63.7→59.7%). Same verdict as refmap.
+- Counter-intuitively, **sparser anchors gave higher recall** with the naive
+  two-anchor projection (stride 10k 63.7% > 5k 60.2% > 2k 55.9%): a short baseline
+  makes one local indel blow up the apparent slope → spurious NULL. The fix is a
+  windowed fit, not sparse anchors.
+
+### Robust windowed projection (the win)
+`project_robust`: gather anchors within ±`win` of the query, take the majority
+B73 chr, choose orientation (+1/−1) by the tighter residual `b∓c`, project with
+the median intercept; NULL unless ≥`min_support` anchors and residual MAD ≤
+`max_mad`. Exploits the within-species **slope ≈ ±1** prior and the MAD gate
+protects precision.
+
+| projection (occ4) | recall | precision |
+|---|---:|---:|
+| two-anchor, stride 10k | 63.7% | 95.9% |
+| two-anchor, stride 2k | 55.9% | 96.0% |
+| **robust, stride 2k, win 500k, mad 200k** | **77.6%** | **95.9%** |
+
+Robust is **stride-insensitive** (now denser helps: 10k 76.2% → 2k 77.6%) and
+flat across win∈{0.5–1 M}, mad∈{0.2–0.5 M} (recall 77.6–77.9%, precision ~95.9%).
+With robust projection only ~1,000 reads NULL out — recall is now capped by the
+**18,062 `MULTI`** (occ>4 repeat) reads, which are genuinely unplaceable.
+
+## Final comparison (100k reads, tol ±5 Mb)
+
+| variant | precision | recall | wrong-chr | placement |
+|---|---:|---:|---:|---:|
+| E0 baseline refmap | 57.3% | 54.6% | 35,768 | 40 s walk |
+| E3 two-flank+max-occ=4 | 96.0% | 45.5% | 920 | 37 s walk |
+| E4 liftover (two-anchor) | 95.9% | 63.7% | 1,068 | ~3 s locate |
+| **E4 liftover (robust)** | **95.9%** | **77.6%** | 1,177 | ~3 s locate |
+
+**E4 robust dominates:** same ~96% precision as the best walk-based variant, but
+**+32 pts recall** over E3 and ~15× faster. The carrier-projected `PLACED` bucket
+is ~94% correct vs refmap's 14.7% `ONE_SIDE`.
+
+## Locked prototype config
+`--max-occ 4` (auto=#taxa), anchors stride 2000 len 100, `--robust --win 500000
+--max-mad 200000`.
+
+## Next: integrate as the C "second SSA"
+The prototype proves the concept offline (Python over `mem -p`). Production form:
+a second per-taxon→reference coordinate map alongside `.ssa` (built once from
+unique anchors), consulted at the locate step inside `refmap` so a carrier hit is
+projected to B73 without any walk; NULL slots → UNPLACED. Expected to fold E4's
+precision+recall+speed into `refmap` directly.
+
