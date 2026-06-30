@@ -1,0 +1,34 @@
+ropebwt3-phg
+============
+
+This repository is a fork of ropebwt3 (https://github.com/lh3/ropebwt3),
+distributed under the MIT License. It adds the `refmap` subcommand for placing
+pangenome queries on a designated reference genome, together with supporting
+documentation under docs/. All original source files and the upstream license
+are retained unchanged.
+
+This NOTICE provides attribution only. It does not modify the terms of the MIT
+License in LICENSE.txt, and it does not claim any rights over the original work.
+
+
+Original work
+-------------
+ropebwt3
+Copyright (c) 2024- Dana-Farber Cancer Institute (Heng Li)
+Licensed under the MIT License (see LICENSE.txt).
+Upstream: https://github.com/lh3/ropebwt3
+
+
+Bundled dependency
+------------------
+libsais
+Copyright (c) Ilya Grebnov
+Licensed under the Apache License, Version 2.0.
+
+
+Modifications in this fork
+--------------------------
+The `refmap` subcommand and the docs/ materials.
+Copyright (c) 2026 Edward Buckler / Buckler Laboratory
+(USDA-ARS and Cornell University).
+Released under the same MIT License as the original work (see LICENSE.txt).

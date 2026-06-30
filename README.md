@@ -1,3 +1,8 @@
+> **Note:** This is a fork of [lh3/ropebwt3](https://github.com/lh3/ropebwt3) by
+> Heng Li (MIT licensed). It adds the [`refmap`](#refmap) subcommand for placing
+> pangenome queries on a designated reference genome. The original code and
+> license are unchanged — see [`LICENSE.txt`](LICENSE.txt) and [`NOTICE`](NOTICE).
+
 ## <a name="start"></a>Getting Started
 ```sh
 # Compile
