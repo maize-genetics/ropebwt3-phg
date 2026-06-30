@@ -81,6 +81,15 @@ With robust projection only ~1,000 reads NULL out — recall is now capped by th
 **+32 pts recall** over E3 and ~15× faster. The carrier-projected `PLACED` bucket
 is ~94% correct vs refmap's 14.7% `ONE_SIDE`.
 
+## Robustness checks
+- **Speed (measured):** projection step (load 3.2 M-point liftover + place 100k)
+  = 5.45 s single-thread Python, 237 MB RSS; with `mem -p` locate (2.67 s, 20 thr)
+  end-to-end ≈ 8 s vs refmap 40 s (~5×). The liftover load is one-time (like
+  `.ssa`); marginal projection is cheap, so a C "second SSA" should near `mem`.
+- **Generalization (fresh seed):** seed-13 reads (unseen by the anchors) →
+  precision 96.0%, recall 77.8%, B73ctrl 80.6% — matches seed-7
+  (95.9% / 77.6% / 80.7%). Not overfit.
+
 ## Locked prototype config
 `--max-occ 4` (auto=#taxa), anchors stride 2000 len 100, `--robust --win 500000
 --max-mad 200000`.
