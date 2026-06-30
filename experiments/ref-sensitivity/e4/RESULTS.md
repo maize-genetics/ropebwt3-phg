@@ -90,6 +90,20 @@ is ~94% correct vs refmap's 14.7% `ONE_SIDE`.
   precision 96.0%, recall 77.8%, B73ctrl 80.6% — matches seed-7
   (95.9% / 77.6% / 80.7%). Not overfit.
 
+## Read-length sensitivity (E4 robust, occ4, stride 2k)
+
+| read len | MULTI (repeat) | recall | precision | B73 ctrl |
+|---:|---:|---:|---:|---:|
+| 75 bp | 39.3% | 56.7% | 95.0% | — |
+| 100 bp | 29.5% | 66.3% | 95.4% | — |
+| 150 bp | 18.1% | 77.6% | 95.9% | 80.7% |
+| 250 bp | 8.6% | 87.4% | 96.5% | 90.7% |
+
+Recall is governed by the repeat (`MULTI`) fraction, which shrinks with read
+length; **precision is rock-stable (~95–96%, even improving) at every length.**
+Practical implication: longer reads buy large recall gains (56.7→87.4% from
+75→250 bp) at no precision cost — use the longest reads available.
+
 ## Locked prototype config
 `--max-occ 4` (auto=#taxa), anchors stride 2000 len 100, `--robust --win 500000
 --max-mad 200000`.
