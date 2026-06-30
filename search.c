@@ -6,7 +6,11 @@
 #include "kthread.h"
 #include "kalloc.h"
 
-typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV } rb3_search_algo_t;
+typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
+
+#define RB3_WALK_CONSENSUS  0 // follow the base shared by the most carriers
+#define RB3_WALK_STRICT     1 // stop walking at the first carrier disagreement
+#define RB3_WALK_PERCARRIER 2 // one outward walk (and one result) per carrier genome
 
 #define RB3_MF_NO_KALLOC   0x1
 #define RB3_MF_WRITE_UNMAP 0x2
@@ -21,6 +25,9 @@ typedef struct {
 	rb3_search_algo_t algo;
 	int64_t min_occ, min_len, max_all_out;
 	int64_t batch_size;
+	char *ref_prefix;  // refmap: reference sequences are those whose name starts with this
+	int32_t max_walk;  // refmap: max bases to walk outward along carriers, per flank
+	int8_t walk_mode;  // refmap: RB3_WALK_*
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -34,6 +41,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
 	opt->algo = RB3_SA_MEM_TG;
+	opt->max_walk = 5000;
+	opt->walk_mode = RB3_WALK_CONSENSUS;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -64,6 +73,8 @@ typedef struct {
 	int64_t id;
 	rb3_fmi_t fmi;
 	rb3_seqio_t *fp;
+	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
+	int64_t n_ref;   // refmap: number of reference sequences
 } pipeline_t;
 
 typedef struct {
@@ -71,14 +82,39 @@ typedef struct {
 	rb3_hapdiv_t r;
 } m_hapdiv_t;
 
+// refmap: result of placing one query on the reference genome
+#define RB3_RM_UNPLACED 0
+#define RB3_RM_PLACED   1
+#define RB3_RM_ONE_SIDE 2
+#define RB3_RM_EXACT    3
+
+typedef struct refmap_rst_s {
+	int8_t status;       // RB3_RM_*
+	int8_t strand;       // reference strand (0 forward, 1 reverse); valid when placed/exact
+	int32_t qlen;
+	int32_t n_carrier;   // distinct carrier sequences seen (capped)
+	int64_t ref_sid;     // reference sequence index (in [0,n_seq)); -1 if none
+	int64_t cL, cR;      // reference coordinates bracketing the query; -1 if unknown
+	int64_t ins_size;    // implied size inserted into the carrier relative to the reference
+	int32_t n_car_list;  // number of carriers stored below
+	rb3_pos_t *carriers; // a few carrier (sid,pos); allocated with RB3_MALLOC
+	int32_t n_sub;       // per-carrier mode: number of sub-results (one per carrier)
+	struct refmap_rst_s *sub; // per-carrier mode: one placement per carrier
+} refmap_rst_t;
+
 typedef struct {
 	const pipeline_t *p;
 	int32_t n_seq, n_hapdiv;
 	m_seq_t *seq;
 	rb3_swrst_t *rst, *rst_rev;
 	m_hapdiv_t *hapdiv;
+	refmap_rst_t *refmap; // refmap: one entry per query
 	m_tbuf_t *buf;
 } step_t;
+
+static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r);
+static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
+							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen);
 
 static void worker_for_seq(void *data, long i, int tid)
 {
@@ -96,6 +132,8 @@ static void worker_for_seq(void *data, long i, int tid)
 			rb3_sw(b->km, &p->opt->swo, &p->fmi, s->len, s->seq, &t->rst_rev[i]);
 			rb3_revcomp6(s->len, s->seq);
 		}
+	} else if (p->opt->algo == RB3_SA_REFMAP) { // place the query on the reference genome
+		refmap_query(b->km, p, s, &t->refmap[i]);
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
@@ -172,6 +210,243 @@ static void pos_stranded(const rb3_sid_t *sid, const rb3_pos_t *pos, int32_t rle
 		*st = *clen - (pos->pos + rlen), *en = *clen - pos->pos;
 }
 
+/********************************************************************
+ * refmap: place a query on a designated reference genome by
+ * walking outward through the carrier genomes to the breakpoints.
+ ********************************************************************/
+
+// Backward-search the whole query; on success *out holds its SA interval. Returns 1 on a full match.
+static int refmap_query_interval(const rb3_fmi_t *f, int64_t len, const uint8_t *q, rb3_sai_t *out)
+{
+	rb3_sai_t ik, ok[RB3_ASIZE];
+	int64_t i;
+	if (len <= 0) return 0;
+	rb3_fmd_set_intv(f, q[len-1], &ik);
+	if (ik.size == 0) return 0;
+	for (i = len - 2; i >= 0; --i) {
+		if (q[i] == 0 || q[i] > 4) return 0; // sentinel or ambiguous base: give up on a full match
+		rb3_fmd_extend(f, &ik, ok, 1);
+		if (ok[q[i]].size == 0) return 0;
+		ik = ok[q[i]];
+	}
+	*out = ik;
+	return 1;
+}
+
+// Walk outward from interval Iq through the carriers, recording one base per step.
+// side 0 = left (backward) flank, side 1 = right (forward) flank. On return, buf holds the flank
+// in forward (5'->3') orientation; the breakpoint-proximal end (adjacent to the query) is the 3'
+// end for the left flank and the 5' end (index 0) for the right flank. Returns the flank length.
+// walk_mode picks the path: consensus follows the most-supported base; strict stops at the first
+// carrier disagreement; per-carrier (mask != NULL) follows the single carrier marked in mask.
+static int32_t refmap_extract_flank(void *km, const pipeline_t *p, const rb3_sai_t *Iq, int side, int32_t max_walk, int walk_mode, const uint8_t *mask, uint8_t *buf)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	rb3_sai_t I = *Iq, ok[RB3_ASIZE];
+	int32_t n = 0, is_back = (side == 0);
+	while (n < max_walk) {
+		int c, best = -1;
+		int64_t bestsz = 0;
+		rb3_fmd_extend(f, &I, ok, is_back);
+		if (mask) { // per-carrier: follow the base whose child still contains this carrier
+			rb3_pos_t pos[1];
+			for (c = 1; c <= 4; ++c) {
+				rb3_sai_t *iv = is_back? &ok[c] : &ok[rb3_comp(c)];
+				if (iv->size == 0) continue;
+				if (rb3_ssa_multi_ref(km, f, f->ssa, iv->x[0], iv->x[0] + iv->size, mask, 1, 1<<16, pos) > 0) {
+					best = c, bestsz = iv->size; break;
+				}
+			}
+		} else {
+			for (c = 1; c <= 4; ++c) { // consensus: most-supported neighboring base
+				int64_t sz = is_back? ok[c].size : ok[rb3_comp(c)].size;
+				if (sz > bestsz) bestsz = sz, best = c;
+			}
+		}
+		if (best < 0 || bestsz == 0) break;                         // no carrier continues
+		if (walk_mode == RB3_WALK_STRICT && bestsz != I.size) break; // carriers disagree
+		buf[n++] = best;
+		I = is_back? ok[best] : ok[rb3_comp(best)];
+	}
+	if (side == 0) { // reverse the left flank so buf is in forward orientation
+		int32_t i;
+		for (i = 0; i < n>>1; ++i) {
+			uint8_t t = buf[i]; buf[i] = buf[n-1-i]; buf[n-1-i] = t;
+		}
+	}
+	return n;
+}
+
+// Given the query interval and (optionally) a carrier mask, extract both flanks, re-anchor them in
+// the reference and fill the placement result r (status/strand/ref_sid/cL/cR/ins_size).
+static void refmap_place(void *km, const pipeline_t *p, const m_seq_t *s, const rb3_sai_t *Iq, const uint8_t *mask, refmap_rst_t *r)
+{
+	const rb3_mopt_t *o = p->opt;
+	uint8_t *Lf, *Rf;
+	int32_t Ll, Rl, mlenL = 0, mlenR = 0;
+	int64_t sidL = -1, sidR = -1, coordL = -1, coordR = -1;
+	int gotL, gotR, strandL = 0, strandR = 0;
+	Lf = Kmalloc(km, uint8_t, o->max_walk);
+	Rf = Kmalloc(km, uint8_t, o->max_walk);
+	Ll = refmap_extract_flank(km, p, Iq, 0, o->max_walk, o->walk_mode, mask, Lf);
+	Rl = refmap_extract_flank(km, p, Iq, 1, o->max_walk, o->walk_mode, mask, Rf);
+	gotL = refmap_anchor_flank(km, p, Lf, Ll, 0, &sidL, &strandL, &coordL, &mlenL);
+	gotR = refmap_anchor_flank(km, p, Rf, Rl, 1, &sidR, &strandR, &coordR, &mlenR);
+	kfree(km, Lf); kfree(km, Rf);
+	if (gotL && gotR && sidL == sidR && strandL == strandR) {
+		r->status = RB3_RM_PLACED, r->ref_sid = sidL, r->strand = strandL;
+		r->cL = coordL < coordR? coordL : coordR;
+		r->cR = coordL < coordR? coordR : coordL;
+		r->ins_size = (int64_t)(Ll - mlenL) + s->len + (Rl - mlenR);
+	} else if (gotL || gotR) {
+		r->status = RB3_RM_ONE_SIDE;
+		if (gotL) r->ref_sid = sidL, r->strand = strandL, r->cL = coordL;
+		else      r->ref_sid = sidR, r->strand = strandR, r->cR = coordR;
+	}
+}
+
+// Re-anchor a flank in the reference. The reference-shared part of a flank lies at the end FAR
+// from the query (it is contiguous with the query only in the carriers), so a plain SMEM would be
+// swallowed by the longer carrier match that crosses the breakpoint. Instead we grow the match
+// from the far end and keep the longest stretch still present in the reference:
+//   side 0 = left flank  : longest reference-matching PREFIX  (forward extension from the 5' end)
+//   side 1 = right flank : longest reference-matching SUFFIX  (backward extension from the 3' end)
+// The breakpoint is the near edge of that reference stretch: the prefix end for the left flank
+// (*out_coord = forward end), the suffix start for the right flank (*out_coord = forward start).
+// *out_mlen returns the matched reference length (used to size the insertion).
+static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
+							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	rb3_sai_t ik, ok[RB3_ASIZE], best_iv;
+	rb3_pos_t pos[1];
+	int32_t i, best_len = 0, min_len = p->opt->min_len;
+	int c;
+	int64_t clen, rst, ren;
+	if (flen <= 0) return 0;
+	memset(&best_iv, 0, sizeof(best_iv));
+	if (side == 1) { // right flank: extend the suffix leftward from the 3' end
+		c = flank[flen-1];
+		if (c < 1 || c > 4) return 0;
+		rb3_fmd_set_intv(f, c, &ik);
+		for (i = flen - 1; i >= 0; --i) {
+			if (i < flen - 1) {
+				c = flank[i];
+				if (c < 1 || c > 4) break;
+				rb3_fmd_extend(f, &ik, ok, 1);
+				if (ok[c].size == 0) break;
+				ik = ok[c];
+			}
+			if (rb3_ssa_multi_ref(km, f, f->ssa, ik.x[0], ik.x[0] + ik.size, p->is_ref, 1, 1<<16, pos) > 0)
+				best_len = flen - i, best_iv = ik;
+			else if (best_len > 0) break; // reference dropped out: the longest stretch ends here
+		}
+	} else { // left flank: extend the prefix rightward from the 5' end
+		c = flank[0];
+		if (c < 1 || c > 4) return 0;
+		rb3_fmd_set_intv(f, c, &ik);
+		for (i = 0; i < flen; ++i) {
+			if (i > 0) {
+				int cc = rb3_comp(flank[i]);
+				if (flank[i] < 1 || flank[i] > 4) break;
+				rb3_fmd_extend(f, &ik, ok, 0);
+				if (ok[cc].size == 0) break;
+				ik = ok[cc];
+			}
+			if (rb3_ssa_multi_ref(km, f, f->ssa, ik.x[0], ik.x[0] + ik.size, p->is_ref, 1, 1<<16, pos) > 0)
+				best_len = i + 1, best_iv = ik;
+			else if (best_len > 0) break;
+		}
+	}
+	if (best_len < min_len) return 0; // too short to anchor confidently
+	if (rb3_ssa_multi_ref(km, f, f->ssa, best_iv.x[0], best_iv.x[0] + best_iv.size, p->is_ref, 1, 1<<16, pos) <= 0)
+		return 0;
+	pos_stranded(f->sid, &pos[0], best_len, &clen, &rst, &ren);
+	*out_sid = pos[0].sid >> 1;
+	*out_strand = pos[0].sid & 1;
+	// The breakpoint is the inner edge of the reference-matching region: the 3' end of the prefix
+	// for the left flank, the 5' end of the suffix for the right flank. On a reverse-strand hit the
+	// flank's increasing coordinate runs against the reference's, so the two ends swap.
+	if (side == 0) *out_coord = (pos[0].sid & 1)? rst : ren; // left flank: end of prefix
+	else           *out_coord = (pos[0].sid & 1)? ren : rst; // right flank: start of suffix
+	*out_mlen = best_len;
+	return 1;
+}
+
+static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	rb3_sai_t Iq;
+	rb3_pos_t *pos;
+	int64_t np, i;
+	int car_seen[8], n_car = 0;
+
+	memset(r, 0, sizeof(*r));
+	r->status = RB3_RM_UNPLACED, r->strand = 0, r->qlen = s->len;
+	r->ref_sid = -1, r->cL = r->cR = -1;
+
+	if (!refmap_query_interval(f, s->len, s->seq, &Iq) || Iq.size == 0) {
+		// no end-to-end match (e.g. a sequencing error): fall back to the longest exact core (SMEM)
+		rb3_sai_v mem = {0,0,0};
+		size_t bi;
+		int32_t bestlen = 0;
+		rb3_fmd_smem_TG(km, f, s->len, s->seq, &mem, 1, p->opt->min_len);
+		for (bi = 0; bi < mem.n; ++bi) {
+			int32_t st = mem.a[bi].info>>32, en = (int32_t)mem.a[bi].info;
+			if (en - st > bestlen) bestlen = en - st, Iq = mem.a[bi];
+		}
+		kfree(km, mem.a);
+		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
+	}
+
+	// locate a sample of occurrences; separate reference hits (exact) from carriers
+	pos = Kmalloc(km, rb3_pos_t, 64);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, 64, pos);
+	for (i = 0; i < np; ++i) {
+		if (p->is_ref[pos[i].sid>>1]) { // the query is present in the reference: report it directly
+			int64_t clen, st, en;
+			pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+			r->status = RB3_RM_EXACT, r->ref_sid = pos[i].sid>>1, r->strand = pos[i].sid&1;
+			r->cL = st, r->cR = en, r->ins_size = 0;
+			kfree(km, pos);
+			return;
+		}
+	}
+	r->carriers = RB3_CALLOC(rb3_pos_t, 8);
+	for (i = 0; i < np && n_car < 8; ++i) { // keep a few distinct carrier sequences for reporting
+		int32_t j, dup = 0;
+		for (j = 0; j < n_car; ++j)
+			if (car_seen[j] == (int)(pos[i].sid>>1)) { dup = 1; break; }
+		if (dup) continue;
+		car_seen[n_car] = pos[i].sid>>1;
+		r->carriers[n_car++] = pos[i];
+	}
+	r->n_car_list = n_car, r->n_carrier = n_car;
+	kfree(km, pos);
+
+	if (p->opt->walk_mode == RB3_WALK_PERCARRIER && n_car > 0) {
+		// place each carrier separately, following that one carrier through divergences
+		uint8_t *mask = RB3_CALLOC(uint8_t, f->sid->n_seq);
+		int32_t k;
+		r->sub = RB3_CALLOC(refmap_rst_t, n_car);
+		r->n_sub = n_car;
+		for (k = 0; k < n_car; ++k) {
+			refmap_rst_t *sub = &r->sub[k];
+			int64_t csid = r->carriers[k].sid >> 1;
+			memset(sub, 0, sizeof(*sub));
+			sub->status = RB3_RM_UNPLACED, sub->qlen = s->len, sub->ref_sid = -1, sub->cL = sub->cR = -1;
+			sub->carriers = &r->carriers[k], sub->n_car_list = 1, sub->n_carrier = 1; // borrowed pointer
+			mask[csid] = 1;
+			refmap_place(km, p, s, &Iq, mask, sub);
+			mask[csid] = 0;
+		}
+		free(mask);
+		return;
+	}
+	// consensus / strict: a single placement from the shared carrier path
+	refmap_place(km, p, s, &Iq, 0, r);
+}
+
 static void write_paf(kstring_t *out, const rb3_fmi_t *f, const rb3_swhit_t *h, const m_seq_t *s)
 {
 	int32_t k;
@@ -235,6 +510,58 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 		if (n_out >= max_all_out) break;
 	}
 	rb3_sprintf_lite(out, "//\n");
+}
+
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r)
+{
+	static const char *status_str[4] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT" };
+	int32_t k;
+	out->l = 0;
+	write_name(out, s);
+	rb3_sprintf_lite(out, "\t%d\t%s\t%d\t", r->qlen, status_str[(int)r->status], r->n_carrier);
+	if (r->n_car_list > 0) { // carrier sequences (name:strand)
+		for (k = 0; k < r->n_car_list; ++k) {
+			int64_t sid = r->carriers[k].sid;
+			rb3_sprintf_lite(out, "%s%s:%c", k? "," : "", f->sid->name[sid>>1], "+-"[sid&1]);
+		}
+	} else rb3_sprintf_lite(out, ".");
+	if (r->ref_sid >= 0)
+		rb3_sprintf_lite(out, "\t%s\t%c", f->sid->name[r->ref_sid], "+-"[r->strand & 1]);
+	else
+		rb3_sprintf_lite(out, "\t.\t.");
+	if (r->cL >= 0) rb3_sprintf_lite(out, "\t%ld", (long)r->cL); else rb3_sprintf_lite(out, "\t.");
+	if (r->cR >= 0) rb3_sprintf_lite(out, "\t%ld", (long)r->cR); else rb3_sprintf_lite(out, "\t.");
+	if (r->status == RB3_RM_PLACED || r->status == RB3_RM_EXACT)
+		rb3_sprintf_lite(out, "\t%ld\t%ld", (long)(r->cR - r->cL), (long)r->ins_size);
+	else
+		rb3_sprintf_lite(out, "\t.\t.");
+	rb3_sprintf_lite(out, "\n");
+}
+
+static void write_refmap(step_t *t)
+{
+	const pipeline_t *p = t->p;
+	const rb3_fmi_t *f = &p->fmi;
+	int32_t j, k;
+	kstring_t out = {0,0,0};
+	for (j = 0; j < t->n_seq; ++j) {
+		m_seq_t *s = &t->seq[j];
+		refmap_rst_t *r = &t->refmap[j];
+		if (r->n_sub > 0) { // per-carrier mode: one line per carrier (sub->carriers borrows r->carriers)
+			for (k = 0; k < r->n_sub; ++k) {
+				write_refmap1(&out, f, s, &r->sub[k]);
+				fputs(out.s, stdout);
+			}
+			free(r->sub);
+		} else {
+			write_refmap1(&out, f, s, r);
+			fputs(out.s, stdout);
+		}
+		free(r->carriers);
+		free(s->seq);
+		free(s->name);
+	}
+	free(out.s);
 }
 
 static void write_per_seq(step_t *t)
@@ -391,6 +718,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 					for (j = 0; j + p->opt->hapdiv_k <= seq[i].len; j += p->opt->hapdiv_w)
 						t->hapdiv[n_hapdiv].id = i, t->hapdiv[n_hapdiv++].offset = j;
 				assert(n_hapdiv == t->n_hapdiv);
+			} else if (p->opt->algo == RB3_SA_REFMAP) { // reference-placement mode
+				t->refmap = RB3_CALLOC(refmap_rst_t, n_seq);
 			} else { // per-sequence mode (sw, mem, gap and coverage)
 				t->rst = RB3_CALLOC(rb3_swrst_t, n_seq);
 				if (p->opt->flag & RB3_MF_BOTH_DIR)
@@ -415,6 +744,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		free(t->buf);
 		if (p->opt->algo == RB3_SA_HAPDIV)
 			write_hapdiv(t);
+		else if (p->opt->algo == RB3_SA_REFMAP)
+			write_refmap(t), free(t->refmap);
 		else
 			write_per_seq(t);
 		free(t->seq);
@@ -432,6 +763,9 @@ static ko_longopt_t long_options[] = {
 	{ "cov",             ko_no_argument,       304 },
 	{ "old-mem",         ko_no_argument,       305 },
 	{ "all-e2e",         ko_no_argument,       306 },
+	{ "ref-prefix",      ko_required_argument, 307 },
+	{ "max-walk",        ko_required_argument, 308 },
+	{ "walk-mode",       ko_required_argument, 309 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -480,6 +814,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 304) opt.flag |= RB3_MF_WRITE_COV;
 		else if (c == 305) opt.algo = RB3_SA_MEM_ORI;
 		else if (c == 306) opt.flag |= RB3_MF_WRITE_ALL, opt.swo.flag |= RB3_SWF_E2E, opt.swo.end_len = 1, no_ssa = 1;
+		else if (c == 307) opt.ref_prefix = o.arg;
+		else if (c == 308) opt.max_walk = rb3_parse_num(o.arg);
+		else if (c == 309) {
+			if (strcmp(o.arg, "consensus") == 0) opt.walk_mode = RB3_WALK_CONSENSUS;
+			else if (strcmp(o.arg, "strict") == 0) opt.walk_mode = RB3_WALK_STRICT;
+			else if (strcmp(o.arg, "per-carrier") == 0) opt.walk_mode = RB3_WALK_PERCARRIER;
+			else { fprintf(stderr, "ERROR: --walk-mode must be consensus, strict or per-carrier\n"); return 1; }
+		}
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -500,6 +842,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	} else if (strcmp(argv[0], "mem") == 0) {
 		if (opt.max_pos > 0)
 			load_flag |= RB3_LOAD_ALL;
+	} else if (strcmp(argv[0], "refmap") == 0) {
+		opt.algo = RB3_SA_REFMAP;
+		load_flag |= RB3_LOAD_ALL;
 	}
 	if (opt.algo == RB3_SA_HAPDIV)
 		opt.swo.flag |= RB3_SWF_E2E | RB3_SWF_HAPDIV;
@@ -513,6 +858,12 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --old-mem   use the original MEM algorithm (for testing)\n");
 			fprintf(stderr, "  --gap=NUM   output regions >=NUM that are not covered by MEMs [%d]\n", opt.min_gap_len);
 			fprintf(stderr, "  --cov       output breadth of coverage\n");
+		}
+		if (strcmp(argv[0], "refmap") == 0) {
+			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
+			fprintf(stderr, "  --max-walk=NUM    max bases to walk outward along carriers per flank [%d]\n", opt.max_walk);
+			fprintf(stderr, "  --walk-mode=STR   carrier path: consensus|strict|per-carrier [consensus]\n");
+			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -562,6 +913,30 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
+	p.is_ref = 0, p.n_ref = 0;
+	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
+		int64_t k, plen;
+		if (opt.ref_prefix == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: refmap requires --ref-prefix\n");
+			return 1;
+		}
+		if (p.fmi.ssa == 0 || p.fmi.sid == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: refmap needs the sampled suffix array (.ssa) and sequence names (.len.gz)\n");
+			return 1;
+		}
+		plen = strlen(opt.ref_prefix);
+		p.is_ref = RB3_CALLOC(uint8_t, p.fmi.sid->n_seq);
+		for (k = 0; k < p.fmi.sid->n_seq; ++k)
+			if (strncmp(p.fmi.sid->name[k], opt.ref_prefix, plen) == 0)
+				p.is_ref[k] = 1, p.n_ref++;
+		if (p.n_ref == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: no sequence name starts with '%s'\n", opt.ref_prefix);
+			free(p.is_ref);
+			return 1;
+		}
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] %ld of %ld sequences marked as reference\n", __func__, (long)p.n_ref, (long)p.fmi.sid->n_seq);
+	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
@@ -578,5 +953,6 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		rb3_seq_close(p.fp);
 	}
 	rb3_fmi_free(&p.fmi);
+	free(p.is_ref);
 	return 0;
 }

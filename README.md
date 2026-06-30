@@ -37,6 +37,7 @@ echo CCAGGACCCCTGTCCAGTGTTAGACAGGAGCATGCAG | ./ropebwt3 sw -eN200 -Lm10 human579
   - [Finding maximal exact matches](#mem)
   - [Local alignment](#bwasw)
   - [Haplotype diversity with end-to-end alignment](#e2e)
+  - [Placing a query on a reference genome](#refmap)
   - [Indexing](#build)
   - [Binary BWT formats](#format)
 - [Citation](#cite)
@@ -119,6 +120,49 @@ alleles the 101-mer matches, 5) maximum edit distance observed,
 6) number of haplotypes with perfectly matching the 101-mer,
 7-11) number of haplotypes with edit distance 1-5 from the 101-mer,
 and 12) with distance 6 or higher.
+
+### <a name="refmap"></a>Placing a query on a reference genome
+
+When an index bundles many genomes of a species (a pangenome) and one of them is
+designated the *reference*, the `refmap` command reports the approximate location
+of a query on that reference – even when the query is **absent** from the
+reference because it falls inside an insertion (i.e. a deletion in the
+reference). Plain `mem`/`sw` cannot do this: every exact match of such a query
+lives only in the other genomes, never in the reference.
+
+`refmap` instead locates the query in the genomes that do carry it, walks outward
+along those carriers (with the BWT's backward extension) until each flank crosses
+the insertion breakpoint back into reference-shared sequence, and re-anchors the
+flanks in the reference. The two anchors bracket the query's reference position.
+
+```sh
+# the index needs the sampled suffix array (.ssa) and sequence names (.len.gz)
+ropebwt3 ssa -o pan.fmd.ssa -s8 pan.fmd
+cat *.fa | seqtk comp | cut -f1,2 | gzip > pan.fmd.len.gz
+# reference sequences are those whose name starts with the given prefix
+ropebwt3 refmap --ref-prefix=B73 pan.fmd query.fa
+```
+
+Output is one tab-separated line per query with columns: 1) query name, 2) query
+length, 3) status (`PLACED`, `ONE_SIDE`, `EXACT` or `UNPLACED`), 4) number of
+carrier genomes seen, 5) carrier names with strand, 6) reference sequence name,
+7) reference strand, 8-9) reference coordinates `cL`/`cR` bracketing the query
+(equal for a clean breakpoint; a few bp apart with microhomology), 10) reference
+span `cR-cL`, and 11) the implied inserted size. `EXACT` means the query occurs
+in the reference itself and `cL`/`cR` are its direct coordinates.
+
+Options:
+
+* `--ref-prefix=STR` (required) marks reference sequences by name prefix.
+* `--max-walk=NUM` caps how far each flank walks outward [5000]; a query inside an
+  insertion larger than this stays `UNPLACED`.
+* `--walk-mode=STR` chooses how the outward walk handles carriers that diverge in
+  the flanks: `consensus` (default; follow the most-supported base), `strict`
+  (stop at the first disagreement) or `per-carrier` (one output line per carrier,
+  each followed individually).
+
+A query that matches a carrier only partially (e.g. one mismatch) is placed via
+its longest exact core; in that case the reported inserted size is approximate.
 
 ### <a name="build"></a>Indexing
 

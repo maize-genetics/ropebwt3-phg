@@ -125,6 +125,8 @@ typedef struct {
 	ssa_intv_t *a;
 	rb3_pos_t *sa;
 	void *km;
+	const uint8_t *is_ref; // if non-NULL, only keep hits in sequences with is_ref[sid>>1]
+	int64_t scan_left;     // budget on the number of SA entries examined (for the *_ref variant)
 } ssa_aux_t;
 
 static inline void ssa_add_intv1(ssa_aux_t *aux, int64_t lo, int64_t hi, int64_t off)
@@ -187,6 +189,79 @@ int64_t rb3_ssa_multi(void *km, const rb3_fmi_t *f, const rb3_ssa_t *ssa, int64_
 				ssa_add_intv(ssa, &aux, f->acc[c] + ok[c], f->acc[c] + ol[c], x.off + 1);
 	}
 end_ssa_multi:
+	kfree(km, aux.a);
+	return aux.n_sa;
+}
+
+// Like ssa_add_intv() but only stores hits in reference sequences (aux->is_ref) and
+// charges every examined SA entry against aux->scan_left.
+static int32_t ssa_add_intv_ref(const rb3_ssa_t *ssa, ssa_aux_t *aux, int64_t lo, int64_t hi, int64_t off)
+{
+	int64_t m = aux->n0;
+	int64_t k = ((lo - m) >> ssa->ss << ssa->ss) + m;
+	if (aux->n_sa == aux->max_sa) return -1;
+	for (; k < hi; k += 1LL << ssa->ss) {
+		int64_t l = (k - m) >> ssa->ss;
+		int64_t sid, pos;
+		if (k < lo) continue;
+		if (--aux->scan_left < 0) return -1;
+		assert(l < ssa->n_ssa);
+		sid = ssa->ssa[l] & ((1LL << ssa->ms) - 1);
+		pos = off + (ssa->ssa[l] >> ssa->ms);
+		if (aux->is_ref == 0 || aux->is_ref[sid>>1]) {
+			aux->sa[aux->n_sa].sid = sid;
+			aux->sa[aux->n_sa].pos = pos;
+			aux->n_sa++;
+			if (aux->n_sa == aux->max_sa) return -1;
+		}
+		if (lo < k) ssa_add_intv1(aux, lo, k, off);
+		lo = k + 1;
+	}
+	ssa_add_intv1(aux, lo, hi, off);
+	return 0;
+}
+
+// Same BWT walk as rb3_ssa_multi() but only returns up to max_sa hits located in
+// reference sequences (is_ref[sid>>1] != 0). max_scan bounds the number of SA
+// entries inspected so that confirming a rare/absent reference hit stays cheap.
+int64_t rb3_ssa_multi_ref(void *km, const rb3_fmi_t *f, const rb3_ssa_t *ssa, int64_t lo, int64_t hi, const uint8_t *is_ref, int64_t max_sa, int64_t max_scan, rb3_pos_t *sa)
+{
+	ssa_aux_t aux;
+	int64_t ok[RB3_ASIZE], ol[RB3_ASIZE];
+	if (max_sa == 0 || lo >= hi) return 0;
+	memset(&aux, 0, sizeof(aux));
+	aux.max_sa = max_sa;
+	aux.scan_left = max_scan > 0? max_scan : INT64_MAX;
+	aux.is_ref = is_ref;
+	aux.m_a = 256, aux.n_a = 0;
+	aux.a = Kmalloc(km, ssa_intv_t, aux.m_a);
+	aux.km = km, aux.sa = sa, aux.n0 = f->acc[1];
+	ssa_add_intv_ref(ssa, &aux, lo, hi, 0);
+	while (aux.n_a > 0 && aux.n_sa < aux.max_sa && aux.scan_left > 0) {
+		int64_t l;
+		int32_t c;
+		ssa_intv_t x = aux.a[0];
+		--aux.n_a;
+		if (aux.n_a > 0) { // maintain heap
+			aux.a[0] = aux.a[aux.n_a];
+			ks_heapdown_ssa_intv(0, aux.n_a, aux.a);
+		}
+		rb3_fmi_rank2a(f, x.lo, x.hi, ok, ol);
+		for (l = ok[0]; l < ol[0]; ++l) { // reaching sentinels
+			int64_t sid = ssa->r2i[l];
+			if (--aux.scan_left < 0) goto end_ssa_multi_ref;
+			if (aux.is_ref == 0 || aux.is_ref[sid>>1]) {
+				aux.sa[aux.n_sa].sid = sid;
+				aux.sa[aux.n_sa].pos = x.off;
+				aux.n_sa++;
+				if (aux.n_sa == aux.max_sa) goto end_ssa_multi_ref;
+			}
+		}
+		for (c = 1; c < 6; ++c)
+			if (ok[c] < ol[c])
+				ssa_add_intv_ref(ssa, &aux, f->acc[c] + ok[c], f->acc[c] + ol[c], x.off + 1);
+	}
+end_ssa_multi_ref:
 	kfree(km, aux.a);
 	return aux.n_sa;
 }

@@ -28,6 +28,7 @@ static int usage(FILE *fp)
 	fprintf(fp, "    mem        find maximal exact matches\n");
 	fprintf(fp, "    hapdiv     haplotype diversity with sliding k-mers\n");
 	fprintf(fp, "    suffix     find the longest matching suffix\n");
+	fprintf(fp, "    refmap     place a query on a reference genome within a pangenome\n");
 	fprintf(fp, "  Construction:\n");
 	fprintf(fp, "    build      construct a BWT\n");
 	fprintf(fp, "    merge      merge BWTs\n");
@@ -52,6 +53,7 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "sw") == 0) ret = main_search(argc-1, argv+1);
 	else if (strcmp(argv[1], "mem") == 0) ret = main_search(argc-1, argv+1);
 	else if (strcmp(argv[1], "hapdiv") == 0) ret = main_search(argc-1, argv+1);
+	else if (strcmp(argv[1], "refmap") == 0) ret = main_search(argc-1, argv+1);
 	else if (strcmp(argv[1], "build") == 0) ret = main_build(argc-1, argv+1);
 	else if (strcmp(argv[1], "merge") == 0) ret = main_merge(argc-1, argv+1);
 	else if (strcmp(argv[1], "ssa") == 0) ret = main_ssa(argc-1, argv+1);
