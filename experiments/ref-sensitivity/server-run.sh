@@ -50,7 +50,7 @@ IDX=$DATA/nam4.fmd
 /usr/bin/time -v "$RB" build -d -t "$NCORES" -p "$NCORES" -m "$MEM_BATCH" -o "$IDX" \
   "$DATA/B73.chr.fa.gz" "$DATA/B97.chr.fa.gz" "$DATA/Ki3.chr.fa.gz" "$DATA/CML247.chr.fa.gz" \
   2> "$DATA/build.log" || { echo "build failed; see $DATA/build.log"; exit 1; }
-"$RB" ssa -s8 -o "$IDX.ssa" "$IDX"
+"$RB" ssa -t "$NCORES" -s8 -o "$IDX.ssa" "$IDX"
 for L in B73 B97 Ki3 CML247; do gzip -cd "$DATA/$L.chr.fa.gz"; done | \
   awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
        END{if(n)print n"\t"l}' | gzip > "$IDX.len.gz"
