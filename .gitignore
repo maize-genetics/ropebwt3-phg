@@ -11,3 +11,7 @@ docs/examples/*.fmd
 docs/examples/*.fmd.ssa
 docs/examples/*.fmd.len.gz
 .DS_Store
+
+# ref-sensitivity experiment data (genomes, index, queries) — too large to commit
+experiments/ref-sensitivity/data/
+/ropebwt3-omp
