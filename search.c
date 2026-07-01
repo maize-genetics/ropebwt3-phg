@@ -1,3 +1,4 @@
+#include <math.h>
 #include "fm-index.h"
 #include "align.h"
 #include "rb3priv.h"
@@ -117,6 +118,7 @@ typedef struct refmap_rst_s {
 	rb3_pos_t *carriers; // a few carrier (sid,pos); allocated with RB3_MALLOC
 	int32_t n_sub;       // per-carrier mode: number of sub-results (one per carrier)
 	struct refmap_rst_s *sub; // per-carrier mode: one placement per carrier
+	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 } refmap_rst_t;
 
 typedef struct {
@@ -439,6 +441,21 @@ static int refmap_vote_cmp(const void *a, const void *b)
 	return 0;
 }
 
+// Map the k-mer-agreement signals to a Phred-scaled MAPQ. The number of agreeing
+// k-mers is a well-calibrated, error-rate-robust precision predictor (measured on
+// maize NAM, 0-1% substitution: 1->~0.77, 2->~0.87, 3->~0.92, 4->~0.95, 5->~0.96,
+// >=6->~0.97). A runner-up cluster that ties the winner is an ambiguous locus and
+// caps precision (measured ~0.85). MAPQ = -10*log10(1 - precision). The raw agree/
+// second columns are emitted too, for callers who prefer their own thresholds.
+static inline int refmap_kmer_mapq(int agree, int second)
+{
+	static const double prec[7] = { 0.0, 0.77, 0.87, 0.92, 0.95, 0.96, 0.97 };
+	double p = prec[agree < 1? 1 : (agree > 6? 6 : agree)];
+	if (second >= agree && p > 0.85) p = 0.85;   // tie with a runner-up locus -> ambiguous
+	if (p > 0.99999) p = 0.99999;
+	return (int)(-10.0 * log10(1.0 - p) + 0.499);
+}
+
 // Collect the reference-coordinate votes of one k-mer (only if it is a full-length
 // exact, single-copy-per-taxon match): a reference hit votes directly; a carrier
 // hit votes via the liftover projection. An error-containing k-mer has no
@@ -473,7 +490,8 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
 	const rb3_mopt_t *o = p->opt;
 	int32_t K = o->kmer_len, ki = 0;
 	int64_t off, last_off, nv = 0, mv = 0, cap = o->max_occ > 0? o->max_occ : 8, i;
-	int64_t best_support = 0, best_rsid = -1, best_pos = -1;
+	int64_t best_support = 0, second_support = 0, best_rsid = -1, best_pos = -1;
+	uint64_t all_mask = 0;
 	refmap_vote_t *votes = 0;
 	rb3_pos_t *pos = Kmalloc(km, rb3_pos_t, cap);
 
@@ -488,7 +506,12 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
 		refmap_kmer_votes(km, p, s->seq + (s->len - K), K, ki++, &votes, &nv, &mv, pos, cap);
 	kfree(km, pos);
 
-	// cluster the votes; support = number of DISTINCT k-mers in the cluster
+	// n_vote = distinct k-mers that cast any vote (informative tiles)
+	for (i = 0; i < nv; ++i) if (votes[i].kmer < 64) all_mask |= 1ULL << votes[i].kmer;
+	r->n_vote = __builtin_popcountll(all_mask);
+
+	// cluster the votes; support = number of DISTINCT k-mers in the cluster. Track the
+	// top-2 cluster supports (best drives the placement; second measures competition).
 	qsort(votes, nv, sizeof(refmap_vote_t), refmap_vote_cmp);
 	for (i = 0; i < nv; ) {
 		int64_t j = i, rs = votes[i].rsid, start = votes[i].rpos, support = 0;
@@ -497,13 +520,17 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
 			if (votes[j].kmer < 64 && !(kmask >> votes[j].kmer & 1))
 				kmask |= 1ULL << votes[j].kmer, ++support;
 		if (support > best_support)
-			best_support = support, best_rsid = rs, best_pos = votes[(i + j) >> 1].rpos;
+			second_support = best_support, best_support = support, best_rsid = rs, best_pos = votes[(i + j) >> 1].rpos;
+		else if (support > second_support)
+			second_support = support;
 		i = j;
 	}
 	kfree(km, votes);
+	r->agree = (int32_t)best_support, r->second = (int32_t)second_support;
 	if (best_support >= o->min_agree) {
 		r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
 		r->cL = r->cR = best_pos, r->ins_size = 0, r->n_carrier = (int32_t)best_support;
+		r->mapq = refmap_kmer_mapq((int32_t)best_support, (int32_t)second_support);
 	}
 }
 
@@ -659,7 +686,7 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 	rb3_sprintf_lite(out, "//\n");
 }
 
-static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r)
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer)
 {
 	static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
 	int32_t k;
@@ -682,6 +709,8 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 		rb3_sprintf_lite(out, "\t%ld\t%ld", (long)(r->cR - r->cL), (long)r->ins_size);
 	else
 		rb3_sprintf_lite(out, "\t.\t.");
+	if (kmer) // --kmer confidence: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
+		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%d", r->n_vote, r->agree, r->second, r->mapq);
 	rb3_sprintf_lite(out, "\n");
 }
 
@@ -694,14 +723,15 @@ static void write_refmap(step_t *t)
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
 		refmap_rst_t *r = &t->refmap[j];
+		int kmer = p->opt->kmer_len > 0;
 		if (r->n_sub > 0) { // per-carrier mode: one line per carrier (sub->carriers borrows r->carriers)
 			for (k = 0; k < r->n_sub; ++k) {
-				write_refmap1(&out, f, s, &r->sub[k]);
+				write_refmap1(&out, f, s, &r->sub[k], kmer);
 				fputs(out.s, stdout);
 			}
 			free(r->sub);
 		} else {
-			write_refmap1(&out, f, s, r);
+			write_refmap1(&out, f, s, r, kmer);
 			fputs(out.s, stdout);
 		}
 		free(r->carriers);

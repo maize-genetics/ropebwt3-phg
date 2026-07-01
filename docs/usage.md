@@ -233,6 +233,14 @@ grows with error rate (e.g. at 2% substitution, precision 75.7%→88.1%). The co
 is recall, making this a high-precision mode suited to genotyping. Denser tiling
 (`--kmer-step`) or higher `--min-agree` trade recall for still more precision.
 
+`--kmer` also appends four **per-placement confidence** columns: `nVote`
+(informative k-mers), `agree` (k-mers supporting the placement), `second` (k-mers
+at the runner-up locus), and a calibrated `MAPQ`. The agreeing-k-mer count is a
+well-calibrated, error-robust precision predictor (`agree≥4` ≈ 95% precision) and
+`second≈agree` flags an ambiguous tie; `MAPQ = -10·log10(1-precision)` from a
+maize-NAM-calibrated table lets you threshold directly (cumulative precision at
+1% error: MAPQ≥9 → 92%, ≥13 → 97%). The raw counts are there for custom rules.
+
 ### `--walk-mode`
 
 When carriers disagree within a flank (here `Ki3_chr1` has a SNP in the

@@ -171,6 +171,13 @@ span `cR-cL`, and 11) the implied inserted size. `EXACT` means the query occurs 
 the reference itself; `MULTI` means it occurs more than `--max-occ` times (a
 repeat/retro) and is deliberately not placed.
 
+With `--kmer`, four confidence columns are appended: 12) `nVote` informative
+k-mers, 13) `agree` k-mers supporting the placement, 14) `second` k-mers at the
+runner-up locus (competition), and 15) a calibrated `MAPQ`. The agreeing-k-mer
+count is a well-calibrated, error-robust precision predictor (e.g. `agree≥4` ≈
+95% precision); `second≈agree` flags an ambiguous tie. Cumulative precision on
+100k reads at 1% error: MAPQ≥9 → 92%, ≥13 → 97%.
+
 Options:
 
 * `--ref-prefix=STR` (required) marks reference sequences by name prefix.

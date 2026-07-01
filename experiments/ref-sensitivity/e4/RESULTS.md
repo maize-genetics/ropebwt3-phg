@@ -139,6 +139,26 @@ missing one.
 `--min-agree` distinct k-mers agree. Matches the prototype (error-free
 96.0%/68.5%, 1% error 91.5%/39.5%), ~4-5 s / 100k reads, ASAN-clean.
 
+### Per-placement confidence (`--kmer` output columns)
+`--kmer` appends `nVote` (informative k-mers), `agree` (supporting the
+placement), `second` (runner-up locus), and a calibrated `MAPQ`. The number of
+agreeing k-mers is a well-calibrated, error-robust precision predictor
+(`calib.py`); measured precision by `agree`, stable across error rate:
+
+| agree | prec @0% | prec @1% |
+|---:|---:|---:|
+| 1 | 81.6% | 71.9% |
+| 2 | 90.7% | 84.3% |
+| 3 | 94.1% | 90.6% |
+| 4 | 95.7% | 94.6% |
+| 5 | 96.5% | 96.3% |
+| 6 | 97.1% | 97.2% |
+
+`second ≈ agree` flags an ambiguous tie (a paralog with equal support; e.g. a
+6-vs-6 read that is 51 kb off the truth). `MAPQ = -10·log10(1-precision)` from a
+maize-NAM table gives a directly-thresholdable score — cumulative precision at 1%
+error: MAPQ≥9 → 92.1%, ≥13 → 96.6%, ≥15 → 97.5%.
+
 ## Integrated as the C "second SSA" (DONE)
 The prototype was integrated into ropebwt3: `ropebwt3 lift` builds the
 carrier→reference map and `refmap --lift` projects at the locate step (no walk),

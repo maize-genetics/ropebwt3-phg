@@ -280,6 +280,7 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 	}
 	*out_rsid = best_rsid;
 	*out_rpos = sign * cpos + med;
+	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
 	kfree(km, resP); kfree(km, resM);
 	return 1;
 }
