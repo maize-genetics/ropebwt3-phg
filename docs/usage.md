@@ -199,6 +199,10 @@ unrelated       120 UNPLACED    0 .                              .        .     
 --lift-win=NUM     lift projection window                             [500000]
 --lift-mad=NUM     lift max residual MAD (bp) before returning NULL   [200000]
 --max-occ=N        drop queries/anchors occurring > N times (MULTI); N<0 = auto (#taxa)
+--kmer=INT         place a read from INT-bp k-mers by agreement (0 = off, whole-read)
+--kmer-step=INT    k-mer tiling step                                  [15]
+--min-agree=INT    min agreeing k-mers to place                       [2]
+--kmer-cluster=NUM agreeing k-mers must fall within NUM bp            [2000]
 --max-walk=NUM     walk: max bases to walk outward per flank          [5000]
 --walk-mode=STR    walk: consensus | strict | per-carrier             [consensus]
 --two-flank        walk: require both flanks to anchor (drops ONE_SIDE)
@@ -216,6 +220,18 @@ robust fit; where there is no confident collinear support the read is left
 `UNPLACED` (the NULL slot) rather than placed wrong. This is faster and more
 precise than the walk for bulk read placement. Pair it with `--max-occ=-1` so
 repeat/retro reads are flagged `MULTI`.
+
+### `--kmer` (error-robust, high-precision)
+
+Real reads carry sequencing error, so a 150 bp read rarely matches the index
+exactly. `--kmer 75` (with `--lift`) instead tiles the read into 75 bp k-mers,
+projects each, and places the read only where `--min-agree` distinct k-mers concur
+on a locus (within `--kmer-cluster` bp). An error-containing k-mer has no
+full-length exact match and simply doesn't vote, so error is tolerated; requiring
+agreement rejects lone paralogous k-mers, so precision rises — and the advantage
+grows with error rate (e.g. at 2% substitution, precision 75.7%→88.1%). The cost
+is recall, making this a high-precision mode suited to genotyping. Denser tiling
+(`--kmer-step`) or higher `--min-agree` trade recall for still more precision.
 
 ### `--walk-mode`
 

@@ -179,6 +179,13 @@ Options:
 * `--max-occ=N` drop queries/anchors occurring > N times (status `MULTI`); `N<0`
   = auto (= number of taxa). An informative read maps at most once per taxon, so
   this removes repeats/retros; it is the single most effective precision knob.
+* `--kmer=INT` place a read from its INT-bp k-mers by agreement instead of as a
+  whole (with `--lift`): each k-mer is projected and the read is placed only where
+  `--min-agree` distinct k-mers concur (`--kmer-step`, `--kmer-cluster`). This
+  tolerates sequencing error (an error-free k-mer still votes when the 150 bp read
+  no longer matches exactly) and raises precision as error rises — e.g. at 2%
+  substitution, precision 75.7% (whole-read) → 88.1% (75-bp k-mers, agree≥2), at a
+  recall cost.
 * Walk-only: `--max-walk=NUM` caps how far each flank walks [5000];
   `--walk-mode=consensus|strict|per-carrier` handles divergent carriers;
   `--two-flank` requires both flanks to anchor concordantly (drops the

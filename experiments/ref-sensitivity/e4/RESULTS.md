@@ -132,8 +132,12 @@ Precision by substitution rate (whole-read `--lift` vs 75 bp, step 15, agree ≥
 agreement holds precision high. The cost is recall (a conservative, high-precision
 operating point). More agreement (≥3) or denser tiling trades recall for still
 higher precision. Good fit for genotyping, where a wrong call is costlier than a
-missing one; the natural production form is to place a read from its k-mers'
-`--lift` projections and require agreement.
+missing one.
+
+**Integrated in C** as `refmap --kmer 75 [--kmer-step --min-agree --kmer-cluster]`
+(with `--lift`): tiles each read, projects each k-mer, and places only where
+`--min-agree` distinct k-mers agree. Matches the prototype (error-free
+96.0%/68.5%, 1% error 91.5%/39.5%), ~4-5 s / 100k reads, ASAN-clean.
 
 ## Integrated as the C "second SSA" (DONE)
 The prototype was integrated into ropebwt3: `ropebwt3 lift` builds the
