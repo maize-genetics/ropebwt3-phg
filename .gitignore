@@ -24,3 +24,5 @@ experiments/ref-sensitivity/e4/*.tsv
 experiments/ref-sensitivity/e4/__pycache__/
 experiments/ref-sensitivity/e4/param_log.txt
 docs/examples/*.lift
+experiments/ref-sensitivity/e4/*.out
+experiments/ref-sensitivity/e4/*.log
