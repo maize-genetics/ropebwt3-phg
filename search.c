@@ -19,6 +19,7 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_R
 #define RB3_MF_WRITE_COV   0x4
 #define RB3_MF_WRITE_ALL   0x8
 #define RB3_MF_BOTH_DIR    0x10
+#define RB3_MF_STATS       0x20 // refmap: print a per-status / locate-volume summary to stderr on exit
 
 typedef struct {
 	uint32_t flag;
@@ -37,6 +38,7 @@ typedef struct {
 	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
 	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
 	int64_t kmer_cluster;                   // refmap: cluster tolerance for agreeing k-mers (bp)
+	int64_t locate_cap; // refmap: cap on positions located per query on the whole-read path (see refmap_query)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -59,6 +61,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->lift_win = 500000, opt->lift_mad = 200000;
 	opt->kmer_len = 0;    // off by default (whole-read placement)
 	opt->kmer_step = 15, opt->min_agree = 2, opt->kmer_cluster = 2000;
+	opt->locate_cap = 64; // matches the previous hardcoded cap (unchanged default behavior)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -93,6 +96,19 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
 } pipeline_t;
+
+// refmap: run-wide counters for --stats. Updated with __sync_fetch_and_add from worker
+// threads (kt_for has no per-query mutex, and these are the only cross-thread counters),
+// and printed once to stderr after the pipeline finishes. n_status[] confirms that MULTI
+// (and UNPLACED-by-max_occ) queries return before rb3_ssa_multi() is ever called; n_located
+// / n_locate_calls measure how much locate work the surviving (non-MULTI) queries actually
+// do, i.e. how much headroom --locate-cap has below the historical fixed cap of 64.
+typedef struct {
+	int64_t n_status[5];    // counts by RB3_RM_* (top-level r->status, after refmap_query returns)
+	int64_t n_locate_calls; // number of rb3_ssa_multi() calls on the whole-read path (search.c ~line 576)
+	int64_t n_located;      // total positions returned by those calls
+} refmap_stats_t;
+static refmap_stats_t refmap_stats;
 
 typedef struct {
 	int32_t id, offset;
@@ -153,6 +169,10 @@ static void worker_for_seq(void *data, long i, int tid)
 		}
 	} else if (p->opt->algo == RB3_SA_REFMAP) { // place the query on the reference genome
 		refmap_query(b->km, p, s, &t->refmap[i]);
+		if (p->opt->flag & RB3_MF_STATS) {
+			int8_t st = t->refmap[i].status;
+			if (st >= 0 && st < 5) __sync_fetch_and_add(&refmap_stats.n_status[st], 1);
+		}
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
@@ -568,9 +588,18 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		return;
 	}
 
-	// locate a sample of occurrences; separate reference hits (exact) from carriers
-	pos = Kmalloc(km, rb3_pos_t, 64);
-	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, 64, pos);
+	// locate a sample of occurrences; separate reference hits (exact) from carriers. The cap only
+	// needs to cover what downstream placement actually consumes: an EXACT check over all located
+	// hits, plus up to 8 distinct carriers (see the loop below) -- --locate-cap lets that cap be
+	// tuned below the historical fixed 64 to cut wasted rb3_ssa_multi() work on non-MULTI, non-repeat
+	// queries whose Iq.size sits well under max_occ (e.g. up to a few dozen with --max-occ=-1).
+	int64_t cap = p->opt->locate_cap > 0? p->opt->locate_cap : 64;
+	pos = Kmalloc(km, rb3_pos_t, cap);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, cap, pos);
+	if (p->opt->flag & RB3_MF_STATS) {
+		__sync_fetch_and_add(&refmap_stats.n_locate_calls, 1);
+		__sync_fetch_and_add(&refmap_stats.n_located, np);
+	}
 	for (i = 0; i < np; ++i) {
 		if (p->is_ref[pos[i].sid>>1]) { // the query is present in the reference: report it directly
 			int64_t clen, st, en;
@@ -953,6 +982,8 @@ static ko_longopt_t long_options[] = {
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
 	{ "kmer-cluster",    ko_required_argument, 319 },
+	{ "locate-cap",      ko_required_argument, 320 },
+	{ "stats",           ko_no_argument,       321 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1019,6 +1050,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
 		else if (c == 319) opt.kmer_cluster = rb3_parse_num(o.arg);
+		else if (c == 320) opt.locate_cap = rb3_parse_num(o.arg); // cap on rb3_ssa_multi() positions per query (whole-read path)
+		else if (c == 321) opt.flag |= RB3_MF_STATS;              // print a status/locate-volume summary to stderr on exit
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1070,6 +1103,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
 			fprintf(stderr, "  --kmer-cluster=NUM  agreeing k-mers must fall within NUM bp [%ld]\n", (long)opt.kmer_cluster);
+			fprintf(stderr, "  --locate-cap=INT  cap positions located per query on the whole-read path [%ld]\n", (long)opt.locate_cap);
+			fprintf(stderr, "  --stats           print a per-status / locate-volume summary to stderr on exit\n");
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
@@ -1186,6 +1221,20 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		kt_pipeline(2, worker_pipeline, &p, 3);
 		rb3_seq_close(p.fp);
+	}
+	if (opt.algo == RB3_SA_REFMAP && (opt.flag & RB3_MF_STATS)) {
+		static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
+		int64_t n_tot = 0, k;
+		for (k = 0; k < 5; ++k) n_tot += refmap_stats.n_status[k];
+		fprintf(stderr, "[M::%s] refmap --stats: %ld queries\n", __func__, (long)n_tot);
+		for (k = 0; k < 5; ++k)
+			fprintf(stderr, "[M::%s]   %-8s %ld (%.2f%%)\n", __func__, status_str[k],
+					(long)refmap_stats.n_status[k], n_tot > 0? 100.0 * refmap_stats.n_status[k] / n_tot : 0.0);
+		fprintf(stderr, "[M::%s]   locate calls (rb3_ssa_multi, whole-read path): %ld, positions located: %ld (avg %.2f/call)\n",
+				__func__, (long)refmap_stats.n_locate_calls, (long)refmap_stats.n_located,
+				refmap_stats.n_locate_calls > 0? (double)refmap_stats.n_located / refmap_stats.n_locate_calls : 0.0);
+		fprintf(stderr, "[M::%s]   note: MULTI (and error-read UNPLACED with no core match) queries return before any locate call -- "
+				"only PLACED/ONE_SIDE/EXACT queries above pay the locate cost\n", __func__);
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);

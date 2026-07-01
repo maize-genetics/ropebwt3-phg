@@ -26,3 +26,6 @@ experiments/ref-sensitivity/e4/param_log.txt
 docs/examples/*.lift
 experiments/ref-sensitivity/e4/*.out
 experiments/ref-sensitivity/e4/*.log
+
+# refmap-multi-speedup scratch benchmark data (reads, outputs) — too large to commit
+/tmp_bench/
