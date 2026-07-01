@@ -16,11 +16,23 @@ You have one BWT index built from many genomes of a species (e.g. the 26 maize
 NAM founders), and one of them is the reference (e.g. B73). You have a short
 query (say 150 bp) that hits several genomes but **not** the reference, because
 the region is part of an insertion relative to the reference. `mem` and `sw`
-cannot give you a reference coordinate for it; `refmap` can, by walking outward
-through the carrier genomes to the insertion breakpoints and re-anchoring there.
+cannot give you a reference coordinate for it; `refmap` can.
+
+`refmap` places such a query in one of two ways:
+
+* **`--lift` (recommended)** — project the carrier hit to a reference coordinate
+  through a precomputed carrier→reference map (the "second SSA", built once by
+  `ropebwt3 lift`). Fast and accurate for bulk read placement (95.5% precision,
+  77.9% recall, ~15× faster than the walk on a 4-genome maize benchmark). See
+  [lift-second-ssa.md](lift-second-ssa.md).
+* **walk (default, no extra build)** — walk outward through the carriers to the
+  insertion breakpoints and re-anchor there; this *brackets* the breakpoint and
+  reports the inserted size, which is what you want for structural detail on a
+  single locus.
 
 If the query *is* present in the reference, `refmap` reports its exact
-coordinates (`status = EXACT`) instead.
+coordinates (`status = EXACT`) instead. A query occurring more than `--max-occ`
+times (a repeat/retro) is reported as `MULTI` and not placed.
 
 ---
 
@@ -33,6 +45,7 @@ coordinates (`status = EXACT`) instead.
 | `<base>.fmd` | `ropebwt3 build -d` | the BWT itself |
 | `<base>.fmd.ssa` | `ropebwt3 ssa` | sampled suffix array → coordinates |
 | `<base>.fmd.len.gz` | `seqtk comp` / awk | sequence names and lengths |
+| `<base>.lift` *(optional)* | `ropebwt3 lift` | carrier→reference map, for `--lift` |
 
 The reference is selected by **sequence-name prefix**, so name the reference
 sequences with a common prefix (e.g. `B73_chr1`, `B73_chr2`, …) distinct from
@@ -99,7 +112,14 @@ ropebwt3 ssa -s8 -o docs/examples/pangenome.fmd.ssa docs/examples/pangenome.fmd
 # 3. names + lengths (seqtk alternative shown; the script uses awk)
 seqtk comp docs/examples/pangenome.fa | cut -f1,2 | gzip > docs/examples/pangenome.fmd.len.gz
 
-# 4. place the queries on the B73 reference
+# 4. RECOMMENDED: build the lift map once, then place by projection.
+#    (tiny example uses -k 31 -s 10; real genomes: defaults -k 100 -s 2000, ref FASTA)
+ropebwt3 lift --ref-prefix=B73 -k 31 -s 10 -o docs/examples/pangenome.lift \
+  docs/examples/pangenome.fmd docs/examples/pangenome.fa
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift docs/examples/pangenome.lift \
+  docs/examples/pangenome.fmd docs/examples/queries.fa
+
+# 5. or the no-setup fallback (walk)
 ropebwt3 refmap --ref-prefix=B73 docs/examples/pangenome.fmd docs/examples/queries.fa
 ```
 
@@ -157,10 +177,11 @@ unrelated       120 UNPLACED    0 .                              .        .     
 
 | status | meaning |
 |---|---|
-| `PLACED` | both flanks re-anchored; `cL`/`cR` bracket the query on the reference |
-| `ONE_SIDE` | only one flank anchored (the other side diverges or is too far) |
+| `PLACED` | placed on the reference: `--lift` projection, or (walk) both flanks re-anchored and `cL`/`cR` bracket the query |
+| `ONE_SIDE` | walk only: one flank anchored (the other diverges or is too far) — low precision; `--two-flank` or `--lift` avoids it |
 | `EXACT` | the query occurs in the reference itself; `cL`/`cR` are its coordinates |
-| `UNPLACED` | the query is in no genome, or no anchor within `--max-walk` |
+| `MULTI` | the query occurs more than `--max-occ` times (repeat/retro); deliberately not placed |
+| `UNPLACED` | the query is in no genome; the walk found no anchor within `--max-walk`; or `--lift` found no confident collinear projection (the NULL slot) |
 
 > **Microhomology.** With real sequence, the inserted bases often share a few
 > bases with the flanks, so `cL` and `cR` can differ by a few bp and `refSpan`
@@ -174,12 +195,27 @@ unrelated       120 UNPLACED    0 .                              .        .     
 
 ```
 --ref-prefix=STR   reference = sequences whose name starts with STR   [required]
---max-walk=NUM     max bases to walk outward along carriers per flank [5000]
---walk-mode=STR    carrier path: consensus | strict | per-carrier     [consensus]
+--lift=FILE        project carrier hits via a `ropebwt3 lift` map (recommended)
+--lift-win=NUM     lift projection window                             [500000]
+--lift-mad=NUM     lift max residual MAD (bp) before returning NULL   [200000]
+--max-occ=N        drop queries/anchors occurring > N times (MULTI); N<0 = auto (#taxa)
+--max-walk=NUM     walk: max bases to walk outward per flank          [5000]
+--walk-mode=STR    walk: consensus | strict | per-carrier             [consensus]
+--two-flank        walk: require both flanks to anchor (drops ONE_SIDE)
 -l INT             min anchor length when re-mapping a flank          [19]
 -t INT             number of threads                                  [4]
 -L                 one sequence per line in the input
 ```
+
+### `--lift` (recommended)
+
+Build the map once with `ropebwt3 lift` (see
+[lift-second-ssa.md](lift-second-ssa.md)), then pass `--lift FILE` to `refmap`.
+Each carrier hit is projected to a reference coordinate by a windowed slope=±1
+robust fit; where there is no confident collinear support the read is left
+`UNPLACED` (the NULL slot) rather than placed wrong. This is faster and more
+precise than the walk for bulk read placement. Pair it with `--max-occ=-1` so
+repeat/retro reads are flagged `MULTI`.
 
 ### `--walk-mode`
 

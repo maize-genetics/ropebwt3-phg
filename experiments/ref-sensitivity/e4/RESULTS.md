@@ -108,10 +108,37 @@ Practical implication: longer reads buy large recall gains (56.7→87.4% from
 `--max-occ 4` (auto=#taxa), anchors stride 2000 len 100, `--robust --win 500000
 --max-mad 200000`.
 
-## Next: integrate as the C "second SSA"
-The prototype proves the concept offline (Python over `mem -p`). Production form:
-a second per-taxon→reference coordinate map alongside `.ssa` (built once from
-unique anchors), consulted at the locate step inside `refmap` so a carrier hit is
-projected to B73 without any walk; NULL slots → UNPLACED. Expected to fold E4's
-precision+recall+speed into `refmap` directly.
+## Precision under sequencing error: 75 bp k-mer agreement
+
+Real reads carry errors, so a 150 bp read rarely matches the index exactly; the
+whole-read placement then falls back to a short, less-unique core and loses
+precision. Splitting the read into overlapping 75 bp k-mers and requiring
+**≥ N of them to agree** on a locus (only full-length exact k-mer hits count, so
+an error-containing k-mer simply contributes nothing) tolerates error and raises
+precision. Scripts: `add_errors.py`, `gen_kmers.py`, `place_kmers.py`,
+`kmer_exp.sh`.
+
+Precision by substitution rate (whole-read `--lift` vs 75 bp, step 15, agree ≥ 2):
+
+| error | whole-read prec / recall | k-mer≥2 prec / recall |
+|---:|---:|---:|
+| 0% | 95.5% / 77.9% | 96.1% / 68.6% |
+| 1% | 85.1% / 65.3% | 91.5% / 39.5% |
+| 2% | 75.7% / 55.6% | 88.1% / 19.9% |
+| 3% | 68.4% / 48.5% | 85.2% / 12.0% |
+
+**The k-mer precision advantage grows with error rate** (+0.6 → +16.8 pts from
+0→3%): whole-read degrades fast as exact 150 bp matches vanish, while k-mer
+agreement holds precision high. The cost is recall (a conservative, high-precision
+operating point). More agreement (≥3) or denser tiling trades recall for still
+higher precision. Good fit for genotyping, where a wrong call is costlier than a
+missing one; the natural production form is to place a read from its k-mers'
+`--lift` projections and require agreement.
+
+## Integrated as the C "second SSA" (DONE)
+The prototype was integrated into ropebwt3: `ropebwt3 lift` builds the
+carrier→reference map and `refmap --lift` projects at the locate step (no walk),
+with NULL slots → UNPLACED. Measured `refmap --lift`: precision 95.5%, recall
+77.9%, 2.76 s / 100k reads (~15×), ASAN-clean. Construction walkthrough:
+[`../../../docs/lift-second-ssa.md`](../../../docs/lift-second-ssa.md).
 

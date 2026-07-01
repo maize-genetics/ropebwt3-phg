@@ -135,36 +135,54 @@ reference because it falls inside an insertion (i.e. a deletion in the
 reference). Plain `mem`/`sw` cannot do this: every exact match of such a query
 lives only in the other genomes, never in the reference.
 
-`refmap` instead locates the query in the genomes that do carry it, walks outward
-along those carriers (with the BWT's backward extension) until each flank crosses
-the insertion breakpoint back into reference-shared sequence, and re-anchors the
-flanks in the reference. The two anchors bracket the query's reference position.
+`refmap` locates the query in the genomes that carry it, then places it on the
+reference in one of two ways:
+
+* **Lift / "second SSA" (recommended).** A precomputed carrier→reference
+  coordinate map (`ropebwt3 lift`) lets `refmap --lift` **project** a carrier hit
+  straight to a reference coordinate. On a 4-genome maize benchmark this reached
+  **95.5% precision, 77.9% recall, and ~15× faster** placement than the walk. See
+  [docs/lift-second-ssa.md](docs/lift-second-ssa.md) and
+  [docs/results-maize.md](docs/results-maize.md).
+* **Walk (default fallback, no extra build).** When no `--lift` map is given,
+  `refmap` walks outward along the carriers (BWT backward extension) until each
+  flank crosses the insertion breakpoint into reference-shared sequence, and
+  re-anchors the flanks; the two anchors bracket the query's reference position.
 
 ```sh
-# the index needs the sampled suffix array (.ssa) and sequence names (.len.gz)
-ropebwt3 ssa -o pan.fmd.ssa -s8 pan.fmd
+# 0. the index needs the sampled suffix array (.ssa) and sequence names (.len.gz)
+ropebwt3 ssa -t 20 -s8 -o pan.fmd.ssa pan.fmd
 cat *.fa | seqtk comp | cut -f1,2 | gzip > pan.fmd.len.gz
-# reference sequences are those whose name starts with the given prefix
+
+# --- recommended: build the lift map once, then project ---
+ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa      # the "second SSA"
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
+
+# --- or the no-setup fallback (walk) ---
 ropebwt3 refmap --ref-prefix=B73 pan.fmd query.fa
 ```
 
 Output is one tab-separated line per query with columns: 1) query name, 2) query
-length, 3) status (`PLACED`, `ONE_SIDE`, `EXACT` or `UNPLACED`), 4) number of
-carrier genomes seen, 5) carrier names with strand, 6) reference sequence name,
+length, 3) status (`PLACED`, `ONE_SIDE`, `EXACT`, `MULTI` or `UNPLACED`), 4) number
+of carrier genomes seen, 5) carrier names with strand, 6) reference sequence name,
 7) reference strand, 8-9) reference coordinates `cL`/`cR` bracketing the query
 (equal for a clean breakpoint; a few bp apart with microhomology), 10) reference
-span `cR-cL`, and 11) the implied inserted size. `EXACT` means the query occurs
-in the reference itself and `cL`/`cR` are its direct coordinates.
+span `cR-cL`, and 11) the implied inserted size. `EXACT` means the query occurs in
+the reference itself; `MULTI` means it occurs more than `--max-occ` times (a
+repeat/retro) and is deliberately not placed.
 
 Options:
 
 * `--ref-prefix=STR` (required) marks reference sequences by name prefix.
-* `--max-walk=NUM` caps how far each flank walks outward [5000]; a query inside an
-  insertion larger than this stays `UNPLACED`.
-* `--walk-mode=STR` chooses how the outward walk handles carriers that diverge in
-  the flanks: `consensus` (default; follow the most-supported base), `strict`
-  (stop at the first disagreement) or `per-carrier` (one output line per carrier,
-  each followed individually).
+* `--lift=FILE` project carrier hits through a `ropebwt3 lift` map instead of
+  walking (recommended); `--lift-win`/`--lift-mad` tune the projection.
+* `--max-occ=N` drop queries/anchors occurring > N times (status `MULTI`); `N<0`
+  = auto (= number of taxa). An informative read maps at most once per taxon, so
+  this removes repeats/retros; it is the single most effective precision knob.
+* Walk-only: `--max-walk=NUM` caps how far each flank walks [5000];
+  `--walk-mode=consensus|strict|per-carrier` handles divergent carriers;
+  `--two-flank` requires both flanks to anchor concordantly (drops the
+  low-precision `ONE_SIDE` case).
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
