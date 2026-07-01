@@ -2,7 +2,7 @@
 # Columns (tab-separated):
 #   1 qname     query name
 #   2 qlen      query length
-#   3 status    PLACED | ONE_SIDE | EXACT | UNPLACED
+#   3 status    PLACED | ONE_SIDE | EXACT | MULTI | UNPLACED
 #   4 nCarrier  number of carrier genomes the query was found in
 #   5 carriers  carrier sequence names with strand (name:+/-), '.' if none
 #   6 refName   reference sequence the query was placed on, '.' if none
@@ -16,7 +16,16 @@
 # reference coordinate 300; the insertion is 500 bp; ref_query was taken from
 # reference positions 250..400.
 
-# === default (consensus) mode ===
+# === --lift (recommended): project the carrier hit to a reference coordinate ===
+# The projection returns a single approximate coordinate (cL == cR) rather than
+# the breakpoint bracket + insertion size the walk gives. lift is optimized for
+# genome-scale bulk placement (see docs/results-maize.md); on this 1100 bp toy the
+# projection window is far larger than the sequences, so treat it as illustrative.
+ins_query	150	PLACED	6	Ki3_chr1:+,Tx303_chr1:+,CML247_chr1:+,Mo17_chr1:+,Oh43_chr1:+,B97_chr1:+	B73_chr1	+	500	500	0	0
+ref_query	150	EXACT	0	.	B73_chr1	+	250	400	150	0
+unrelated	120	UNPLACED	0	.	.	.	.	.	.	.
+
+# === walk, default (consensus) mode: bracket the breakpoint + report insert size ===
 ins_query	150	PLACED	6	Oh43_chr1:+,B97_chr1:+,CML247_chr1:+,Mo17_chr1:+,Ki3_chr1:+,Tx303_chr1:+	B73_chr1	+	300	300	0	500
 ins_query_rc	150	PLACED	6	Oh43_chr1:-,Tx303_chr1:-,B97_chr1:-,Mo17_chr1:-,CML247_chr1:-,Ki3_chr1:-	B73_chr1	-	300	300	0	500
 ref_query	150	EXACT	0	.	B73_chr1	+	250	400	150	0

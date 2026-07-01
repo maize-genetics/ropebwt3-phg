@@ -105,6 +105,14 @@ three are the priorities flagged after the initial implementation.
 
 ### 1. Speed and the locate tradeoff on real genomes
 
+> **Update:** a maize-scale benchmark now exists — 4 NAM founders, 100k reads —
+> see [`benchmark-maize.md`](benchmark-maize.md) (protocol) and
+> [`results-maize.md`](results-maize.md) (results). Headline: `refmap` is ~35×
+> slower than `mem` (wall) and ~54% correct-chr overall, with error concentrated
+> in the `ONE_SIDE` single-anchor path (~60% of errors) and high-copy retro reads.
+> Precision-fix experiments E1–E3 (two-flank concordance, `--max-occ`
+> uniqueness) are specified there.
+
 The synthetic tests are tiny; the real cost is unknown on maize-scale data
 (chromosome-length sequences × ~24 genomes). The likely hot spot is
 `refmap_anchor_flank`, which today does a base-by-base reference-membership check
