@@ -5,6 +5,7 @@
 #include "ketopt.h"
 #include "kthread.h"
 #include "kalloc.h"
+#include "lift.h"
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
 
@@ -31,6 +32,8 @@ typedef struct {
 	int64_t max_occ;   // refmap: reject reads/anchors occurring > max_occ times (0 = off; <0 = auto = #taxa)
 	int64_t max_bracket; // refmap: reject a PLACED if |cR-cL| > max_bracket (0 = off)
 	int8_t two_flank;  // refmap: require both flanks to anchor concordantly (1 = on)
+	char *lift_fn;     // refmap: liftover file -> project carrier hits instead of walking
+	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -49,6 +52,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->max_occ = 0;     // off by default (E0 baseline)
 	opt->max_bracket = 0; // off by default
 	opt->two_flank = 0;   // off by default
+	opt->lift_fn = 0;     // off by default (walk)
+	opt->lift_win = 500000, opt->lift_mad = 200000;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -81,6 +86,7 @@ typedef struct {
 	rb3_seqio_t *fp;
 	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
 	int64_t n_ref;   // refmap: number of reference sequences
+	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
 } pipeline_t;
 
 typedef struct {
@@ -389,6 +395,35 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 	return 1;
 }
 
+// Place a carrier-only query by PROJECTING its carrier hits to the reference via
+// the liftover (the E4 "second SSA"), instead of walking outward. The majority
+// reference sequence among the per-carrier projections wins; NULL projections
+// (no confident collinear support) are dropped, and if none survive -> UNPLACED.
+static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int64_t rsids[8], rposs[8], best_rsid = -1, med, v[8];
+	int32_t n = 0, k, j, bestn, m;
+	for (k = 0; k < r->n_car_list && n < 8; ++k) {
+		int64_t clen, st, en, rsid, rpos;
+		pos_stranded(f->sid, &r->carriers[k], s->len, &clen, &st, &en);
+		if (rb3_lift_project(p->lift, km, (int32_t)(r->carriers[k].sid >> 1), st,
+							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
+			rsids[n] = rsid, rposs[n] = rpos, ++n;
+	}
+	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
+	for (k = 0, bestn = 0; k < n; ++k) {           // majority reference sequence
+		int32_t c = 0;
+		for (j = 0; j < n; ++j) if (rsids[j] == rsids[k]) ++c;
+		if (c > bestn) bestn = c, best_rsid = rsids[k];
+	}
+	for (k = 0, m = 0; k < n; ++k) if (rsids[k] == best_rsid) v[m++] = rposs[k];
+	for (k = 1; k < m; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
+	med = v[m >> 1];
+	r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
+	r->cL = r->cR = med, r->ins_size = 0;
+}
+
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -446,6 +481,11 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 	r->n_car_list = n_car, r->n_carrier = n_car;
 	kfree(km, pos);
+
+	if (p->lift) { // E4: project carrier hits to the reference instead of walking
+		refmap_place_lift(km, p, s, r);
+		return;
+	}
 
 	if (p->opt->walk_mode == RB3_WALK_PERCARRIER && n_car > 0) {
 		// place each carrier separately, following that one carrier through divergences
@@ -792,6 +832,9 @@ static ko_longopt_t long_options[] = {
 	{ "max-occ",         ko_required_argument, 310 },
 	{ "two-flank",       ko_no_argument,       311 },
 	{ "max-bracket",     ko_required_argument, 312 },
+	{ "lift",            ko_required_argument, 313 },
+	{ "lift-win",        ko_required_argument, 314 },
+	{ "lift-mad",        ko_required_argument, 315 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -851,6 +894,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 310) opt.max_occ = atol(o.arg);     // E2: occurrence cap; <0 = auto (#taxa)
 		else if (c == 311) opt.two_flank = 1;             // E1: require both flanks to anchor
 		else if (c == 312) opt.max_bracket = rb3_parse_num(o.arg); // E1: max |cR-cL| for a PLACED
+		else if (c == 313) opt.lift_fn = o.arg;           // E4: liftover file (project, not walk)
+		else if (c == 314) opt.lift_win = rb3_parse_num(o.arg);
+		else if (c == 315) opt.lift_mad = rb3_parse_num(o.arg);
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -895,6 +941,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
 			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
 			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
+			fprintf(stderr, "  --lift=FILE       project carrier hits via a `ropebwt3 lift` map instead of walking\n");
+			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
+			fprintf(stderr, "  --lift-mad=NUM    liftover max residual MAD [%ld]\n", (long)opt.lift_mad);
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
@@ -945,7 +994,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
 	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
 		int64_t k, plen;
 		if (opt.ref_prefix == 0) {
@@ -986,6 +1035,16 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 3)
 				fprintf(stderr, "[M::%s] auto --max-occ = %ld (distinct taxa)\n", __func__, (long)opt.max_occ);
 		}
+		if (opt.lift_fn) { // E4: load the carrier->reference liftover
+			p.lift = rb3_lift_restore(opt.lift_fn);
+			if (p.lift == 0) {
+				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);
+				free(p.is_ref);
+				return 1;
+			}
+			if (rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s] loaded liftover over %ld sequences\n", __func__, (long)rb3_lift_n_seq(p.lift));
+		}
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
@@ -1004,5 +1063,6 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
+	rb3_lift_destroy(p.lift);
 	return 0;
 }

@@ -107,6 +107,23 @@ carrier→reference offset map gives an approximate B73 band without walking, an
 simultaneously enables an off-diagonal (paralog) rejection — see
 [`handoff.md`](handoff.md) open-question #2.
 
+**E4 is now implemented** as the `lift` subcommand (the "second SSA") + `refmap
+--lift` (`lift.c`, `search.c`). Workflow:
+
+```sh
+# build the carrier->reference liftover once (like ssa), from the reference FASTA
+ropebwt3 lift --ref-prefix=B73 -k 100 -s 2000 -t 20 -o nam4.lift nam4.fmd B73.chr.fa.gz
+# place reads by projection instead of walking
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift nam4.lift -t 20 nam4.fmd queries.fa
+```
+
+`lift` slides k-mers over the reference, and for each single-copy-per-taxon k-mer
+(≤ `-m`, auto = #taxa) records (carrier_pos ↔ reference_pos) pairs. At query time
+`refmap --lift` projects a carrier hit with a windowed slope=±1 robust fit
+(`--lift-win`, `--lift-mad`), returning `PLACED` or, where no confident collinear
+support exists, leaving the read `UNPLACED` (the NULL slot). Measured: **95.5%
+precision, 77.9% recall, 2.76 s / 100k reads** (see results-maize.md E4 row).
+
 **Biological basis for E2:** ~40% of sequence is not shared between two maize
 lines, but retrotransposons are shared and high-copy. A single-copy (informative)
 locus contributes at most one hit per taxon, so an informative read maps

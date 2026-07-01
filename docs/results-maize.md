@@ -16,7 +16,7 @@ a coordinate (not UNPLACED/MULTI). Canonical numbers from `analyze.py` ALL row.
 | **E1** | `--two-flank` | 66,555 | 49,736 | 14,263 | **74.7%** | 49.7% |
 | **E2** | `--max-occ=4` | 56,858 | 50,083 | 5,219 | **88.1%** | 50.1% |
 | **E3** | `--two-flank --max-occ=4` | 47,337 | 45,459 | **920** | **96.0%** | 45.5% |
-| **E4** | synteny-prior liftover (prototype) | 80,950 | 77,630 | 1,177 | **95.9%** | **77.6%** |
+| **E4** | `--lift` synteny prior (C, integrated) | 81,536 | 77,893 | 1,417 | **95.5%** | **77.9%** |
 
 **Takeaways.** Both fixes do exactly what the diagnosis predicted, and stack:
 - **E1** removes `ONE_SIDE`: wrong-chr 35.8k → 14.3k (−60%), precision 57→75%, at
@@ -29,15 +29,15 @@ a coordinate (not UNPLACED/MULTI). Canonical numbers from `analyze.py` ALL row.
 - `--max-occ=4` (= #taxa) also trims B73 control 86.6→81.3% — a few correctly
   placed shared loci (occ 5–8) get flagged `MULTI`; a slightly higher threshold
   would recover them. **Sweep `--max-occ ∈ {4,6,8,…}` is the obvious next tuning.**
-- **E4 (synteny prior) is the breakthrough**: it replaces the slow walk with a
-  carrier→B73 coordinate projection (built from unique anchors), reaching the same
-  ~96% precision as E3 but at **77.6% recall (+32 pts)** and ~15× faster
-  placement. Prototype + method in
+- **E4 (synteny prior) is the breakthrough, now implemented in C.** It replaces
+  the slow walk with a carrier→B73 coordinate projection (the "second SSA", built
+  once by `ropebwt3 lift`). Integrated `refmap --lift`: **precision 95.5%, recall
+  77.9% (+32 pts over E3), and 2.76 s for 100k reads (~15× faster than the walk,
+  essentially `mem` speed).** ASAN-clean. The liftover build is a one-time
+  index-side cost (21.6 s over B73, 21 MB file), analogous to `.ssa`. Method +
+  prototype sweeps in
   [`../experiments/ref-sensitivity/e4/RESULTS.md`](../experiments/ref-sensitivity/e4/RESULTS.md).
-  Carrier-projected placements are ~94% correct vs refmap's 14.7% `ONE_SIDE`.
-  Recall is now capped by the ~18% genuinely-repetitive (`MULTI`) reads. Next:
-  integrate as a C "second SSA" so `refmap` projects at locate time without
-  walking.
+  Recall is now capped by the ~18% genuinely-repetitive (`MULTI`) reads.
 
 ## Scoreboard — speed (100k reads, `-t 20`)
 
@@ -49,6 +49,7 @@ a coordinate (not UNPLACED/MULTI). Canonical numbers from `analyze.py` ALL row.
 | **E1** | `refmap --two-flank` | 39.50 s | 2,532 | — | — | — | 34× |
 | **E2** | `refmap --max-occ=4` | 37.44 s | 2,671 | — | — | — | 32× |
 | **E3** | `refmap` E1+E2 | 37.47 s | 2,669 | — | — | — | 32× |
+| **E4** | `refmap --lift` (C) | **2.76 s** | **36,232** | — | — | 2.6 GB | **1.03×** |
 
 Speed read: `refmap` is ~35× slower than `mem` by wall (≈70× by CPU-seconds, since
 `mem` finishes too fast at 1.16 s to fully use 20 threads) and ~4.3× slower than

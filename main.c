@@ -11,6 +11,7 @@ int main_build(int argc, char *argv[]);
 int main_merge(int argc, char *argv[]);
 int main_get(int argc, char *argv[]);
 int main_ssa(int argc, char *argv[]);
+int main_lift(int argc, char *argv[]);
 int main_suffix(int argc, char *argv[]);
 int main_search(int argc, char *argv[]);
 int main_kount(int argc, char *argv[]);
@@ -34,6 +35,7 @@ static int usage(FILE *fp)
 	fprintf(fp, "    merge      merge BWTs\n");
 	fprintf(fp, "    plain2fmd  convert BWT in plain text to FMD\n");
 	fprintf(fp, "    ssa        generate sampled suffix array\n");
+	fprintf(fp, "    lift       build carrier->reference liftover for refmap --lift\n");
 	fprintf(fp, "  Miscellaneous:\n");
 	fprintf(fp, "    get        retrieve the i-th sequence from BWT\n");
 	fprintf(fp, "    stat       basic statistics of BWT\n");
@@ -57,6 +59,7 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "build") == 0) ret = main_build(argc-1, argv+1);
 	else if (strcmp(argv[1], "merge") == 0) ret = main_merge(argc-1, argv+1);
 	else if (strcmp(argv[1], "ssa") == 0) ret = main_ssa(argc-1, argv+1);
+	else if (strcmp(argv[1], "lift") == 0) ret = main_lift(argc-1, argv+1);
 	else if (strcmp(argv[1], "stat") == 0) ret = main_stat(argc-1, argv+1);
 	else if (strcmp(argv[1], "suffix") == 0) ret = main_suffix(argc-1, argv+1);
 	else if (strcmp(argv[1], "get") == 0) ret = main_get(argc-1, argv+1);
