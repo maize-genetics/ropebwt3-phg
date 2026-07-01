@@ -123,6 +123,7 @@ ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift nam4.lift -t 20 nam4.fmd qu
 (`--lift-win`, `--lift-mad`), returning `PLACED` or, where no confident collinear
 support exists, leaving the read `UNPLACED` (the NULL slot). Measured: **95.5%
 precision, 77.9% recall, 2.76 s / 100k reads** (see results-maize.md E4 row).
+How the liftover is constructed, step by step: [`lift-second-ssa.md`](lift-second-ssa.md).
 
 **Biological basis for E2:** ~40% of sequence is not shared between two maize
 lines, but retrotransposons are shared and high-copy. A single-copy (informative)

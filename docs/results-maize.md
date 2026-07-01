@@ -34,7 +34,8 @@ a coordinate (not UNPLACED/MULTI). Canonical numbers from `analyze.py` ALL row.
   once by `ropebwt3 lift`). Integrated `refmap --lift`: **precision 95.5%, recall
   77.9% (+32 pts over E3), and 2.76 s for 100k reads (~15× faster than the walk,
   essentially `mem` speed).** ASAN-clean. The liftover build is a one-time
-  index-side cost (21.6 s over B73, 21 MB file), analogous to `.ssa`. Method +
+  index-side cost (21.6 s over B73, 21 MB file), analogous to `.ssa`. How the
+  liftover is built: [`lift-second-ssa.md`](lift-second-ssa.md). Method +
   prototype sweeps in
   [`../experiments/ref-sensitivity/e4/RESULTS.md`](../experiments/ref-sensitivity/e4/RESULTS.md).
   Recall is now capped by the ~18% genuinely-repetitive (`MULTI`) reads.
