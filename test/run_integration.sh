@@ -66,9 +66,14 @@ check_line_in "ps4g: gametes sorted, B73 first (0)" "$TMP/out.ps4g" "$(printf '#
 check_line_in "ps4g: 6 non-reference carriers, alphabetical from index 1" "$TMP/out.ps4g" "$(printf '#B97\t1\t3')"
 check_line_in "ps4g: data section header" "$TMP/out.ps4g" "$(printf 'gameteSet\trefContig\trefPosBinned\tcount')"
 check_line_in "ps4g: ref_query's EXACT hit contributes gamete B73 only (not equivalent to any carrier)" "$TMP/out.ps4g" \
-	"$(printf '0\t_chr1\t0\t1')"
+	"$(printf '0\tchr1\t0\t1')"
 check_line_in "ps4g: the 3 PLACED reads at the insertion share one 6-carrier gameteSet, count aggregated to 3" "$TMP/out.ps4g" \
-	"$(printf '1,2,3,4,5,6\t_chr1\t1\t3')"
+	"$(printf '1,2,3,4,5,6\tchr1\t1\t3')"
+# refContig must be the bare contig name ("chr1"), never a stray leading '_' left
+# over from a --ref-prefix that (like the real-world --ref-prefix=B73 used here
+# and in the project's own scripts) doesn't itself include the separator.
+check_eq "ps4g: no data row's refContig has a stray leading underscore" \
+	"$(awk 'BEGIN{FS="\t"} /^gameteSet/{p=1;next} p && $2 ~ /^_/{print $2}' "$TMP/out.ps4g")" ""
 
 # invariant: #TotalUniqueCounts must equal the sum of the data rows' count column
 declare_total=$(grep '^#TotalUniqueCounts:' "$TMP/out.ps4g" | awk '{print $2}')
@@ -97,7 +102,7 @@ shape=$(echo "$npy_header" | grep -oE "'shape': \([0-9]+, [0-9]+\)" | grep -oE '
 check_eq "npy: shape is 2 bins x 9 columns (7 gametes + 2 labels)" "$shape" "2 9 "
 
 check_line_in "npy: gametes.tsv lists all 7 samples, B73 first" "$TMP/out.npy.gametes.tsv" "$(printf '0\tB73')"
-check_line_in "npy: bins.tsv row for the insertion locus (bin 1, contig stripped)" "$TMP/out.npy.bins.tsv" "$(printf '1\t_chr1\t1')"
+check_line_in "npy: bins.tsv row for the insertion locus (bin 1, contig stripped)" "$TMP/out.npy.bins.tsv" "$(printf '1\tchr1\t1')"
 
 # --- 2b. --npy-binary: same locations, but presence (1) instead of the read count ---
 "$RB" refmap --ref-prefix=B73 --npy "$TMP/binary.npy" --npy-binary -t1 "$IDX" "$DIR/queries.fa" \
@@ -122,9 +127,12 @@ else
 fi
 
 # --- 3. --label-bed: diploid training labels ---
+# chrom is the bare contig name ("chr1", not "_chr1"): this exercises
+# bed_resolve_contig's contig_suffix-based match against --ref-prefix=B73
+# (no trailing underscore), the same convention the project's own scripts use.
 cat > "$TMP/labels.bed" <<'EOF'
-_chr1	0	100	B73
-_chr1	200	400	Ki3	Mo17
+chr1	0	100	B73
+chr1	200	400	Ki3	Mo17
 EOF
 "$RB" refmap --ref-prefix=B73 --npy "$TMP/labeled.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
 	> /dev/null 2>"$TMP/labeled.log"
@@ -176,6 +184,18 @@ EOF
 	if [ $? -eq 0 ]; then pass; else fail "numpy deep-check ($NPY_PY) raised an assertion"; fi
 else
 	echo "SKIP: no python3 with numpy found on PATH; skipping the numpy load/shape/value deep-check" >&2
+fi
+
+# --- generic PS4G<->npy correspondence check (verify_ps4g_npy.py), same numpy interpreter ---
+if [ -n "$NPY_PY" ]; then
+	if "$NPY_PY" verify_ps4g_npy.py "$TMP/out.ps4g" "$TMP/out.npy" > "$TMP/verify.log" 2>&1; then
+		pass
+	else
+		fail "verify_ps4g_npy.py found a mismatch between out.ps4g and out.npy"
+		cat "$TMP/verify.log" >&2
+	fi
+else
+	echo "SKIP: verify_ps4g_npy.py needs a python3 with numpy" >&2
 fi
 
 # --- memory safety, if valgrind is available ---

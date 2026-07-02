@@ -1272,7 +1272,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int32_t k;
 		rb3_sprintf_lite(&cmd, "ropebwt3");
 		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
-		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, opt.ref_prefix, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}

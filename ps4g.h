@@ -55,8 +55,11 @@ void rb3_bed_destroy(rb3_bed_t *b);
 // per (contig,bin,gameteSet) -- the same granularity as the PS4G data rows, not
 // collapsed across gameteSets sharing a bin -- so gamete co-occurrence within a
 // read is never lost. npy_binary writes presence (1) instead of the read count.
+// Contig names (PS4G refContig / npy bins.tsv) are always the bare contig part
+// of the reference sequence's own name (e.g. "B73_chr1" -> "chr1"), independent
+// of --ref-prefix -- row[].ref_sid is always a reference sequence already.
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
-							const char *ref_prefix, const rb3_bed_t *bed, int npy_binary,
+							const rb3_bed_t *bed, int npy_binary,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command);
 
 #ifdef __cplusplus

@@ -17,6 +17,19 @@ static int32_t gtab_sample_len(const char *nm)
 	return us? (int32_t)(us - nm) : (int32_t)strlen(nm);
 }
 
+// Bare contig name for a sequence, e.g. "B73_chr1" -> "chr1": strip the sample
+// prefix *and* its following '_' separator, using the same first-'_' split as
+// gtab_sample_len/rb3_gtab_build. Deliberately independent of the exact
+// --ref-prefix string a user passes (e.g. "B73" vs "B73_") -- a raw
+// name+strlen(ref_prefix) offset left a stray leading '_' ("_chr1") whenever
+// --ref-prefix didn't itself include the trailing underscore, which is the
+// convention actually used in this project's own scripts (--ref-prefix=B73).
+static const char *contig_suffix(const char *name)
+{
+	const char *us = strchr(name, '_');
+	return us? us + 1 : name;
+}
+
 static int gtab_strp_cmp(const void *a, const void *b)
 {
 	return strcmp(*(char *const*)a, *(char *const*)b);
@@ -141,9 +154,10 @@ static int64_t bed_resolve_contig(const rb3_sid_t *sid, const char *ref_prefix, 
 {
 	int64_t k;
 	size_t plen = ref_prefix? strlen(ref_prefix) : 0;
-	for (k = 0; k < sid->n_seq; ++k) // try the stripped (PS4G-style) contig name first
-		if (ref_prefix && strncmp(sid->name[k], ref_prefix, plen) == 0 && strcmp(sid->name[k] + plen, chrom) == 0)
-			return k;
+	for (k = 0; k < sid->n_seq; ++k) { // try the stripped (PS4G-style) contig name, reference sequences only
+		if (ref_prefix == 0 || strncmp(sid->name[k], ref_prefix, plen) != 0) continue; // must be a reference sequence, else e.g. "chr1" could match a carrier's own "Oh43_chr1"
+		if (strcmp(contig_suffix(sid->name[k]), chrom) == 0) return k;
+	}
 	for (k = 0; k < sid->n_seq; ++k) // fall back to a literal sequence-name match
 		if (strcmp(sid->name[k], chrom) == 0)
 			return k;
@@ -291,10 +305,9 @@ static void write_npy_header(FILE *fp, int64_t rows, int64_t cols)
 }
 
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
-							const char *ref_prefix, const rb3_bed_t *bed, int npy_binary,
+							const rb3_bed_t *bed, int npy_binary,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command)
 {
-	int64_t plen = ref_prefix? (int64_t)strlen(ref_prefix) : 0;
 	ev_t *ev;
 	int64_t i, n_row = 0, m_row = 0;
 	row_t *row = 0;
@@ -352,7 +365,7 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			fprintf(fp, "gameteSet\trefContig\trefPosBinned\tcount\n");
 			for (i = 0; i < n_row; ++i) {
 				int32_t k;
-				const char *cname = sid->name[row[i].ref_sid] + (ref_prefix? plen : 0);
+				const char *cname = contig_suffix(sid->name[row[i].ref_sid]);
 				for (k = 0; k < row[i].glen; ++k)
 					fprintf(fp, "%s%d", k? "," : "", acc->garena[row[i].goff + k]);
 				fprintf(fp, "\t%s\t%ld\t%ld\n", cname, (long)row[i].bin, (long)row[i].count);
@@ -397,7 +410,7 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		if (fp) { // a (contig,bin) can repeat across rows: each row is a distinct gameteSet at that bin
 			fprintf(fp, "row\tcontig\tbin\n");
 			for (i = 0; i < n_row; ++i)
-				fprintf(fp, "%ld\t%s\t%ld\n", (long)i, sid->name[row[i].ref_sid] + (ref_prefix? plen : 0), (long)row[i].bin);
+				fprintf(fp, "%ld\t%s\t%ld\n", (long)i, contig_suffix(sid->name[row[i].ref_sid]), (long)row[i].bin);
 			fclose(fp);
 		}
 		sprintf(aux_fn, "%s.gametes.tsv", npy_fn);

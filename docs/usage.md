@@ -295,8 +295,11 @@ walk happened to report first.
 a `#gamete` header table (name, index, total supporting-read count) followed by
 `gameteSet  refContig  refPosBinned  count` rows, one per distinct set of
 gametes observed at a binned reference position (`refPosBinned = position /
---bin-size`). `refContig` has the `--ref-prefix` stripped (`B73_chr1` →
-`chr1`).
+--bin-size`). `refContig` is the bare contig part of the reference sequence's
+own name (`B73_chr1` → `chr1`) — the same first-`_` split used for gametes,
+not a `--ref-prefix`-length string trim, so it comes out clean regardless of
+whether `--ref-prefix` itself includes the trailing `_` (e.g. `B73` vs `B73_`
+give the same `chr1`, never a stray `_chr1`).
 
 **numpy (`--npy=FILE`).** Writes a dense `int32` array of shape
 `(n_rows, n_gametes + 2)` as a standard `.npy` v1.0 file (loadable with

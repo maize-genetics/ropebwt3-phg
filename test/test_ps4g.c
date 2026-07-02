@@ -170,12 +170,12 @@ static void test_finalize(const char *outdir)
 	rb3_ps4g_acc_add(acc, 0, 210, g5, 1);
 	CHECK(acc->n_ev == 5, "finalize: 5 events accumulated before aggregation");
 
-	bed = rb3_bed_read(bed_fn, g, sid, "B73_");
+	bed = rb3_bed_read(bed_fn, g, sid, "B73"); // no trailing '_': the real-world convention (see test_bed_contig_resolution)
 	CHECK(bed != 0, "finalize: BED fixture parsed");
 	CHECK(bed && bed->n_r == 2, "finalize: BED has 2 regions");
 
-	rb3_ps4g_npy_finalize(acc, g, sid, "B73_", bed, /*npy_binary=*/0, ps4g_fn, npy_fn, "unit-test-cmd");
-	rb3_ps4g_npy_finalize(acc, g, sid, "B73_", bed, /*npy_binary=*/1, 0, npy_bin_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/0, ps4g_fn, npy_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/1, 0, npy_bin_fn, "unit-test-cmd");
 
 	// ---- PS4G file ----
 	fp = fopen(ps4g_fn, "r");
@@ -270,6 +270,42 @@ static void test_finalize(const char *outdir)
 	free_sid(sid);
 }
 
+// Regression test for a real bug: a raw name+strlen(ref_prefix) offset left a
+// stray leading '_' ("_chr1") whenever --ref-prefix didn't itself include the
+// separator -- exactly the convention this project's own scripts use
+// (--ref-prefix=B73, not "B73_"). Two sequences share the bare contig name
+// "chr1" here (a reference and a carrier) to also confirm the fix doesn't
+// accidentally resolve a BED region to the wrong (non-reference) sequence.
+static void test_bed_contig_resolution(const char *outdir)
+{
+	rb3_sid_t *sid = RB3_CALLOC(rb3_sid_t, 1);
+	rb3_gtab_t *g;
+	rb3_bed_t *bed;
+	char bed_fn[512];
+	FILE *fp;
+	sid->n_seq = 2;
+	sid->name = RB3_MALLOC(char*, 2);
+	sid->len = RB3_CALLOC(int32_t, 2);
+	sid->name[0] = rb3_strdup("B73_chr1");  // reference
+	sid->name[1] = rb3_strdup("Oh43_chr1"); // carrier; same bare contig name "chr1"
+
+	g = rb3_gtab_build(sid);
+	snprintf(bed_fn, sizeof(bed_fn), "%s/bed_contig_resolution.bed", outdir);
+	fp = fopen(bed_fn, "w");
+	fprintf(fp, "chr1\t0\t100\tB73\n"); // bare contig name, no leading '_'
+	fclose(fp);
+
+	bed = rb3_bed_read(bed_fn, g, sid, "B73"); // no trailing '_'
+	CHECK(bed != 0, "bed_resolve_contig: fixture parsed");
+	CHECK(bed && bed->n_r == 1, "bed_resolve_contig: one region parsed");
+	CHECK(bed && bed->n_r == 1 && bed->r[0].ref_sid == 0,
+		  "bed_resolve_contig: 'chr1' with --ref-prefix=B73 (no '_') resolves to the reference sequence (0), not the carrier (1) sharing the same bare contig name, and not -1 (unresolved)");
+
+	rb3_bed_destroy(bed);
+	rb3_gtab_destroy(g);
+	free(sid->name[0]); free(sid->name[1]); free(sid->name); free(sid->len); free(sid);
+}
+
 int main(int argc, char *argv[])
 {
 	const char *outdir = argc > 1? argv[1] : "test/output";
@@ -282,6 +318,7 @@ int main(int argc, char *argv[])
 
 	test_acc_dedup();
 	test_finalize(outdir);
+	test_bed_contig_resolution(outdir);
 
 	fprintf(stderr, "test_ps4g: %d passed, %d failed\n", n_pass, n_fail);
 	return n_fail == 0? 0 : 1;
