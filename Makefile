@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o
+			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -38,13 +38,20 @@ test/test_ps4g.o:test/test_ps4g.c ps4g.h rb3priv.h
 test/test_ps4g:test/test_ps4g.o ps4g.o misc.o
 		$(CC) $(CFLAGS) $^ -o $@ -lz -lm
 
-test:$(PROG) test/test_ps4g
+test/test_hitcount.o:test/test_hitcount.c hitcount.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_hitcount:test/test_hitcount.o hitcount.o
+		$(CC) $(CFLAGS) $^ -o $@ -lpthread
+
+test:$(PROG) test/test_ps4g test/test_hitcount
 		@mkdir -p test/output
 		./test/test_ps4g test/output
+		./test/test_hitcount
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
@@ -72,8 +79,9 @@ rle.o: rle.h
 rope.o: rle.h rope.h
 sais-ss.o: rb3priv.h libsais.h libsais64.h
 search.o: fm-index.h rb3priv.h rld0.h mrope.h rope.h io.h align.h ketopt.h
-search.o: kthread.h kalloc.h lift.h ps4g.h
+search.o: kthread.h kalloc.h lift.h ps4g.h hitcount.h
 ssa.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h kalloc.h kthread.h
 ssa.o: ketopt.h ksort.h
 lift.o: fm-index.h io.h rb3priv.h ketopt.h kalloc.h kthread.h lift.h
 ps4g.o: rb3priv.h ps4g.h io.h kseq.h
+hitcount.o: hitcount.h

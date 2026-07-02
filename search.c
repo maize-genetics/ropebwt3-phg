@@ -8,6 +8,7 @@
 #include "kalloc.h"
 #include "lift.h"
 #include "ps4g.h"
+#include "hitcount.h"
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
 
@@ -43,6 +44,7 @@ typedef struct {
 	char *label_bed_fn; // refmap: diploid training labels (chrom start end sampleA [sampleB]), NULL = off
 	int64_t bin_size;   // refmap: PS4G/npy position bin size in bp (default 256)
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
+	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -68,6 +70,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->ps4g_fn = 0, opt->npy_fn = 0, opt->label_bed_fn = 0;
 	opt->bin_size = 256;
 	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
+	opt->target_hits = 0; // off by default (read the whole input)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -104,6 +107,7 @@ typedef struct {
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
+	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
 } pipeline_t;
 
 typedef struct {
@@ -759,6 +763,15 @@ static void refmap_rst_accumulate(rb3_ps4g_acc_t *acc, const refmap_rst_t *r)
 		rb3_ps4g_acc_add(acc, r->ref_sid, r->cL, r->gametes, r->n_gametes);
 }
 
+// --target-hits: count a written record toward the target if it's PLACED or EXACT.
+// t->p is const (step_t's writers are meant to be read-only); the hit counter is
+// the one deliberately mutable exception, so cast it away at this single call site
+// rather than loosen const-ness everywhere step_t.p is used.
+static void refmap_count_hit(const pipeline_t *p, int8_t status)
+{
+	rb3_hitcount_add(&((pipeline_t*)p)->hitcount, status == RB3_RM_PLACED || status == RB3_RM_EXACT);
+}
+
 static void write_refmap(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -774,6 +787,7 @@ static void write_refmap(step_t *t)
 				write_refmap1(&out, f, s, &r->sub[k], kmer);
 				fputs(out.s, stdout);
 				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
+				refmap_count_hit(p, r->sub[k].status);
 				free(r->sub[k].gametes);
 			}
 			free(r->sub);
@@ -781,6 +795,7 @@ static void write_refmap(step_t *t)
 			write_refmap1(&out, f, s, r, kmer);
 			fputs(out.s, stdout);
 			refmap_rst_accumulate(p->ps4g_acc, r);
+			refmap_count_hit(p, r->status);
 		}
 		free(r->carriers);
 		free(r->gametes);
@@ -916,7 +931,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		int64_t len, tot = 0;
 		int32_t n_seq = 0, m_seq = 0;
 		m_seq_t *seq = 0;
-		while ((ss = rb3_seq_read1(p->fp, &len, &name)) != 0) { // read sequences
+		while (!rb3_hitcount_reached(&p->hitcount) && (ss = rb3_seq_read1(p->fp, &len, &name)) != 0) { // read sequences
 			m_seq_t *s;
 			RB3_GROW0(m_seq_t, seq, n_seq, m_seq);
 			s = &seq[n_seq++];
@@ -1007,6 +1022,7 @@ static ko_longopt_t long_options[] = {
 	{ "label-bed",       ko_required_argument, 322 },
 	{ "bin-size",        ko_required_argument, 323 },
 	{ "npy-binary",      ko_no_argument,       324 },
+	{ "target-hits",     ko_required_argument, 325 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1078,6 +1094,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 322) opt.label_bed_fn = o.arg; // diploid training labels: chrom start end sampleA [sampleB]
 		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
 		else if (c == 324) opt.npy_binary = 1; // npy: write presence (1) instead of read counts
+		else if (c == 325) opt.target_hits = rb3_parse_num(o.arg); // stop once this many PLACED+EXACT records are written
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1135,6 +1152,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
 			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
 			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
+			fprintf(stderr, "  --target-hits=NUM stop once NUM PLACED/EXACT records are written (0 = off, read everything) [%ld]\n", (long)opt.target_hits);
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -1186,6 +1204,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.label_bed = 0;
+	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
 		int64_t k, plen;
 		if (opt.ref_prefix == 0) {
@@ -1248,8 +1267,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 				}
 			}
 		}
-	} else if (opt.ps4g_fn || opt.npy_fn || opt.label_bed_fn) {
-		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed only apply to refmap\n");
+	} else if (opt.ps4g_fn || opt.npy_fn || opt.label_bed_fn || opt.target_hits > 0) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap\n");
 		return 1;
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
@@ -1258,6 +1277,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		puts("CC");
 	}
 	for (j = o.ind + 1; j < argc; ++j) {
+		if (rb3_hitcount_reached(&p.hitcount)) break; // --target-hits already satisfied; skip remaining input files
 		p.fp = rb3_seq_open(argv[j], is_line);
 		if (p.fp == 0) {
 			if (rb3_verbose >= 1)
@@ -1266,6 +1286,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		kt_pipeline(2, worker_pipeline, &p, 3);
 		rb3_seq_close(p.fp);
+	}
+	{
+		int64_t tgt, n;
+		if (rb3_hitcount_short(&p.hitcount, &tgt, &n) && rb3_verbose >= 1)
+			fprintf(stderr, "WARNING: --target-hits=%ld requested but the input was exhausted after only %ld PLACED/EXACT records\n", (long)tgt, (long)n);
 	}
 	if (p.ps4g_acc) {
 		kstring_t cmd = {0,0,0};

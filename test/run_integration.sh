@@ -198,12 +198,74 @@ else
 	echo "SKIP: verify_ps4g_npy.py needs a python3 with numpy" >&2
 fi
 
+# --- 4. --target-hits: stop once N PLACED/EXACT records are written ---
+# NOTE on exact counts below: the outer read/process/write pipeline
+# (kt_pipeline) always runs with 2 scheduling workers regardless of -t (-t only
+# controls the per-batch compute parallelism inside each step), and its
+# worker-ordering rule guarantees round N+1's read can start as soon as round
+# N leaves its read step -- i.e. before round N's write has updated the hit
+# counter. With -K set small enough to force ~1 record per round, this makes
+# the overshoot an exact, deterministic "+1 record" every time (verified by
+# running the same case 5x and getting an identical count each time), not a
+# vague "a few more". `-t1` doesn't remove this overshoot (it's not about
+# compute threading) but is used below anyway for a clean, singlethreaded run.
+
+# 4a. PLACED counts toward the target too, not just EXACT (existing fixture:
+# ins_query=PLACED, ins_query_rc=PLACED, ref_query=EXACT, in that file order).
+"$RB" refmap --ref-prefix=B73 --target-hits=2 -K 1 -t1 "$IDX" "$DIR/queries.fa" \
+	> "$TMP/target2.tsv" 2>"$TMP/target2.log"
+check_eq "refmap exits 0 (--target-hits=2)" "$?" "0"
+check_eq "target-hits=2: exactly 3 rows (2 PLACED to hit the target + 1 deterministic overshoot record)" \
+	"$(wc -l < "$TMP/target2.tsv" | tr -d ' ')" "3"
+check_eq "target-hits=2: stops right after ref_query, never reaches ins_query_1snp/unrelated" \
+	"$(cut -f1 "$TMP/target2.tsv" | tr '\n' ',')" "ins_query,ins_query_rc,ref_query,"
+
+# 4b. Tight, hand-computed fixture: 30 records alternating a known-EXACT 60bp
+# chunk (e1..e15, lifted from pangenome.fa's B73_chr1) and the known-UNPLACED
+# junk sequence already used as queries.fa's "unrelated" read (u1..u15).
+EXACT_SEQ=$(awk 'NR==2' "$DIR/pangenome.fa")
+JUNK_SEQ=$(awk '/^>unrelated/{getline; print}' "$DIR/queries.fa")
+: > "$TMP/target_hits.fa"
+for i in $(seq 1 15); do
+	printf '>e%d\n%s\n' "$i" "$EXACT_SEQ" >> "$TMP/target_hits.fa"
+	printf '>u%d\n%s\n' "$i" "$JUNK_SEQ" >> "$TMP/target_hits.fa"
+done
+
+"$RB" refmap --ref-prefix=B73 --target-hits=5 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
+	> "$TMP/target5.tsv" 2>"$TMP/target5.log"
+check_eq "refmap exits 0 (--target-hits=5, new fixture)" "$?" "0"
+check_eq "target-hits=5: exactly 10 rows (5th EXACT is record 9; +1 deterministic overshoot = record 10)" \
+	"$(wc -l < "$TMP/target5.tsv" | tr -d ' ')" "10"
+check_eq "target-hits=5: rows are e1,u1,...,e5,u5 in order, nothing from e6/u6 onward" \
+	"$(cut -f1 "$TMP/target5.tsv" | tr '\n' ',')" "e1,u1,e2,u2,e3,u3,e4,u4,e5,u5,"
+check_eq "target-hits=5: all 5 EXACT rows are actually status EXACT" \
+	"$(awk -F'\t' '$1 ~ /^e/{print $3}' "$TMP/target5.tsv" | sort -u | tr '\n' ',')" "EXACT,"
+check_eq "target-hits=5: all 5 junk rows are actually status UNPLACED (not filtered out)" \
+	"$(awk -F'\t' '$1 ~ /^u/{print $3}' "$TMP/target5.tsv" | sort -u | tr '\n' ',')" "UNPLACED,"
+
+# 4c. Shortfall: requesting more PLACED/EXACT than exist must not error, must
+# still process the whole input, and must warn with the actual count found.
+"$RB" refmap --ref-prefix=B73 --target-hits=100 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
+	> "$TMP/target100.tsv" 2>"$TMP/target100.log"
+check_eq "refmap exits 0 even when the target is never reached (not an error)" "$?" "0"
+check_eq "target-hits=100 (unreachable, only 15 EXACT exist): all 30 input records still processed" \
+	"$(wc -l < "$TMP/target100.tsv" | tr -d ' ')" "30"
+check_line_in "target-hits=100: WARNING reports the requested target and the actual count found" "$TMP/target100.log" \
+	"WARNING: --target-hits=100 requested but the input was exhausted after only 15 PLACED/EXACT records"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
 		"$RB" refmap --ref-prefix=B73 --ps4g "$TMP/vg.ps4g" --npy "$TMP/vg.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
 		> /dev/null 2>"$TMP/valgrind.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks; see $TMP/valgrind.log"; cat "$TMP/valgrind.log" >&2; fi
+
+	# --target-hits with real multi-threaded compute (-t4), exercising the
+	# atomic hit counter under actual concurrent access.
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" refmap --ref-prefix=B73 --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
+		> /dev/null 2>"$TMP/valgrind_target.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi

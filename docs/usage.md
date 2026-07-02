@@ -214,6 +214,7 @@ unrelated       120 UNPLACED    0 .                              .        .     
 --label-bed=FILE   diploid training labels: chrom start end sampleA [sampleB]
 --bin-size=NUM     PS4G/npy reference position bin size in bp        [256]
 --npy-binary       npy: write presence (1) instead of read counts
+--target-hits=NUM  stop once NUM PLACED/EXACT records are written (0 = off) [0]
 ```
 
 ### `--lift` (recommended)
@@ -338,3 +339,40 @@ in both label columns and are meant for inference, not training.
 chr1   0        20000000  B73  Oh43
 chr1   20000000 40000000  B97
 ```
+
+## 8. Bounding the sample size (`--target-hits`)
+
+Simulated/real read sets easily run into the tens of millions, but a
+PS4G/npy training sample doesn't need to be that large — `--target-hits=NUM`
+stops reading once `refmap` has written `NUM` records with status `PLACED`
+or `EXACT` (the only statuses PS4G/npy actually use), so a run that would
+otherwise process the whole file can stop far short of it.
+
+The output has **at least** `NUM` such records — every `UNPLACED`/`ONE_SIDE`/
+`MULTI` record seen before the cutoff is still reported too (nothing is
+filtered out) — and typically more: the read/process/write pipeline always
+runs two rounds (batches) concurrently regardless of `-t` (`-t` only controls
+compute parallelism *within* a round, not how many rounds overlap), so a
+round or two of reading can already be committed before a round's write
+makes the updated count visible to the next read. With `-K` (batch size) set
+small enough to force ~1 record per round, this overshoot is a small, exact,
+reproducible "+1 record" (verified by hand on a small fixture — the same run
+repeated gives an identical count every time). With the **default** (large,
+100,000,000-base) `-K`, expect the overshoot to be **a handful of batches**,
+not a fraction of one: on the full 16M-read/25-founder NAM index with
+`--target-hits=1000000` and `-t 20`, the actual run stopped at 1,889,145
+PLACED+EXACT records (of 2,649,008 total records processed) — well short of
+the full 16M reads, but nowhere near a tight bound. If you need a closer
+bound, use a smaller `-K` (at some throughput cost, since smaller batches
+mean less overlap between the read/process/write stages); the count is
+always monotonic and one-directional — you will never get fewer than `NUM`.
+
+If the whole input is exhausted without reaching `NUM` (e.g. requesting more
+than actually exist), this is **not an error**: `refmap` finishes normally
+(exit code 0) and prints `WARNING: --target-hits=NUM requested but the input
+was exhausted after only M PLACED/EXACT records` to stderr with the actual
+count `M`.
+
+`--target-hits` is cumulative across multiple input files given on the same
+command line, and is refmap-only (like `--ps4g`/`--npy`/`--label-bed`) since
+`PLACED`/`EXACT` are refmap-specific statuses.
