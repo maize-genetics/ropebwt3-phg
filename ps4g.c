@@ -291,7 +291,7 @@ static void write_npy_header(FILE *fp, int64_t rows, int64_t cols)
 }
 
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
-							const char *ref_prefix, const rb3_bed_t *bed,
+							const char *ref_prefix, const rb3_bed_t *bed, int npy_binary,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command)
 {
 	int64_t plen = ref_prefix? (int64_t)strlen(ref_prefix) : 0;
@@ -362,29 +362,22 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 	}
 
 	if (npy_fn) {
-		int64_t n_nrow = 0, cols = gtab->n_gamete + 2;
-		int32_t *mat = 0;
-		int64_t *nrow_ref_sid = 0, *nrow_bin = 0, m_nrow = 0;
+		// One npy row per PS4G row (contig, bin, gameteSet) -- NOT collapsed across
+		// gameteSets sharing a bin. Aggregating different gameteSets into one row
+		// would discard exactly the co-occurrence information (which gametes were
+		// jointly supported by the same reads) that the imputation model needs.
+		int64_t cols = gtab->n_gamete + 2;
+		int32_t *mat = RB3_CALLOC(int32_t, n_row * cols);
 		FILE *fp;
 		char *aux_fn;
 
 		for (i = 0; i < n_row; ++i) {
-			int32_t k;
-			if (n_nrow == 0 || nrow_ref_sid[n_nrow-1] != row[i].ref_sid || nrow_bin[n_nrow-1] != row[i].bin) {
-				RB3_GROW(int64_t, nrow_ref_sid, n_nrow, m_nrow);
-				nrow_bin = RB3_REALLOC(int64_t, nrow_bin, m_nrow);
-				mat = RB3_REALLOC(int32_t, mat, m_nrow * cols);
-				memset(mat + n_nrow * cols, 0, cols * sizeof(int32_t));
-				nrow_ref_sid[n_nrow] = row[i].ref_sid, nrow_bin[n_nrow] = row[i].bin;
-				++n_nrow;
-			}
-			for (k = 0; k < row[i].glen; ++k)
-				mat[(n_nrow-1) * cols + acc->garena[row[i].goff + k]] += row[i].count;
-		}
-		for (i = 0; i < n_nrow; ++i) { // fill diploid training labels from the BED, -1 if unlabeled
+			int32_t k, val = npy_binary? 1 : (int32_t)row[i].count;
 			int32_t gA = -1, gB = -1;
-			int64_t pos = nrow_bin[i] * acc->bin_size;
-			if (bed) bed_lookup(bed, nrow_ref_sid[i], pos, &gA, &gB);
+			int64_t pos = row[i].bin * acc->bin_size;
+			for (k = 0; k < row[i].glen; ++k)
+				mat[i * cols + acc->garena[row[i].goff + k]] = val;
+			if (bed) bed_lookup(bed, row[i].ref_sid, pos, &gA, &gB); // diploid training labels, -1 if unlabeled
 			mat[i * cols + gtab->n_gamete] = gA;
 			mat[i * cols + gtab->n_gamete + 1] = gB;
 		}
@@ -393,18 +386,18 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		if (fp == 0) {
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write numpy file '%s'\n", npy_fn);
 		} else {
-			write_npy_header(fp, n_nrow, cols);
-			fwrite(mat, sizeof(int32_t), n_nrow * cols, fp);
+			write_npy_header(fp, n_row, cols);
+			fwrite(mat, sizeof(int32_t), n_row * cols, fp);
 			fclose(fp);
 		}
 
 		aux_fn = RB3_MALLOC(char, strlen(npy_fn) + 16);
 		sprintf(aux_fn, "%s.bins.tsv", npy_fn);
 		fp = fopen(aux_fn, "w");
-		if (fp) {
+		if (fp) { // a (contig,bin) can repeat across rows: each row is a distinct gameteSet at that bin
 			fprintf(fp, "row\tcontig\tbin\n");
-			for (i = 0; i < n_nrow; ++i)
-				fprintf(fp, "%ld\t%s\t%ld\n", (long)i, sid->name[nrow_ref_sid[i]] + (ref_prefix? plen : 0), (long)nrow_bin[i]);
+			for (i = 0; i < n_row; ++i)
+				fprintf(fp, "%ld\t%s\t%ld\n", (long)i, sid->name[row[i].ref_sid] + (ref_prefix? plen : 0), (long)row[i].bin);
 			fclose(fp);
 		}
 		sprintf(aux_fn, "%s.gametes.tsv", npy_fn);
@@ -417,7 +410,7 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			fclose(fp);
 		}
 		free(aux_fn);
-		free(mat); free(nrow_ref_sid); free(nrow_bin);
+		free(mat);
 	}
 
 	free(gamete_total);

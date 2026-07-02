@@ -99,6 +99,28 @@ check_eq "npy: shape is 2 bins x 9 columns (7 gametes + 2 labels)" "$shape" "2 9
 check_line_in "npy: gametes.tsv lists all 7 samples, B73 first" "$TMP/out.npy.gametes.tsv" "$(printf '0\tB73')"
 check_line_in "npy: bins.tsv row for the insertion locus (bin 1, contig stripped)" "$TMP/out.npy.bins.tsv" "$(printf '1\t_chr1\t1')"
 
+# --- 2b. --npy-binary: same locations, but presence (1) instead of the read count ---
+"$RB" refmap --ref-prefix=B73 --npy "$TMP/binary.npy" --npy-binary -t1 "$IDX" "$DIR/queries.fa" \
+	> /dev/null 2>"$TMP/binary.log"
+check_eq "refmap exits 0 (--npy-binary)" "$?" "0"
+hdr_len_bin=$(python3 - "$TMP/binary.npy" <<'EOF' 2>/dev/null
+import sys
+with open(sys.argv[1], 'rb') as f:
+    f.read(8)
+    hlen = int.from_bytes(f.read(2), 'little')
+    print(10 + hlen)
+EOF
+)
+if [ -n "$hdr_len_bin" ]; then
+	# row1 = the insertion-locus row (6-carrier gameteSet); B97 is gamete column 1
+	cnt_mode=$(od -An -tu4 -j $(( hdr_len_bin + (1*9+1)*4 )) -N4 "$TMP/out.npy" | tr -d ' ')
+	bin_mode=$(od -An -tu4 -j $(( hdr_len_bin + (1*9+1)*4 )) -N4 "$TMP/binary.npy" | tr -d ' ')
+	check_eq "npy: default mode keeps the read count (3 reads placed there)" "$cnt_mode" "3"
+	check_eq "npy: --npy-binary clips the same cell to presence (1)" "$bin_mode" "1"
+else
+	echo "SKIP: --npy-binary cell check needs python3 to locate the .npy data offset" >&2
+fi
+
 # --- 3. --label-bed: diploid training labels ---
 cat > "$TMP/labels.bed" <<'EOF'
 _chr1	0	100	B73

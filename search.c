@@ -42,6 +42,7 @@ typedef struct {
 	char *npy_fn;       // refmap: write a numpy (.npy) training/inference array here (NULL = off)
 	char *label_bed_fn; // refmap: diploid training labels (chrom start end sampleA [sampleB]), NULL = off
 	int64_t bin_size;   // refmap: PS4G/npy position bin size in bp (default 256)
+	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -66,6 +67,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->kmer_step = 15, opt->min_agree = 2, opt->kmer_cluster = 2000;
 	opt->ps4g_fn = 0, opt->npy_fn = 0, opt->label_bed_fn = 0;
 	opt->bin_size = 256;
+	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -1004,6 +1006,7 @@ static ko_longopt_t long_options[] = {
 	{ "npy",             ko_required_argument, 321 },
 	{ "label-bed",       ko_required_argument, 322 },
 	{ "bin-size",        ko_required_argument, 323 },
+	{ "npy-binary",      ko_no_argument,       324 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1074,6 +1077,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 321) opt.npy_fn = o.arg;       // numpy training/inference array
 		else if (c == 322) opt.label_bed_fn = o.arg; // diploid training labels: chrom start end sampleA [sampleB]
 		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
+		else if (c == 324) opt.npy_binary = 1; // npy: write presence (1) instead of read counts
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1130,6 +1134,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
 			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
 			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
+			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -1267,7 +1272,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int32_t k;
 		rb3_sprintf_lite(&cmd, "ropebwt3");
 		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
-		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, opt.ref_prefix, p.label_bed, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, opt.ref_prefix, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}

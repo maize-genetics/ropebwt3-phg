@@ -151,9 +151,11 @@ static void test_finalize(const char *outdir)
 	int32_t g1[] = { 2, 0, 0, 3, 2 }, g2[] = { 0, 2, 3 }, g3[] = { 1 }, g4[] = { 2 }, g5[] = { 1 };
 	int32_t *mat;
 	int64_t rows = 0, cols = 0;
+	char npy_bin_fn[512];
 
 	snprintf(ps4g_fn, sizeof(ps4g_fn), "%s/unit.ps4g", outdir);
 	snprintf(npy_fn, sizeof(npy_fn), "%s/unit.npy", outdir);
+	snprintf(npy_bin_fn, sizeof(npy_bin_fn), "%s/unit_binary.npy", outdir);
 	snprintf(bed_fn, sizeof(bed_fn), "%s/unit_labels.bed", outdir);
 	write_bed_fixture(bed_fn);
 
@@ -172,7 +174,8 @@ static void test_finalize(const char *outdir)
 	CHECK(bed != 0, "finalize: BED fixture parsed");
 	CHECK(bed && bed->n_r == 2, "finalize: BED has 2 regions");
 
-	rb3_ps4g_npy_finalize(acc, g, sid, "B73_", bed, ps4g_fn, npy_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, "B73_", bed, /*npy_binary=*/0, ps4g_fn, npy_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, "B73_", bed, /*npy_binary=*/1, 0, npy_bin_fn, "unit-test-cmd");
 
 	// ---- PS4G file ----
 	fp = fopen(ps4g_fn, "r");
@@ -196,22 +199,42 @@ static void test_finalize(const char *outdir)
 		fclose(fp);
 	}
 
-	// ---- npy file ----
+	// ---- npy file (count mode): one row per PS4G row, i.e. per (contig,bin,gameteSet) --
+	// NOT collapsed across the two distinct gameteSets ({B} and {A,B73,C}) that share bin2.
+	// Losing that distinction would hide that {A,B73,C} co-occurred on the same reads.
 	mat = read_npy_i4(npy_fn, &rows, &cols);
 	CHECK(mat != 0, "finalize: npy file parsed");
 	if (mat) {
-		CHECK(rows == 3, "npy: 3 rows (unique (contig,bin) pairs, coarser than the 4 PS4G rows)");
+		CHECK(rows == 4, "npy: 4 rows, matching the 4 PS4G rows exactly (gameteSets kept separate)");
 		CHECK(cols == 4 + 2, "npy: n_gamete(4) + 2 label columns");
-		// row0 = (ref0,bin1): only gamete B -> [0,1,0,0], unlabeled
-		CHECK(mat[0*cols+0]==0 && mat[0*cols+1]==1 && mat[0*cols+2]==0 && mat[0*cols+3]==0, "npy: row0 gamete counts");
+		// row0 = ref0/bin1 {B}count1 -> [0,1,0,0], unlabeled (pos=100 not in [200,300))
+		CHECK(mat[0*cols+0]==0 && mat[0*cols+1]==1 && mat[0*cols+2]==0 && mat[0*cols+3]==0, "npy: row0 (bin1 {B}) counts");
 		CHECK(mat[0*cols+4]==-1 && mat[0*cols+5]==-1, "npy: row0 unlabeled (-1,-1)");
-		// row1 = (ref0,bin2): {B}count1 + {A,B73,C}count2 summed -> [2,1,2,2]; labeled A/B73 by BED
-		CHECK(mat[1*cols+0]==2 && mat[1*cols+1]==1 && mat[1*cols+2]==2 && mat[1*cols+3]==2, "npy: row1 gamete counts sum across gameteSets sharing a bin");
+		// row1 = ref0/bin2 {B}count1 -> [0,1,0,0]; labeled (pos=200 is in [200,300))
+		CHECK(mat[1*cols+0]==0 && mat[1*cols+1]==1 && mat[1*cols+2]==0 && mat[1*cols+3]==0, "npy: row1 (bin2 {B}) counts, kept separate from row2's {A,B73,C}");
 		CHECK(mat[1*cols+4]==0 && mat[1*cols+5]==2, "npy: row1 labeled (A=0, B73=2) from the chr1:200-300 BED region");
-		// row2 = (ref1,bin0): only gamete B73 -> [0,0,1,0]; homozygous C label
-		CHECK(mat[2*cols+0]==0 && mat[2*cols+1]==0 && mat[2*cols+2]==1 && mat[2*cols+3]==0, "npy: row2 gamete counts");
-		CHECK(mat[2*cols+4]==3 && mat[2*cols+5]==3, "npy: row2 homozygous label (C,C) from a single-sample BED row");
+		// row2 = ref0/bin2 {A,B73,C}count2 -> [2,0,2,2]; same bin as row1, same label, different gameteSet
+		CHECK(mat[2*cols+0]==2 && mat[2*cols+1]==0 && mat[2*cols+2]==2 && mat[2*cols+3]==2, "npy: row2 (bin2 {A,B73,C}) counts, not merged with row1");
+		CHECK(mat[2*cols+4]==0 && mat[2*cols+5]==2, "npy: row2 labeled the same as row1 (same bin, independent of gameteSet)");
+		// row3 = ref1/bin0 {B73}count1 -> [0,0,1,0]; homozygous C label
+		CHECK(mat[3*cols+0]==0 && mat[3*cols+1]==0 && mat[3*cols+2]==1 && mat[3*cols+3]==0, "npy: row3 (ref1/bin0 {B73}) counts");
+		CHECK(mat[3*cols+4]==3 && mat[3*cols+5]==3, "npy: row3 homozygous label (C,C) from a single-sample BED row");
 		free(mat);
+	}
+
+	// ---- npy file (--npy-binary): identical nonzero pattern, but values clipped to 1 ----
+	{
+		int64_t rows2 = 0, cols2 = 0;
+		int32_t *mat2 = read_npy_i4(npy_bin_fn, &rows2, &cols2);
+		CHECK(mat2 != 0, "finalize: binary-mode npy file parsed");
+		if (mat2) {
+			CHECK(rows2 == 4 && cols2 == 6, "npy-binary: same shape as count mode");
+			CHECK(mat2[0*cols2+1]==1, "npy-binary: row0 gamete B is 1 (was already count 1)");
+			CHECK(mat2[2*cols2+0]==1 && mat2[2*cols2+1]==0 && mat2[2*cols2+2]==1 && mat2[2*cols2+3]==1,
+				  "npy-binary: row2 {A,B73,C} clipped from count=2 to presence=1");
+			CHECK(mat2[2*cols2+4]==0 && mat2[2*cols2+5]==2, "npy-binary: labels are unaffected by binary mode");
+			free(mat2);
+		}
 	}
 
 	// ---- companion TSVs ----
@@ -224,7 +247,8 @@ static void test_finalize(const char *outdir)
 			CHECK_STREQ(slurp_line(fp), "row\tcontig\tbin", "bins.tsv: header");
 			CHECK_STREQ(slurp_line(fp), "0\tchr1\t1", "bins.tsv: row 0");
 			CHECK_STREQ(slurp_line(fp), "1\tchr1\t2", "bins.tsv: row 1");
-			CHECK_STREQ(slurp_line(fp), "2\tscaf_1\t0", "bins.tsv: row 2");
+			CHECK_STREQ(slurp_line(fp), "2\tchr1\t2", "bins.tsv: row 2 (bin repeats: a second gameteSet at the same bin)");
+			CHECK_STREQ(slurp_line(fp), "3\tscaf_1\t0", "bins.tsv: row 3");
 			fclose(fp);
 		}
 		snprintf(aux_fn, sizeof(aux_fn), "%s.gametes.tsv", npy_fn);

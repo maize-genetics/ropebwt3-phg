@@ -213,6 +213,7 @@ unrelated       120 UNPLACED    0 .                              .        .     
 --npy=FILE         write a dense (bin x gamete+2) numpy training/inference array
 --label-bed=FILE   diploid training labels: chrom start end sampleA [sampleB]
 --bin-size=NUM     PS4G/npy reference position bin size in bp        [256]
+--npy-binary       npy: write presence (1) instead of read counts
 ```
 
 ### `--lift` (recommended)
@@ -298,15 +299,27 @@ gametes observed at a binned reference position (`refPosBinned = position /
 `chr1`).
 
 **numpy (`--npy=FILE`).** Writes a dense `int32` array of shape
-`(n_bins, n_gametes + 2)` as a standard `.npy` v1.0 file (loadable with
-`numpy.load`, no PHG/ropebwt3 dependency needed). Column `g` is the number of
-contributing reads supporting gamete `g` at that bin; the last two columns are
-diploid training labels (gamete index of each parent copy, `-1` if
-unlabeled). Row order and column identity are given by two companion TSVs
-written alongside it:
+`(n_rows, n_gametes + 2)` as a standard `.npy` v1.0 file (loadable with
+`numpy.load`, no PHG/ropebwt3 dependency needed). **A row is one PS4G data
+row** — one `(contig, bin, gameteSet)` observation, *not* one row per bin.
+When two different gameteSets are observed at the same bin (e.g. some reads
+support `{A,B}` and others support only `{C}` there), each gets its own row;
+they are never summed together, because doing so would discard exactly the
+co-occurrence information — which gametes were jointly supported by the same
+reads — that the imputation model needs. A bin with several gameteSets
+therefore appears as several rows sharing the same `(contig, bin)` (and the
+same training labels, since those are per-bin, not per-gameteSet).
+
+Column `g` is populated only for gametes in that row's set; by default the
+value is the number of reads supporting that observation, or with
+`--npy-binary`, `1` regardless of the count (useful for models that only care
+about presence/absence rather than depth). The last two columns are diploid
+training labels (gamete index of each parent copy, `-1` if unlabeled). Row
+order and column identity are given by two companion TSVs written alongside
+it:
 
 * `<npy>.bins.tsv` — `row  contig  bin` (bin's genomic start = `bin *
-  --bin-size`)
+  --bin-size`; a `(contig, bin)` pair can repeat across rows)
 * `<npy>.gametes.tsv` — `gameteIndex  sampleName`
 
 **Training labels (`--label-bed=FILE`).** A BED file with sample-name label
