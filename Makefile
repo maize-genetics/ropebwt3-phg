@@ -19,7 +19,7 @@ ifneq ($(omp),0)
 endif
 
 .SUFFIXES:.c .o
-.PHONY:all clean depend
+.PHONY:all clean depend test
 
 .c.o:
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
@@ -32,8 +32,19 @@ ropebwt3:$(OBJS) main.o
 rld0.o:rld0.c rld0.h bre.h
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) -DRLD_HAVE_BRE $(INCLUDES) $< -o $@
 
+test/test_ps4g.o:test/test_ps4g.c ps4g.h rb3priv.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_ps4g:test/test_ps4g.o ps4g.o misc.o
+		$(CC) $(CFLAGS) $^ -o $@ -lz -lm
+
+test:$(PROG) test/test_ps4g
+		@mkdir -p test/output
+		./test/test_ps4g test/output
+		cd test && ./run_integration.sh
+
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
