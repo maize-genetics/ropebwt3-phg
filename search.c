@@ -7,6 +7,7 @@
 #include "kthread.h"
 #include "kalloc.h"
 #include "lift.h"
+#include "ps4g.h"
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
 
@@ -37,6 +38,10 @@ typedef struct {
 	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
 	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
 	int64_t kmer_cluster;                   // refmap: cluster tolerance for agreeing k-mers (bp)
+	char *ps4g_fn;      // refmap: write a PS4G file here (NULL = off)
+	char *npy_fn;       // refmap: write a numpy (.npy) training/inference array here (NULL = off)
+	char *label_bed_fn; // refmap: diploid training labels (chrom start end sampleA [sampleB]), NULL = off
+	int64_t bin_size;   // refmap: PS4G/npy position bin size in bp (default 256)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -59,6 +64,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->lift_win = 500000, opt->lift_mad = 200000;
 	opt->kmer_len = 0;    // off by default (whole-read placement)
 	opt->kmer_step = 15, opt->min_agree = 2, opt->kmer_cluster = 2000;
+	opt->ps4g_fn = 0, opt->npy_fn = 0, opt->label_bed_fn = 0;
+	opt->bin_size = 256;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -92,6 +99,9 @@ typedef struct {
 	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
 	int64_t n_ref;   // refmap: number of reference sequences
 	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
+	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
+	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
+	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 } pipeline_t;
 
 typedef struct {
@@ -119,6 +129,7 @@ typedef struct refmap_rst_s {
 	int32_t n_sub;       // per-carrier mode: number of sub-results (one per carrier)
 	struct refmap_rst_s *sub; // per-carrier mode: one placement per carrier
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
+	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
 } refmap_rst_t;
 
 typedef struct {
@@ -571,12 +582,25 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	// locate a sample of occurrences; separate reference hits (exact) from carriers
 	pos = Kmalloc(km, rb3_pos_t, 64);
 	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, 64, pos);
-	for (i = 0; i < np; ++i) {
-		if (p->is_ref[pos[i].sid>>1]) { // the query is present in the reference: report it directly
-			int64_t clen, st, en;
-			pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
-			r->status = RB3_RM_EXACT, r->ref_sid = pos[i].sid>>1, r->strand = pos[i].sid&1;
-			r->cL = st, r->cR = en, r->ins_size = 0;
+	{
+		int ref_found = 0;
+		for (i = 0; i < np; ++i) {
+			if (!ref_found && p->is_ref[pos[i].sid>>1]) { // the query is present in the reference: report it directly
+				int64_t clen, st, en;
+				pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+				r->status = RB3_RM_EXACT, r->ref_sid = pos[i].sid>>1, r->strand = pos[i].sid&1;
+				r->cL = st, r->cR = en, r->ins_size = 0;
+				ref_found = 1; // keep scanning: PS4G/npy need every sample sharing this exact sequence
+			}
+		}
+		if (ref_found) {
+			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
+				int32_t tmp[64], m;
+				for (i = 0, m = 0; i < np; ++i) tmp[m++] = p->gtab->sid2g[pos[i].sid>>1];
+				r->gametes = RB3_MALLOC(int32_t, m);
+				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
+				r->n_gametes = m;
+			}
 			kfree(km, pos);
 			return;
 		}
@@ -592,6 +616,12 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 	r->n_car_list = n_car, r->n_carrier = n_car;
 	kfree(km, pos);
+	if (p->gtab && n_car > 0) { // PS4G/npy: carrier samples backing a (possible) PLACED call below
+		int32_t k;
+		r->gametes = RB3_MALLOC(int32_t, n_car);
+		for (k = 0; k < n_car; ++k) r->gametes[k] = p->gtab->sid2g[r->carriers[k].sid>>1];
+		r->n_gametes = n_car;
+	}
 
 	if (p->lift) { // E4: project carrier hits to the reference instead of walking
 		refmap_place_lift(km, p, s, r);
@@ -610,6 +640,11 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 			memset(sub, 0, sizeof(*sub));
 			sub->status = RB3_RM_UNPLACED, sub->qlen = s->len, sub->ref_sid = -1, sub->cL = sub->cR = -1;
 			sub->carriers = &r->carriers[k], sub->n_car_list = 1, sub->n_carrier = 1; // borrowed pointer
+			if (p->gtab) {
+				sub->gametes = RB3_MALLOC(int32_t, 1);
+				sub->gametes[0] = p->gtab->sid2g[csid];
+				sub->n_gametes = 1;
+			}
 			mask[csid] = 1;
 			refmap_place(km, p, s, &Iq, mask, sub);
 			mask[csid] = 0;
@@ -714,6 +749,14 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 	rb3_sprintf_lite(out, "\n");
 }
 
+// PS4G/npy: fold an EXACT or PLACED read's (ref position, supporting gametes) into the accumulator.
+// Other statuses (UNPLACED/ONE_SIDE/MULTI) contribute no confident reference position and are skipped.
+static void refmap_rst_accumulate(rb3_ps4g_acc_t *acc, const refmap_rst_t *r)
+{
+	if (acc && r->n_gametes > 0 && r->ref_sid >= 0 && (r->status == RB3_RM_EXACT || r->status == RB3_RM_PLACED))
+		rb3_ps4g_acc_add(acc, r->ref_sid, r->cL, r->gametes, r->n_gametes);
+}
+
 static void write_refmap(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -728,13 +771,17 @@ static void write_refmap(step_t *t)
 			for (k = 0; k < r->n_sub; ++k) {
 				write_refmap1(&out, f, s, &r->sub[k], kmer);
 				fputs(out.s, stdout);
+				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
+				free(r->sub[k].gametes);
 			}
 			free(r->sub);
 		} else {
 			write_refmap1(&out, f, s, r, kmer);
 			fputs(out.s, stdout);
+			refmap_rst_accumulate(p->ps4g_acc, r);
 		}
 		free(r->carriers);
+		free(r->gametes);
 		free(s->seq);
 		free(s->name);
 	}
@@ -953,6 +1000,10 @@ static ko_longopt_t long_options[] = {
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
 	{ "kmer-cluster",    ko_required_argument, 319 },
+	{ "ps4g",            ko_required_argument, 320 },
+	{ "npy",             ko_required_argument, 321 },
+	{ "label-bed",       ko_required_argument, 322 },
+	{ "bin-size",        ko_required_argument, 323 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1019,6 +1070,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
 		else if (c == 319) opt.kmer_cluster = rb3_parse_num(o.arg);
+		else if (c == 320) opt.ps4g_fn = o.arg;      // PS4G output (parents/gametes supporting each ref position)
+		else if (c == 321) opt.npy_fn = o.arg;       // numpy training/inference array
+		else if (c == 322) opt.label_bed_fn = o.arg; // diploid training labels: chrom start end sampleA [sampleB]
+		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1071,6 +1126,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
 			fprintf(stderr, "  --kmer-cluster=NUM  agreeing k-mers must fall within NUM bp [%ld]\n", (long)opt.kmer_cluster);
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
+			fprintf(stderr, "  --ps4g=FILE       write PS4G v2.0 gamete-support counts (EXACT+PLACED reads)\n");
+			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
+			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
+			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -1121,6 +1180,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		return 1;
 	}
 	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
+	p.gtab = 0, p.ps4g_acc = 0, p.label_bed = 0;
 	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
 		int64_t k, plen;
 		if (opt.ref_prefix == 0) {
@@ -1171,6 +1231,21 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 3)
 				fprintf(stderr, "[M::%s] loaded liftover over %ld sequences\n", __func__, (long)rb3_lift_n_seq(p.lift));
 		}
+		if (opt.ps4g_fn || opt.npy_fn) {
+			p.gtab = rb3_gtab_build(p.fmi.sid);
+			p.ps4g_acc = rb3_ps4g_acc_init(opt.bin_size);
+			if (opt.label_bed_fn) {
+				p.label_bed = rb3_bed_read(opt.label_bed_fn, p.gtab, p.fmi.sid, opt.ref_prefix);
+				if (p.label_bed == 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to read --label-bed '%s'\n", opt.label_bed_fn);
+					free(p.is_ref);
+					return 1;
+				}
+			}
+		}
+	} else if (opt.ps4g_fn || opt.npy_fn || opt.label_bed_fn) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed only apply to refmap\n");
+		return 1;
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
@@ -1187,6 +1262,17 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		kt_pipeline(2, worker_pipeline, &p, 3);
 		rb3_seq_close(p.fp);
 	}
+	if (p.ps4g_acc) {
+		kstring_t cmd = {0,0,0};
+		int32_t k;
+		rb3_sprintf_lite(&cmd, "ropebwt3");
+		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, opt.ref_prefix, p.label_bed, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		free(cmd.s);
+		rb3_ps4g_acc_destroy(p.ps4g_acc);
+	}
+	rb3_bed_destroy(p.label_bed);
+	rb3_gtab_destroy(p.gtab);
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
 	rb3_lift_destroy(p.lift);

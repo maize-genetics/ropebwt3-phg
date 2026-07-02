@@ -209,6 +209,10 @@ unrelated       120 UNPLACED    0 .                              .        .     
 -l INT             min anchor length when re-mapping a flank          [19]
 -t INT             number of threads                                  [4]
 -L                 one sequence per line in the input
+--ps4g=FILE        write PS4G v2.0 gamete-support counts (EXACT+PLACED reads)
+--npy=FILE         write a dense (bin x gamete+2) numpy training/inference array
+--label-bed=FILE   diploid training labels: chrom start end sampleA [sampleB]
+--bin-size=NUM     PS4G/npy reference position bin size in bp        [256]
 ```
 
 ### `--lift` (recommended)
@@ -263,3 +267,58 @@ See the strict and per-carrier blocks in
 Caps how far each flank walks outward. A query buried inside an insertion larger
 than the cap stays `UNPLACED` (no reference anchor is reached). Raise it for
 large structural variants at the cost of more work per query.
+
+## 7. PS4G and numpy output (`--ps4g`, `--npy`, `--label-bed`)
+
+These flags let `refmap` feed the PHG ML-imputation pipeline directly, instead
+of going through `mem` → BED → `phg convert-bed-to-ps4g`. Only `EXACT` and
+`PLACED` reads contribute (`ONE_SIDE`/`MULTI`/`UNPLACED` carry no confident
+reference position); `--kmer` mode does not currently contribute either output.
+
+**Gametes.** Every sequence in the index belongs to a *gamete* — the sample
+name taken from the sequence name up to the first `_` (e.g. `B73_chr1` →
+`B73`), the same rule `refmap` already uses for its `--max-occ=-1` taxon count.
+Gametes are numbered `0..N-1` in **sorted** name order, so indices are stable
+and comparable across runs on the same index. This table is written out as the
+`#gamete` block in the PS4G file and as `<npy>.gametes.tsv`.
+
+**Equivalent hits.** An `EXACT` read (found verbatim in the reference) is
+reported at one reference coordinate as before, but now *every* sample whose
+sequence contains that exact read — the reference sample included — is
+recorded as an equally-valid parent/gamete at that position. A `PLACED` read
+contributes the (up to 8) carrier samples used to place it. This is what lets
+the ML model see all haplotypes consistent with a read, not just the one the
+walk happened to report first.
+
+**PS4G (`--ps4g=FILE`).** Writes the [PS4G v2.0 format](../../phg_v2/docs/ps4g_specifications.md):
+a `#gamete` header table (name, index, total supporting-read count) followed by
+`gameteSet  refContig  refPosBinned  count` rows, one per distinct set of
+gametes observed at a binned reference position (`refPosBinned = position /
+--bin-size`). `refContig` has the `--ref-prefix` stripped (`B73_chr1` →
+`chr1`).
+
+**numpy (`--npy=FILE`).** Writes a dense `int32` array of shape
+`(n_bins, n_gametes + 2)` as a standard `.npy` v1.0 file (loadable with
+`numpy.load`, no PHG/ropebwt3 dependency needed). Column `g` is the number of
+contributing reads supporting gamete `g` at that bin; the last two columns are
+diploid training labels (gamete index of each parent copy, `-1` if
+unlabeled). Row order and column identity are given by two companion TSVs
+written alongside it:
+
+* `<npy>.bins.tsv` — `row  contig  bin` (bin's genomic start = `bin *
+  --bin-size`)
+* `<npy>.gametes.tsv` — `gameteIndex  sampleName`
+
+**Training labels (`--label-bed=FILE`).** A BED file with sample-name label
+columns instead of scores: `chrom  start  end  sampleA  [sampleB]`. `chrom`
+matches the stripped reference contig name (as in the PS4G/npy output) or,
+failing that, a literal sequence name. One label column means the region is
+homozygous (both diploid columns get the same gamete index); a second column
+gives the other parent. Bins whose genomic start falls in no region get `-1`
+in both label columns and are meant for inference, not training.
+
+```
+# labels.bed
+chr1   0        20000000  B73  Oh43
+chr1   20000000 40000000  B97
+```
