@@ -155,6 +155,38 @@ unrelated       120 UNPLACED    0 .                              .        .     
 | 9 | cR | reference coordinate of the **right** breakpoint, or `.` |
 | 10 | refSpan | `cR - cL`; reference bases spanned (0 = clean insertion point) |
 | 11 | insSize | implied inserted size in the carriers (bp) |
+| 12 | occ | *(only with `--report-occ`)* raw FM-index occurrence count, i.e. a "copy number" |
+
+#### `--report-occ`: copy number, off by default
+
+`--report-occ` appends one more trailing column: the exact number of places the
+query's sequence occurs across the whole pangenome (reference + every founder),
+before any `--max-occ`/carrier-cap truncation touches it. It is off by default —
+passing no flag reproduces today's output byte-for-byte; existing consumers of
+this TSV are unaffected until they opt in.
+
+This is a genuine, uncapped occurrence count, not an approximation: it is the
+same FM-index interval size that already drives the `MULTI` cutoff internally
+(`--max-occ`), just exposed per row instead of being discarded. It is
+**pangenome-wide** (a locus conserved across many founders reports a
+correspondingly larger `occ`, not a per-genome copy number for one specific
+assembly) and it is **not** inflated by a fixed factor for dual-strand
+indexing — a truly single-copy locus present in exactly one assembly reports
+`occ = 1` (verified directly against a known-unique example), and a genuine
+inverted/palindromic repeat correctly reports a higher count, which is real
+signal, not an artifact to divide away. For `MULTI` rows it is the count that
+triggered the rejection (typically well above `--max-occ`); for `--kmer` mode
+results it is always `0` (no single whole-query interval exists in that
+tiled-agreement algorithm).
+
+```
+$ ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift lift.fmd.lift --report-occ idx.fmd reads.fq
+qname   qlen status  nCar carriers                 refName  strand cL        cR        span ins occ
+read_a  151  PLACED  11   Oh43,CML52,Oh7B,...       B73_chr2 +      207852601 207852601 0    0   11
+read_b  151  EXACT   0    .                         B73_chr7 +      143503881 143504032 151  0   6
+read_c  151  MULTI   0    .                         .        .      .         .         .    .   91
+```
+
 
 ### How to read the example
 
@@ -215,6 +247,7 @@ unrelated       120 UNPLACED    0 .                              .        .     
 --bin-size=NUM     PS4G/npy reference position bin size in bp        [256]
 --npy-binary       npy: write presence (1) instead of read counts
 --target-hits=NUM  stop once NUM PLACED/EXACT records are written (0 = off) [0]
+--report-occ       append a trailing "copy number" column (0 = off, opt-in)
 ```
 
 ### `--lift` (recommended)
