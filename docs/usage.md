@@ -321,7 +321,7 @@ and comparable across runs on the same index. This table is written out as the
 reported at one reference coordinate as before, but now *every* sample whose
 sequence contains that exact read — the reference sample included — is
 recorded as an equally-valid parent/gamete at that position. A `PLACED` read
-contributes the (up to 8) carrier samples used to place it. This is what lets
+contributes the (up to 64) carrier samples used to place it. This is what lets
 the ML model see all haplotypes consistent with a read, not just the one the
 walk happened to report first.
 
