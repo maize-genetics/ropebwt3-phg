@@ -103,7 +103,8 @@ def parse_truth(path, name2idx):
         header = f.readline()
         for line in f:
             F = line.rstrip("\n").split("\t")
-            (rid, src, tx, strand, segstr, njunc, errpos, oraclestr, is_pav) = F
+            rid, src, tx, strand, segstr, njunc, errpos, oraclestr, is_pav = F[:9]
+            read_class = F[9] if len(F) > 9 else "normal"   # normal/intron_retention/chimera
             segments = []
             for seg in segstr.split(";"):
                 contig, span = seg.rsplit(":", 1)
@@ -124,7 +125,8 @@ def parse_truth(path, name2idx):
                         "oracle": oracle,
                         "seg_oracles": seg_oracles,
                         "has_error": errpos != "",
-                        "is_pav": is_pav == "1"}
+                        "is_pav": is_pav == "1",
+                        "read_class": read_class}
     return out
 
 

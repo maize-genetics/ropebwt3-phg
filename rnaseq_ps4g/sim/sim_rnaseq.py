@@ -114,6 +114,13 @@ def main():
                     default="sense",
                     help="read strand vs the mRNA: sense (default), antisense, or "
                          "unstranded (per-read coin flip)")
+    # adversarial RNA negatives (labeled in the read_class truth column; default off)
+    ap.add_argument("--intron-retention", type=float, default=0.0,
+                    help="fraction of reads drawn genomic (intron kept, contiguous) "
+                         "straddling a small intron")
+    ap.add_argument("--chimera", type=float, default=0.0,
+                    help="fraction of reads that fuse two transcript halves "
+                         "(template switch; non-colinear)")
     ap.add_argument("--expr-sigma", type=float, default=1.0,
                     help="log-normal expression sigma (0 = uniform)")
     ap.add_argument("--max-tries", type=int, default=20)
@@ -155,69 +162,106 @@ def main():
     fq = open(os.path.join(a.outdir, "reads.fq"), "w")
     tv = open(os.path.join(a.outdir, "truth.tsv"), "w")
     tv.write("read_id\tsource_genotype\ttranscript\tstrand\texon_segments\t"
-             "n_junctions\terror_positions\toracle_set_per_span\tis_PAV\n")
+             "n_junctions\terror_positions\toracle_set_per_span\tis_PAV\tread_class\n")
 
     sub = {"A": "CGT", "C": "AGT", "G": "ACT", "T": "ACG"}
+    # per-transcript genomic exons (sorted) + introns, for intron-retention reads
+    for t in usable:
+        ge = sorted((g0, g1) for (_, _, g0, g1) in t["exons_m"])
+        t["introns"] = [(ge[k][1], ge[k + 1][0]) for k in range(len(ge) - 1)]
+
+    def span_truth(source, gen_lo, gen_hi, clean_sub):
+        """(seg_str, oracle_str, is_pav) for a genotype-genomic span [gen_lo,gen_hi)."""
+        ref = ems[source].geno_span_to_ref(gen_lo, gen_hi)
+        if ref is None:
+            oset = simlib.oracle_set(clean_sub, geno_seqs, gindex)
+            return "%s:-1--1" % contig, ",".join(map(str, oset)), True
+        oset = simlib.oracle_from_projection(projections, source, ref[0], ref[1], gindex)
+        return "%s:%d-%d" % (contig, ref[0], ref[1]), ",".join(map(str, oset)), False
+
+    def payload(clean, segs_with_src, njunc, source, tid, strand, rclass):
+        ss, os_, pav = [], [], False
+        for (src, gen_lo, gen_hi, sub_seq) in segs_with_src:
+            s1, o1, p = span_truth(src, gen_lo, gen_hi, sub_seq)
+            ss.append(s1); os_.append(o1); pav = pav or p
+        return clean, ss, os_, njunc, pav, source, tid, strand, rclass
+
+    def gen_normal():
+        t = rng.choices(usable, weights=weights, k=1)[0]
+        start = rng.randint(0, len(t["mrna"]) - L)
+        segs = read_segments(t, start, start + L)
+        if len(segs) - 1 > a.max_junctions:
+            return None
+        clean = t["mrna"][start:start + L]
+        sw = [(t["source"], gl, gh, clean[ml - start:mh - start]) for (ml, mh, gl, gh) in segs]
+        return payload(clean, sw, len(segs) - 1, t["source"], t["tid"], t["strand"], "normal")
+
+    def gen_intron_retention():
+        # a genomic (unspliced) read straddling a small intron -- must map contiguously,
+        # not be fabricated into a junction. Only introns short enough to fit in a read.
+        cand = [t for t in usable if any(0 < (b - c) <= L - 40 for (c, b) in t["introns"])]
+        if not cand:
+            return None
+        t = rng.choice(cand)
+        c, b = rng.choice([(c, b) for (c, b) in t["introns"] if 0 < (b - c) <= L - 40])
+        start_g = c - rng.randint(20, L - (b - c) - 20)      # exon bases before the intron
+        gseq = seq_of[t["source"]]
+        if start_g < 0 or start_g + L > len(gseq):
+            return None
+        clean = gseq[start_g:start_g + L]                     # intron kept -> genomic-contiguous
+        return payload(clean, [(t["source"], start_g, start_g + L, clean)], 0,
+                       t["source"], t["tid"] + ":IR", t["strand"], "intron_retention")
+
+    def gen_chimera():
+        # two transcript halves fused (template switch): the halves are non-colinear
+        # and must NOT yield a confident single-locus placement.
+        if len(usable) < 2:
+            return None
+        tA, tB = rng.sample(usable, 2)
+        h = L // 2
+        aS, bS = rng.randint(0, len(tA["mrna"]) - h), rng.randint(0, len(tB["mrna"]) - (L - h))
+        clean = tA["mrna"][aS:aS + h] + tB["mrna"][bS:bS + (L - h)]
+        sw = []
+        for (t, s, e, off) in ((tA, aS, aS + h, 0), (tB, bS, bS + (L - h), h)):
+            for (ml, mh, gl, gh) in read_segments(t, s, e):
+                sw.append((t["source"], gl, gh, clean[off + (ml - s):off + (mh - s)]))
+        return payload(clean, sw, len(sw) - 1, tA["source"],
+                       tA["tid"] + "+" + tB["tid"], ".", "chimera")
+
     n_made = n_skip = 0
     for i in range(a.nreads):
-        placed = False
+        u = rng.random()
+        gen = (gen_chimera if u < a.chimera else
+               gen_intron_retention if u < a.chimera + a.intron_retention else gen_normal)
+        p = None
         for _ in range(a.max_tries):
-            t = rng.choices(usable, weights=weights, k=1)[0]
-            mrna = t["mrna"]
-            start = rng.randint(0, len(mrna) - L)
-            segs = read_segments(t, start, start + L)
-            if len(segs) - 1 > a.max_junctions:
-                continue
-            placed = True
-            break
-        if not placed:
+            p = gen()
+            if p is not None:
+                break
+        if p is None:
             n_skip += 1
             continue
+        clean, seg_strs, oracle_strs, njunc, is_pav, source, tid, strand, rclass = p
 
-        clean = mrna[start:start + L]                 # error-free read (sense)
-        # per-segment reference intervals + oracle sets (on error-free sequence)
-        seg_strs, oracle_strs = [], []
-        is_pav = False
-        em = ems[t["source"]]
-        for (m_lo, m_hi, gen_lo, gen_hi) in segs:
-            ref = em.geno_span_to_ref(gen_lo, gen_hi)
-            if ref is None:
-                is_pav = True
-                seg_seq = clean[m_lo - start:m_hi - start]
-                oset = simlib.oracle_set(seg_seq, geno_seqs, gindex)
-                seg_strs.append("%s:-1--1" % contig)
-            else:
-                oset = simlib.oracle_from_projection(
-                    projections, t["source"], ref[0], ref[1], gindex)
-                seg_strs.append("%s:%d-%d" % (contig, ref[0], ref[1]))
-            oracle_strs.append(",".join(map(str, oset)))
-
-        # library strand: sense = mRNA orientation; antisense = its reverse
-        # complement; unstranded = a coin flip per read. Oracle/segments are
-        # strand-independent (ropebwt3 maps both strands), so only the emitted
-        # sequence flips; error positions are in the emitted read's coordinates.
+        # library strand: sense = mRNA orientation; antisense = its reverse complement;
+        # unstranded = a coin flip. Oracle/segments are strand-independent.
         antisense = (a.library == "antisense" or
                      (a.library == "unstranded" and rng.random() < 0.5))
         base = simlib.revcomp(clean) if antisense else clean
-
-        # apply substitution error
         r = list(base)
         errs = []
-        for j, c in enumerate(r):
-            if c in sub and rng.random() < a.error:
-                r[j] = rng.choice(sub[c])
+        for j, ch in enumerate(r):
+            if ch in sub and rng.random() < a.error:
+                r[j] = rng.choice(sub[ch])
                 errs.append(j)
         read = "".join(r)
 
         rid = "r%06d" % i
         fq.write("@%s\n%s\n+\n%s\n" % (rid, read, "I" * len(read)))
         tv.write("\t".join([
-            rid, t["source"], t["tid"], t["strand"],
-            ";".join(seg_strs),
-            str(len(segs) - 1),
-            ",".join(map(str, errs)),
-            "|".join(oracle_strs),
-            "1" if is_pav else "0",
+            rid, source, tid, strand, ";".join(seg_strs), str(njunc),
+            ",".join(map(str, errs)), "|".join(oracle_strs),
+            "1" if is_pav else "0", rclass,
         ]) + "\n")
         n_made += 1
 

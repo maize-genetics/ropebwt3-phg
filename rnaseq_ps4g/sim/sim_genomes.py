@@ -64,18 +64,26 @@ def build_reference(rng, a):
 
     def add(kind, length):
         nonlocal pos
-        s = rand_seq(rng, length)
+        return add_seq(kind, rand_seq(rng, length))
+
+    def add_seq(kind, s):
+        """Append a given sequence as a region (used to emit an identical tandem copy)."""
+        nonlocal pos
         seq.append(s)
         r0 = pos
-        pos += length
+        pos += len(s)
         regions.append((r0, pos, kind))
         return r0, pos
+
+    tandem = set(range(a.tandem_dup))                 # gene indices to duplicate in tandem
+    large_intron_gene = a.ngenes - 1 if a.large_intron_kb > 0 else -1
 
     add("intergenic", rng.randint(a.intergenic_min, a.intergenic_max))
     for gi in range(a.ngenes):
         nex = rng.randint(a.min_exons, a.max_exons)
         strand = rng.choice("+-")
-        exons, introns = [], []
+        # build the gene's sequence pieces once (so a tandem copy is identical)
+        pieces = []                                   # list of (kind, sequence)
         for ei in range(nex):
             # ensure the first exon of gene 0 is long (clean within-exon reads);
             # sprinkle one short internal exon to exercise 2-junction reads later.
@@ -85,11 +93,22 @@ def build_reference(rng, a):
                 elen = rng.randint(70, 100)
             else:
                 elen = rng.randint(120, 350)
-            exons.append(add("exon", elen))
+            pieces.append(("exon", rand_seq(rng, elen)))
             if ei < nex - 1:
-                introns.append(add("intron", rng.randint(a.intron_min, a.intron_max)))
-        genes.append({"id": "gene%d" % gi, "strand": strand,
-                      "exons": exons, "introns": introns})
+                # one designated gene gets a large first intron (splice gap > max_ref_span)
+                if gi == large_intron_gene and ei == 0:
+                    ilen = int(a.large_intron_kb * 1000)
+                else:
+                    ilen = rng.randint(a.intron_min, a.intron_max)
+                pieces.append(("intron", rand_seq(rng, ilen)))
+        # emit the gene, then an identical adjacent copy if it is a tandem duplicate
+        for copy in range(2 if gi in tandem else 1):
+            gid = "gene%d" % gi if copy == 0 else "gene%ddup" % gi
+            exons, introns = [], []
+            for kind, s in pieces:
+                r0, r1 = add_seq(kind, s)
+                (exons if kind == "exon" else introns).append((r0, r1))
+            genes.append({"id": gid, "strand": strand, "exons": exons, "introns": introns})
         add("intergenic", rng.randint(a.intergenic_min, a.intergenic_max))
 
     return "".join(seq), genes, regions
@@ -193,6 +212,13 @@ def main():
     ap.add_argument("--intergenic-snp", type=float, default=0.01)
     ap.add_argument("--pav-rate", type=float, default=0.12,
                     help="prob a gene (not gene0) is absent in a non-ref genotype")
+    # adversarial fixtures (default off; turn on to stress chaining ties / gap cost)
+    ap.add_argument("--tandem-dup", type=int, default=0,
+                    help="duplicate the first N genes in tandem (identical adjacent "
+                         "copy -> placement ties)")
+    ap.add_argument("--large-intron-kb", type=float, default=0,
+                    help="give the last gene one intron this many kb (splice gap "
+                         "beyond the chainer's max-ref-span)")
     # churn operation probabilities (per step); remainder is a retained run.
     ap.add_argument("--p-del", type=float, default=0.30)
     ap.add_argument("--p-ins", type=float, default=0.10)
