@@ -123,16 +123,17 @@ def parse_truth(path, name2idx):
 
 
 def parse_ps4g_per_read(path):
-    """The per-read PS4G file from refmap --ps4g-per-read:
-    readName -> (contig, pos, frozenset(gamete indices)). This is the exact set a
-    read contributes, before aggregation, so each read is attributed strictly."""
+    """The per-read PS4G file (refmap --ps4g-per-read, or the chaining emitter):
+    readName -> list of (contig, pos, frozenset(gametes)). A read may emit more
+    than one row (one per exon segment, from the chaining emitter); stock refmap
+    emits one. This is the exact set a read contributes, so attribution is strict."""
     out = {}
     with open(path) as f:
         f.readline()  # header
         for line in f:
             rid, contig, pos, gs = line.rstrip("\n").split("\t")
             s = frozenset(int(x) for x in gs.split(",")) if gs else frozenset()
-            out[rid] = (contig, int(pos), s)
+            out.setdefault(rid, []).append((contig, int(pos), s))
     return out
 
 
@@ -163,18 +164,30 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--truth", required=True)
-    ap.add_argument("--refmap", required=True)
-    ap.add_argument("--ps4g", required=True)
     ap.add_argument("--ps4g-per-read", dest="ps4g_per_read", required=True,
-                    help="per-read PS4G file (refmap --ps4g-per-read): exact "
-                         "per-read gameteSet, for strict attribution")
-    ap.add_argument("--gametes", help="gametes.tsv to validate against PS4G header")
+                    help="per-read PS4G file (refmap --ps4g-per-read or the chaining "
+                         "emitter): exact per-read gameteSet(s), for strict attribution")
+    ap.add_argument("--gametes", help="gametes.tsv (gamete index map); used for names "
+                    "when --ps4g is absent, else validated against the PS4G header")
+    ap.add_argument("--ps4g", help="aggregated PS4G (stock refmap) for header + row "
+                    "validation; optional for the chaining emitter")
+    ap.add_argument("--refmap", help="stock refmap per-read table for exact [cL,cR] "
+                    "placement geometry; optional (else reconstructed from pos+len)")
     a = ap.parse_args()
 
-    name2idx, idx2name, pos_sets = parse_gametes_header(a.ps4g)
-    table = parse_refmap_table(a.refmap, name2idx)
+    pos_sets = {}
+    if a.ps4g:
+        name2idx, idx2name, pos_sets = parse_gametes_header(a.ps4g)
+    elif a.gametes:
+        name2idx = {}
+        for line in open(a.gametes):
+            idx, name = line.rstrip("\n").split("\t")
+            name2idx[name] = int(idx)
+    else:
+        ap.error("need --ps4g or --gametes for the gamete index map")
+    table = parse_refmap_table(a.refmap, name2idx) if a.refmap else {}
     truth = parse_truth(a.truth, name2idx)
-    per_read = parse_ps4g_per_read(a.ps4g_per_read)  # readName -> (contig, pos, exact set)
+    per_read = parse_ps4g_per_read(a.ps4g_per_read)  # readName -> [(contig, pos, set), ...]
 
     # the individual's founder set: reads are sampled from one gamete now
     # (homozygous), a heterozygous individual (two gametes) later. Non-founder
@@ -222,25 +235,25 @@ def main():
 
     allb, clean, noisy = bucket(), bucket(), bucket()
     for rid, t in truth.items():
-        sc = per_read.get(rid)      # (contig, pos, exact gameteSet) or None
+        rows = per_read.get(rid)    # [(contig, pos, set), ...] or None
         rec = table.get(rid)
         b = clean if not t["has_error"] else noisy
         for bb in (allb, b):
             bb["n"] += 1
         # --- classify placement into exactly one bucket
-        if sc is None:              # not EXACT/PLACED -> no evidence emitted
+        if not rows:                # not EXACT/PLACED -> no evidence emitted
             for bb in (allb, b):
                 bb["unmapped"] += 1
             continue
-        sc_contig, sc_pos, es = sc[0], sc[1], set(sc[2])
-        # emitted interval for the wrong-region test: prefer the table's [cL,cR)
-        # (exact), else reconstruct [pos, pos+read_len) from the per-read PS4G file.
+        es = set().union(*[set(r[2]) for r in rows])   # emitted set (chain rows share it)
+        # placement: prefer the stock table's exact [cL,cR); else reconstruct
+        # [pos, pos+read_len) and accept if ANY emitted row overlaps a true segment.
         if rec is not None and rec["coord"] is not None:
             at_locus = placed_at_locus(rec, t["segments"])
         else:
             L = sum(hi - lo for _, lo, hi in t["segments"]) or 1
-            at_locus = any(c == sc_contig and sc_pos < hi and lo < sc_pos + L
-                           for c, lo, hi in t["segments"])
+            at_locus = any(rc == c and rp < hi and lo < rp + L
+                           for (rc, rp, _) in rows for (c, lo, hi) in t["segments"])
         if not at_locus:
             for bb in (allb, b):
                 bb["wrong_region"] += 1
@@ -297,12 +310,13 @@ def main():
     print("  set breadth among recovered reads (true founder already present): IBS = non-")
     print("  source founders identical over the span (inherent); spurious = founders added by")
     print("  error, not truly consistent -- a specificity cost the CRF's multihot absorbs.")
-    print("== PS4G validation ==")
-    print("  gamete index map: %s"
-          % ("OK" if not problems else "; ".join(problems)))
-    print("  rows within a true read span: %d/%d (%.1f%%)"
-          % (rows_in_span, rows_total,
-             100.0 * rows_in_span / rows_total if rows_total else 0.0))
+    if a.ps4g:
+        print("== PS4G validation ==")
+        print("  gamete index map: %s"
+              % ("OK" if not problems else "; ".join(problems)))
+        print("  rows within a true read span: %d/%d (%.1f%%)"
+              % (rows_in_span, rows_total,
+                 100.0 * rows_in_span / rows_total if rows_total else 0.0))
     if problems:
         sys.exit(1)
 

@@ -71,25 +71,33 @@ often don't land on the exact start base (interval-tolerant recall is still 99.5
 but single-base PS4G positions are imprecise). Emitting each SMEM at its **own**
 start base (segmentation) fixes this too.
 
-## 3. Chaining prototype — first result (set-based colinear chaining)
+## 3. Chaining vs stock — full sweep (set-based colinear chaining)
 
-`chain/chain_prototype.py` over `ropebwt3 mem -p`, 20k within-exon reads, 1% error,
-vs the stock-refmap baseline:
+`chain/chain_prototype.py` (unite each read's SMEMs over `ropebwt3 mem -p`, strict
+colinear intersection) vs stock refmap, scored by `eval/score.py`. 8k within-exon
+reads/rate, seed 11. **S** = stock, **C** = chaining:
 
-| metric | stock refmap | chaining |
-|--|--:|--:|
-| spurious founders / read | 0.402 | **0.055** (~7× fewer) |
-| reads with ≥1 spurious | 31.1% | **5.0%** |
-| error-free spurious / read | — | **0.000** |
-| source-dropout | 0% | **0.10%** (21/20000 unplaced) |
+| error | recall S→C | misplaced S→C | spurious/read S→C | resolution S→C | exact-set S→C |
+|--:|--:|--:|--:|--:|--:|
+| 0.000 | 100→100% | 0.0→0.0% | 0.00→0.00 | 1.000→1.000 | 100→100% |
+| 0.005 | 99.7→99.8% | 0.3→**0.0%** | 0.22→**0.02** | 0.927→0.992 | 82→98% |
+| 0.010 | 99.4→99.9% | 0.6→**0.0%** | 0.40→**0.06** | 0.869→0.979 | 69→95% |
+| 0.020 | 98.8→99.9% | 1.2→**0.0%** | 0.68→**0.13** | 0.791→0.953 | 51→89% |
+| 0.030 | 98.7→100%  | 1.3→**0.0%** | 0.90→**0.23** | 0.735→0.920 | 39→81% |
 
-Strict intersection over the colinear chain removes ~7/8 of the false founders
-while the true founder survives every intersection (source-dropout ≈ 0), as the
-construction argument predicts. On junction reads the same chainer covers **both**
-exons at valid bases (unit-tested; e.g. r000001 → `{0,1,2,4}` at both exon starts).
-Speed caveat: the `mem -p` prototype is locate-bound on the sparse `-s16` SSA (373 s
-for the 20k `mem` step); the chaining itself is instant, and the planned C
-`--smem-out` avoids per-position locate (uses the SA interval → gametes directly).
+Chaining wins on **every** metric at every error rate: recall equal-or-higher,
+**misplaced → 0%** (colinearity + the reference-span bound kill mis-mapping),
+**spurious founders 3–9× lower**, resolution/exact-set far higher; founder-dropout
+and missed-IBS stay 0. The true founder survives every intersection by
+construction, so specificity rises with no recall cost. Junction reads: the same
+chainer covers **both** exons at valid bases (unit-tested; r000001 → `{0,1,2,4}` at
+both exon starts) — a proper junction sweep needs the whole-read (intersected)
+oracle in `score.py`, a small TODO.
+
+Run it: `sh rnaseq_ps4g/run_stage0.sh` now emits both `score.txt` (stock) and
+`score.chain.txt` (chaining). Speed: the prototype's `mem -p` is locate-bound, so
+`run_stage0.sh` builds the SSA dense (`-s4`); the chaining itself is instant, and a
+C `--smem-out` would drop the separate `mem` pass entirely.
 
 ## Conclusion
 
