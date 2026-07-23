@@ -150,9 +150,31 @@ Measured on a fixtured genome (6k reads, 1% error):
 | **tandem duplication** (gene0≡gene0dup) | placed at an arbitrary copy (false position) | **0/3181** placed — all flagged **ambiguous** (no false evidence) |
 
 Within-exon results are unchanged (penalty ≈ 0 for contiguous reads: recall 99.9%,
-misplaced 0.0%, spurious 5.0%). Chimeras that stay colinear on one strand are the
-known-hard residual (the `max-intron` cap only rejects the far ones); the labeled
-`read_class` lets us quantify that false-evidence rate as a next step.
+misplaced 0.0%, spurious 5.0%).
+
+### Chimera false-evidence (the honest cost of chaining)
+
+Chimeras (two-transcript fusions, `read_class=chimera`) are artifacts from no real
+founder, so a chain that **bridges the two loci** fabricates a fusion/linkage that
+does not exist. Chaining's uniting behaviour makes this *worse* than stock, and it
+is tunable by `--max-intron`. 8k reads, 50% chimera, 1% error:
+
+| | placed (any) | **fabricated fusion** (chain bridges >10 kb) |
+|--|--:|--:|
+| stock refmap | 93% | **0%** (one position/read — can't span two loci) |
+| chaining, `--max-intron 200000` | 99.9% | **18.3%** |
+| chaining, `--max-intron 20000` (new default) | 99.9% | **0.0%** |
+
+Fabricated-fusion rate vs `--max-intron`: 0% up to 20 kb, then 15% @100 kb, 18% @200 kb.
+Genes here are ≥30 kb apart and the large-intron fixture is 5 kb, so **max-intron in
+~[6 kb, 20 kb] rejects every cross-gene fusion while still placing the 5 kb intron** —
+the old 200 kb default was simply too loose. The default is now **20 kb**; raise it
+for large-intron organisms (at the cost of more chimeric fusions).
+
+`--max-intron` cannot catch a chimera fusing two genes *closer* than the cap; the
+real discriminator there is **canonical splice sites (GT–AG)**, which needs real
+sequence (the sim uses random bases) — a future filter. The `read_class` label is
+what lets us keep this rate honest.
 
 ## Conclusion
 

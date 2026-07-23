@@ -67,7 +67,7 @@ def read_smems(fp, ref_prefix, name2idx, max_occ):
         yield cur, rows
 
 
-def chain_and_intersect(smems, gap_intron, max_intron=200000, gap_coef=0.02):
+def chain_and_intersect(smems, gap_intron, max_intron=20000, gap_coef=0.02):
     """Return (segments, gset, flag) for one read. flag is 'ok', 'unplaced' (no
     chain) or 'ambiguous' (maps to >1 reference locus -- not confidently placeable).
 
@@ -146,9 +146,11 @@ def main():
     ap.add_argument("--contig", default="chr1")
     ap.add_argument("--max-occ", type=int, default=5, help="SMEMs with count > this are repeats (skipped)")
     ap.add_argument("--gap-intron", type=int, default=30, help="reference gap starting a new exon segment")
-    ap.add_argument("--max-intron", type=int, default=200000,
+    ap.add_argument("--max-intron", type=int, default=20000,
                     help="reject a chain link whose unexplained reference jump "
-                         "(Δref - Δquery) exceeds this (plausible intron ceiling)")
+                         "(Δref - Δquery) exceeds this (plausible intron ceiling). "
+                         "Lower = fewer chimeric cross-gene fusions but caps real "
+                         "intron size; raise for large-intron organisms")
     ap.add_argument("--gap-coef", type=float, default=0.02,
                     help="penalty per bp of unexplained reference jump; disfavors "
                          "distant/chimeric links vs a compact chain of equal anchor count")
