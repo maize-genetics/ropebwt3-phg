@@ -109,14 +109,20 @@ def parse_truth(path, name2idx):
                 contig, span = seg.rsplit(":", 1)
                 lo, hi = span.split("-")
                 segments.append((contig, int(lo), int(hi)))
-            oracle = set()
-            for part in oraclestr.split("|"):
-                for x in part.split(","):
-                    if x != "":
-                        oracle.add(int(x))
+            # whole-read oracle = INTERSECTION of the per-segment oracle sets: a
+            # spliced read came from one founder that must match every exon it
+            # spans, so the founders consistent with the whole read are those in
+            # all segments (within-exon reads have one segment -> unchanged). This
+            # is the reference the chaining emitter's intersected set is scored
+            # against; it also correctly flags a stock exon-only set that includes
+            # a founder present in one exon but not the others as spurious.
+            seg_oracles = [set(int(x) for x in part.split(",") if x != "")
+                           for part in oraclestr.split("|")]
+            oracle = set.intersection(*seg_oracles) if seg_oracles else set()
             out[rid] = {"source_idx": name2idx.get(src),
                         "segments": segments,
                         "oracle": oracle,
+                        "seg_oracles": seg_oracles,
                         "has_error": errpos != "",
                         "is_pav": is_pav == "1"}
     return out
