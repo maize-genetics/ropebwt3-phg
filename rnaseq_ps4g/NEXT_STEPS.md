@@ -124,6 +124,14 @@ tandem-duplicate, highly-divergent, chimera, intron-retention.
   exclusion, out-of-order rejection). Verified on real reads r000000/1/2:
   r000002 emits `{0}` (spurious W22 removed vs stock `{0,4}`); junction r000001
   covers both exons with the correct intersection `{0,1,2,4}`.
-- TODO: score.py per-read PS4G file-only + multi-row-per-read (junction per-segment
-  scoring); carrier-only SMEM lift projection (non-B73 sources / PAV);
-  extrapolate segment start to the read-start base; then the RESULTS.md sweeps.
+- DONE: gap penalty on the unexplained ref jump (`--gap-coef`, `--max-intron`) +
+  ambiguity flag; adversarial fixtures (tandem-dup, large-intron, chimera,
+  intron-retention); canonical GT-AG intron motifs in the sim + `--ref-fasta`
+  GT-AG splice check (±slack window); score.py whole-read (intersected) oracle +
+  per-segment junction scoring. Sweeps written to RESULTS §3–§5.
+- DONE (C): `ropebwt3 chain` — native chaining in search.c, byte-identical to the
+  Python prototype (6453/6453 rows), as fast as stock refmap (0.49s vs 0.50s/100k),
+  ~2.7× faster than mem|python. RESULTS §6.
+- TODO: GT-AG splice check in C (needs reference-sequence access — load the ref
+  contigs, look up boundary motifs with the ±slack search); carrier-only SMEM lift
+  projection (non-B73 sources / PAV); remove `--kmer` (backlog).
