@@ -206,6 +206,39 @@ error), the imputation-critical metrics stay perfect:
 | within-exon (8k) | 99.9% | **0.0%** | **0.0%** | 6.5% | 0.0% |
 | junction, `--max-junctions 2` (8k) | 97.0% | **0.0%** | **0.0%** | 16.3% | 7.4% |
 
+## 6. Native C chaining (`ropebwt3 chain`)
+
+The prototype chainer is now implemented natively in `search.c` as a new subcommand
+`ropebwt3 chain`, reusing the SMEM+locate machinery (`rb3_fmd_smem_TG` +
+`rb3_ssa_multi`) and the `gtab` gamete table — no separate `mem` process, no Python.
+It runs the same colinear in-order DP + strict intersection + per-exon-segment
+emission + `max-intron` cap + ambiguity flag as `chain_prototype.py`, emitting the
+identical per-read PS4G (`readName refContig refPos gameteSet`).
+
+**Accuracy** — byte-identical to the Python prototype on 5k mixed junction reads
+(**6453/6453 rows match, 0 diffs**) at matched parameters (`-l 19`, `--max-occ 5`,
+`--max-intron 500`, `--gap-intron 30`). Scored on 100k reads: recall 97.6%,
+**founder-dropout 0.0%, misplaced 0.0%**, unmapped 2.4% — matching the Python metrics.
+
+**Speed** — 100k RNAseq reads, 16 threads, single-chr pangenome; compute time
+(`worker_pipeline`, excludes index load), best of 3:
+
+| tool | time | vs refmap |
+|--|--:|--:|
+| `ropebwt3 chain` (native) | **0.49 s** | 0.98× |
+| `ropebwt3 refmap --lift --ps4g` (stock) | 0.50 s | 1.00× |
+| `mem -p64 \| chain_prototype.py` (Python) | 1.33 s | 2.7× |
+
+Native chaining is **as fast as stock refmap** — uniting a read's SMEMs adds no
+measurable cost over placing one — and ~2.7× faster than the Python pipeline, while
+emitting the richer united, per-segment PS4G. Run it:
+`ropebwt3 chain --ref-prefix B73 idx.fmd reads.fq > reads.ps4g`.
+
+**Not yet in C**: the GT–AG splice check (needs reference-sequence access at the
+intron boundaries); `ropebwt3 chain` equals `chain_prototype.py` *without*
+`--ref-fasta`. Adding it (load the reference contigs, look up the boundary motifs
+with the same ±slack search) is the next step.
+
 ## Conclusion
 
 Both experiments point to the same fix: **stop relying on one core per read.**

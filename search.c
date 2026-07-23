@@ -10,7 +10,7 @@
 #include "ps4g.h"
 #include "hitcount.h"
 
-typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
+typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
 #define RB3_WALK_CONSENSUS  0 // follow the base shared by the most carriers
 #define RB3_WALK_STRICT     1 // stop walking at the first carrier disagreement
@@ -54,6 +54,9 @@ typedef struct {
 	char *npy_fn;       // refmap: write a numpy (.npy) training/inference array here (NULL = off)
 	char *label_bed_fn; // refmap: diploid training labels (chrom start end sampleA [sampleB]), NULL = off
 	int64_t bin_size;   // refmap: PS4G/npy position bin size in bp (default 256)
+	int64_t max_intron;    // chain: reject a chain link whose unexplained ref jump (dRef-dQuery) exceeds this
+	int32_t gap_intron;    // chain: reference gap (bp) that starts a new exon segment
+	int32_t chain_max_occ; // chain: SMEMs with FM-interval size > this are uninformative (skipped)
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -67,6 +70,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->n_threads = 4;
 	opt->min_occ = 1;
 	opt->min_len = 19;
+	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = 5; // chain defaults (mirror chain_prototype.py)
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -196,7 +200,7 @@ static void worker_for_seq(void *data, long i, int tid)
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
-		if (p->opt->algo == RB3_SA_MEM_TG)
+		if (p->opt->algo == RB3_SA_MEM_TG || p->opt->algo == RB3_SA_CHAIN)
 			rb3_fmd_smem_TG(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
 		else if (p->opt->algo == RB3_SA_MEM_ORI)
 			rb3_fmd_smem(b->km, &p->fmi, s->len, s->seq, &b->mem, p->opt->min_occ, p->opt->min_len);
@@ -871,6 +875,153 @@ static void write_refmap(step_t *t)
 	free(out.s);
 }
 
+/********************************************************************
+ * chain: unite a read's SMEMs by colinear chaining + strict set
+ * intersection, emitting a per-read PS4G row per exon segment.
+ * Native port of rnaseq_ps4g/chain/chain_prototype.py (sans the GT-AG
+ * splice check, which needs the reference sequence). Reuses the MEM
+ * SMEM+locate machinery: each s->mem[i] has its query span and located
+ * occurrences; gametes come from gtab->sid2g, reference occurrences from
+ * is_ref (pos_stranded gives the forward coordinate + strand).
+ ********************************************************************/
+#define RB3_CHAIN_GAP_NUM 2   // gap penalty numerator: 0.02 * 100 (score scaled x100 to stay integer)
+
+typedef struct {
+	int32_t qs, qe;       // query span
+	int64_t rpos;         // reference forward position of the chosen occurrence
+	int32_t rsid;         // reference sequence index (for the contig name)
+	int8_t  rstrand;      // 0 forward, 1 reverse
+	int32_t n_ref;        // number of reference occurrences (>1 => ambiguous locus)
+	int32_t *gam, n_gam;  // sorted, deduped gamete indices over ALL occurrences
+	int64_t sc;           // DP: (bases - gap_penalty) * 100
+	int32_t anch, prev;   // DP: #anchors and backtrack pointer
+} chain_sm_t;
+
+static int chain_cmp_i32(const void *a, const void *b)
+{ int32_t x = *(const int32_t*)a, y = *(const int32_t*)b; return x < y? -1 : x > y? 1 : 0; }
+
+static int chain_cmp_sm(const void *a, const void *b) // sort candidates by (qs, rpos)
+{
+	const chain_sm_t *x = (const chain_sm_t*)a, *y = (const chain_sm_t*)b;
+	if (x->qs != y->qs) return x->qs < y->qs? -1 : 1;
+	return x->rpos < y->rpos? -1 : x->rpos > y->rpos? 1 : 0;
+}
+
+static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb) // a := sorted(a) ∩ sorted(b)
+{
+	int32_t i = 0, j = 0, k = 0;
+	while (i < na && j < nb) {
+		if (a[i] == b[j]) a[k++] = a[i], ++i, ++j;
+		else if (a[i] < b[j]) ++i;
+		else ++j;
+	}
+	return k;
+}
+
+static void chain_emit(const pipeline_t *p, const m_seq_t *s)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t i, j, n = 0, nc;
+	int8_t strand;
+	int64_t spanp = 0, spanm = 0;
+	chain_sm_t *cs;
+	int32_t *chain, best;
+	if (s->n_mem == 0) return;
+	cs = RB3_CALLOC(chain_sm_t, s->n_mem);
+	for (i = 0; i < s->n_mem; ++i) { // build informative candidates that hit the reference
+		m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, k, ng = 0, nref = 0, rsid = -1;
+		int64_t rpos = -1; int8_t rstr = 0;
+		int32_t *g;
+		if (r->n_pos == 0) continue;
+		g = RB3_MALLOC(int32_t, r->n_pos);
+		for (k = 0; k < r->n_pos; ++k) {
+			rb3_pos_t *t = &r->pos[k];
+			int32_t sidx = t->sid>>1;
+			g[ng++] = gt->sid2g[sidx];
+			if (p->is_ref[sidx]) {
+				int64_t rlen = f->sid->len[sidx];
+				int64_t fp = (t->sid&1)? rlen - (t->pos + (en - st)) : t->pos;
+				if (nref == 0) rpos = fp, rstr = t->sid & 1, rsid = sidx;
+				++nref;
+			}
+		}
+		if (nref == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) { free(g); continue; } // uninformative or no ref hit
+		qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
+		{ int32_t m = 0; for (k = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k]; ng = m; }
+		cs[n].qs = st, cs[n].qe = en, cs[n].rpos = rpos, cs[n].rsid = rsid, cs[n].rstrand = rstr;
+		cs[n].n_ref = nref, cs[n].gam = g, cs[n].n_gam = ng;
+		++n;
+	}
+	if (n == 0) { free(cs); return; }
+	for (i = 0; i < n; ++i) (cs[i].rstrand? &spanm : &spanp)[0] += cs[i].qe - cs[i].qs;
+	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
+	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }
+	if (n == 0) { free(cs); return; }
+	qsort(cs, n, sizeof(chain_sm_t), chain_cmp_sm);
+	for (i = 0; i < n; ++i) cs[i].anch = 1, cs[i].sc = (int64_t)(cs[i].qe - cs[i].qs) * 100, cs[i].prev = -1;
+	for (i = 0; i < n; ++i) { // colinear in-order DP: maximize (#anchors, bases - gap_penalty)
+		int64_t ri = cs[i].rpos;
+		for (j = 0; j < i; ++j) {
+			int64_t rj = cs[j].rpos, dr = strand? rj - ri : ri - rj;
+			int64_t dq = cs[i].qs - cs[j].qe, unexp;
+			int32_t anch; int64_t sc;
+			if (dr < 0 || cs[j].qs > cs[i].qs) continue;  // out of order -> not colinear
+			if (dq < 0) dq = 0;
+			unexp = dr - dq; if (unexp < 0) unexp = 0;    // intron length / paralog jump
+			if (unexp > p->opt->max_intron) continue;     // implausible -> reject the link
+			anch = cs[j].anch + 1;
+			sc = cs[j].sc + (int64_t)(cs[i].qe - cs[i].qs) * 100 - RB3_CHAIN_GAP_NUM * unexp;
+			if (anch > cs[i].anch || (anch == cs[i].anch && sc > cs[i].sc))
+				cs[i].anch = anch, cs[i].sc = sc, cs[i].prev = j;
+		}
+	}
+	best = 0;
+	for (i = 1; i < n; ++i)
+		if (cs[i].anch > cs[best].anch || (cs[i].anch == cs[best].anch && cs[i].sc > cs[best].sc)) best = i;
+	chain = RB3_MALLOC(int32_t, n);
+	nc = 0;
+	for (i = best; i >= 0; i = cs[i].prev) chain[nc++] = i;
+	for (i = 0; i < nc/2; ++i) { int32_t tmp = chain[i]; chain[i] = chain[nc-1-i], chain[nc-1-i] = tmp; }
+	{
+		int ambiguous = 0;
+		for (i = 0; i < nc; ++i) if (cs[chain[i]].n_ref > 1) ambiguous = 1; // maps to >1 locus -> suppress
+		if (!ambiguous) {
+			int32_t *acc = RB3_MALLOC(int32_t, cs[chain[0]].n_gam), na = cs[chain[0]].n_gam;
+			int64_t *ivlo = RB3_MALLOC(int64_t, nc), *ivhi = RB3_MALLOC(int64_t, nc);
+			memcpy(acc, cs[chain[0]].gam, na * sizeof(int32_t));
+			for (i = 1; i < nc; ++i) na = chain_isect(acc, na, cs[chain[i]].gam, cs[chain[i]].n_gam);
+			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
+				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
+				const char *contig = us? us + 1 : nm;
+				int64_t lo, hi;
+				for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
+				for (i = 0; i < nc - 1; ++i) // insertion sort ascending by start (nc is tiny)
+					for (j = i + 1; j < nc; ++j)
+						if (ivlo[j] < ivlo[i]) { int64_t t0 = ivlo[i], t1 = ivhi[i]; ivlo[i] = ivlo[j], ivhi[i] = ivhi[j], ivlo[j] = t0, ivhi[j] = t1; }
+				lo = ivlo[0], hi = ivhi[0];
+				for (i = 1; i < nc; ++i) {
+					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
+						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
+						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
+						putchar('\n');
+						lo = ivlo[i], hi = ivhi[i];
+					} else if (ivhi[i] > hi) hi = ivhi[i];
+				}
+				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
+				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
+				putchar('\n');
+			}
+			free(ivlo); free(ivhi);
+			free(acc);
+		}
+	}
+	for (i = 0; i < n; ++i) free(cs[i].gam);
+	for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos);
+	free(chain); free(cs);
+}
+
 static void write_per_seq(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -880,7 +1031,9 @@ static void write_per_seq(step_t *t)
 		m_seq_t *s = &t->seq[j];
 		free(s->seq);
 		out.l = 0;
-		if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
+		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
+			chain_emit(p, s);
+		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
 			if (t->rst_rev) {
@@ -1091,6 +1244,9 @@ static ko_longopt_t long_options[] = {
 	{ "npy-binary",      ko_no_argument,       324 },
 	{ "target-hits",     ko_required_argument, 325 },
 	{ "report-occ",      ko_no_argument,       326 },
+	{ "max-intron",      ko_required_argument, 330 },
+	{ "gap-intron",      ko_required_argument, 331 },
+	{ "chain-max-occ",   ko_required_argument, 332 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1165,6 +1321,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 324) opt.npy_binary = 1; // npy: write presence (1) instead of read counts
 		else if (c == 325) opt.target_hits = rb3_parse_num(o.arg); // stop once this many PLACED+EXACT records are written
 		else if (c == 326) opt.report_occ = 1; // append raw FM-index interval size (occurrence count) as an extra column
+		else if (c == 330) opt.max_intron = rb3_parse_num(o.arg);    // chain: max unexplained ref jump per link
+		else if (c == 331) opt.gap_intron = atoi(o.arg);             // chain: ref gap that starts a new exon segment
+		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1188,6 +1347,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	} else if (strcmp(argv[0], "refmap") == 0) {
 		opt.algo = RB3_SA_REFMAP;
 		load_flag |= RB3_LOAD_ALL;
+	} else if (strcmp(argv[0], "chain") == 0) {
+		opt.algo = RB3_SA_CHAIN;
+		load_flag |= RB3_LOAD_ALL;
+		if (opt.max_pos <= 0) opt.max_pos = opt.swo.max_pos = 64; // locate all occurrences of informative SMEMs
 	}
 	if (opt.algo == RB3_SA_HAPDIV)
 		opt.swo.flag |= RB3_SWF_E2E | RB3_SWF_HAPDIV;
@@ -1279,10 +1442,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
-	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
+	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
 		int64_t k, plen;
 		if (opt.ref_prefix == 0) {
-			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: refmap requires --ref-prefix\n");
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s requires --ref-prefix\n", argv[0]);
 			return 1;
 		}
 		if (p.fmi.ssa == 0 || p.fmi.sid == 0) {
@@ -1329,8 +1492,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 3)
 				fprintf(stderr, "[M::%s] loaded liftover over %ld sequences\n", __func__, (long)rb3_lift_n_seq(p.lift));
 		}
-		if (opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
-			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, and the per-read PS4G file
+		if (opt.algo == RB3_SA_CHAIN || opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
+			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, the per-read PS4G file, and chain
 			if (opt.ps4g_fn || opt.npy_fn) {
 				p.ps4g_acc = rb3_ps4g_acc_init(opt.bin_size);
 				if (opt.label_bed_fn) {
@@ -1356,6 +1519,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap\n");
 		return 1;
 	}
+	if (opt.algo == RB3_SA_CHAIN) puts("readName\trefContig\trefPos\tgameteSet");
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
