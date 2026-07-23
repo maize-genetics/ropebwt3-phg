@@ -131,6 +131,29 @@ Remaining chaining gaps: exon fragments below the 19 bp SMEM floor can't be cove
 (so one/two-junction coverage caps below 100%), and a few hard reads go `unmapped`
 rather than mis-mapped — the safe direction (lost evidence, not false evidence).
 
+## 5. Adversarial fixtures + intron-aware gap penalty
+
+Fixtures added to the simulator (default off): `sim_genomes --tandem-dup`
+(identical adjacent gene copy) and `--large-intron-kb` (one gene with a >2 kb
+intron); `sim_rnaseq --chimera` and `--intron-retention` (labeled in a `read_class`
+truth column). The chainer's hard `max-ref-span` cap was replaced by a penalty on
+the **unexplained reference jump** (`Δref − Δquery`, i.e. the intron length),
+folded into the `(#anchors, bases − penalty)` DP, plus a `max-intron` reject and an
+**ambiguity flag** (a SMEM with >1 reference occurrence → the read maps to multiple
+loci → suppress, don't guess).
+
+Measured on a fixtured genome (6k reads, 1% error):
+
+| fixture | old behaviour | now |
+|--|--|--|
+| **large intron** (gene5, 5 kb) | rejected by the 2 kb cap → under-served | 155/264 junction reads chain **both exons** across the 5 kb intron |
+| **tandem duplication** (gene0≡gene0dup) | placed at an arbitrary copy (false position) | **0/3181** placed — all flagged **ambiguous** (no false evidence) |
+
+Within-exon results are unchanged (penalty ≈ 0 for contiguous reads: recall 99.9%,
+misplaced 0.0%, spurious 5.0%). Chimeras that stay colinear on one strand are the
+known-hard residual (the `max-intron` cap only rejects the far ones); the labeled
+`read_class` lets us quantify that false-evidence rate as a next step.
+
 ## Conclusion
 
 Both experiments point to the same fix: **stop relying on one core per read.**

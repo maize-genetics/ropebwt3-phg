@@ -49,14 +49,15 @@ def read_smems(fp, ref_prefix, name2idx, max_occ):
             continue
         rid, qs, qe, count = F[0], int(F[1]), int(F[2]), int(F[3])
         toks = F[5:] if len(F) > 5 else []
-        gametes, ref = set(), None
+        gametes, refs = set(), []
         for t in toks:
             name, strand, pos = t.rsplit(":", 2)
             gametes.add(name2idx[simlib.gamete_of(name)])
             if name.startswith(ref_prefix):
-                ref = (int(pos), strand)          # reference forward-strand coord
+                refs.append((int(pos), strand))   # all reference occurrences (tandem dup -> >1)
         smem = {"qs": qs, "qe": qe, "count": count, "gametes": gametes,
-                "ref": ref, "informative": count <= max_occ}
+                "refs": refs, "ref": refs[0] if refs else None,
+                "informative": count <= max_occ}
         if rid != cur:
             if cur is not None:
                 yield cur, rows
@@ -66,48 +67,53 @@ def read_smems(fp, ref_prefix, name2idx, max_occ):
         yield cur, rows
 
 
-def chain_and_intersect(smems, gap_intron, max_ref_span=2000):
-    """Return (segments, gset) for one read, or (None, None) if unplaceable.
+def chain_and_intersect(smems, gap_intron, max_intron=200000, gap_coef=0.02):
+    """Return (segments, gset, flag) for one read. flag is 'ok', 'unplaced' (no
+    chain) or 'ambiguous' (maps to >1 reference locus -- not confidently placeable).
+
     - Keep informative SMEMs with a reference hit; pick the strand and the maximal
-      colinear (monotonic query<->ref) subset.
-    - Intersect their gamete sets over the WHOLE read (junction linkage: a founder
-      must be exact across every colinear exon of this read).
-    - Split the chain into exon segments at reference gaps > gap_intron.
-    Each segment is (ref_lo, ref_hi); emit the intersection set at each.
+      IN-ORDER colinear chain by a `(#anchors, bases - gap_penalty)` DP.
+    - The gap penalty is on the *unexplained* reference jump `Δref - Δquery` (0 for
+      a contiguous within-exon link; = the intron length for a splice). It grows
+      with the jump, so among equal-anchor chains a compact one beats a distant
+      (chimeric/paralogous) link, while a real large intron still wins when it is
+      the only multi-anchor option (anchors dominate the score). Links whose
+      unexplained jump exceeds `max_intron` are rejected outright.
+    - Intersect the gamete sets over the whole chain (junction linkage), and split
+      into exon segments at reference gaps > gap_intron.
+    - Ambiguity: if a chained SMEM has >1 reference occurrence (e.g. a tandem
+      duplication), the read maps to multiple loci -> flag 'ambiguous', don't emit
+      a confident position (suppressing false evidence is safer than guessing).
     """
     cand = [s for s in smems if s["informative"] and s["ref"] is not None]
     if not cand:
-        return None, None
+        return None, None, "unplaced"
     # strand = the one carrying the most query bases (ties -> '+')
     span = {"+": 0, "-": 0}
     for s in cand:
         span[s["ref"][1]] += s["qe"] - s["qs"]
     strand = "+" if span["+"] >= span["-"] else "-"
     cand = [s for s in cand if s["ref"][1] == strand]
-    # colinear + IN ORDER: sort by query start, then keep the maximal chain whose
-    # reference position moves monotonically with query (up for '+', down for '-').
-    # DP (longest chain weighted by covered query bases) so a single out-of-order
-    # SMEM is dropped rather than allowed to derail the chain.
     cand.sort(key=lambda s: (s["qs"], s["ref"][0]))
     n = len(cand)
     w = [s["qe"] - s["qs"] for s in cand]
-    # score a chain by (#anchors, covered bases): a colinear MULTI-anchor chain
-    # (agreement) beats a lone long paralog/chimera, matching --kmer's min-agree
-    # idea. best[i] = (anchors, bases) of the best chain ending at i.
-    best = [(1, w[i]) for i in range(n)]
+    # best[i] = (n_anchors, bases - gap_penalty) of the best chain ending at i
+    best = [(1, float(w[i])) for i in range(n)]
     prev = [-1] * n
     for i in range(n):
         ri = cand[i]["ref"][0]
         for j in range(i):
             rj = cand[j]["ref"][0]
-            ordered = (ri >= rj) if strand == "+" else (ri <= rj)  # ref monotonic with query
-            # spatially compact: a colinear read spans ~read-length (+ introns), not
-            # a distant locus -> reject a far-away (chimeric) SMEM even if monotonic.
-            compact = abs(ri - rj) <= max_ref_span
-            cand_score = (best[j][0] + 1, best[j][1] + w[i])
-            if cand[j]["qs"] <= cand[i]["qs"] and ordered and compact \
-                    and cand_score > best[i]:
-                best[i] = cand_score
+            dr = (ri - rj) if strand == "+" else (rj - ri)   # forward ref advance
+            if dr < 0:                                        # out of order -> not colinear
+                continue
+            dq = max(0, cand[i]["qs"] - cand[j]["qe"])        # query advance (clamp overlap)
+            unexplained = max(0, dr - dq)                     # intron length / paralog jump
+            if unexplained > max_intron:                      # implausible -> reject the link
+                continue
+            score = (best[j][0] + 1, best[j][1] + w[i] - gap_coef * unexplained)
+            if cand[j]["qs"] <= cand[i]["qs"] and score > best[i]:
+                best[i] = score
                 prev[i] = j
     end = max(range(n), key=lambda i: best[i])
     idx, chain = end, []
@@ -116,9 +122,10 @@ def chain_and_intersect(smems, gap_intron, max_ref_span=2000):
         idx = prev[idx]
     chain.reverse()
     if not chain:
-        return None, None
+        return None, None, "unplaced"
+    if any(len(s["refs"]) > 1 for s in chain):                # >1 reference locus
+        return None, None, "ambiguous"
     gset = set.intersection(*[s["gametes"] for s in chain])
-    # reference intervals (forward-strand) of the chained SMEMs, then segment
     ivs = sorted((s["ref"][0], s["ref"][0] + (s["qe"] - s["qs"])) for s in chain)
     segs, lo, hi = [], ivs[0][0], ivs[0][1]
     for a, b in ivs[1:]:
@@ -128,7 +135,7 @@ def chain_and_intersect(smems, gap_intron, max_ref_span=2000):
         else:
             hi = max(hi, b)
     segs.append((lo, hi))
-    return segs, gset
+    return segs, gset, "ok"
 
 
 def main():
@@ -139,17 +146,23 @@ def main():
     ap.add_argument("--contig", default="chr1")
     ap.add_argument("--max-occ", type=int, default=5, help="SMEMs with count > this are repeats (skipped)")
     ap.add_argument("--gap-intron", type=int, default=30, help="reference gap starting a new exon segment")
-    ap.add_argument("--max-ref-span", type=int, default=2000,
-                    help="max reference distance between chained SMEMs (rejects "
-                         "distant/chimeric hits; raise for large introns)")
+    ap.add_argument("--max-intron", type=int, default=200000,
+                    help="reject a chain link whose unexplained reference jump "
+                         "(Δref - Δquery) exceeds this (plausible intron ceiling)")
+    ap.add_argument("--gap-coef", type=float, default=0.02,
+                    help="penalty per bp of unexplained reference jump; disfavors "
+                         "distant/chimeric links vs a compact chain of equal anchor count")
     a = ap.parse_args()
 
     name2idx = parse_gametes(a.gametes)
     sys.stdout.write("readName\trefContig\trefPos\tgameteSet\n")
-    n_reads = n_emit = n_unplaced = 0
+    n_reads = n_emit = n_unplaced = n_ambig = 0
     for rid, smems in read_smems(sys.stdin, a.ref_prefix, name2idx, a.max_occ):
         n_reads += 1
-        segs, gset = chain_and_intersect(smems, a.gap_intron, a.max_ref_span)
+        segs, gset, flag = chain_and_intersect(smems, a.gap_intron, a.max_intron, a.gap_coef)
+        if flag == "ambiguous":
+            n_ambig += 1                      # maps to >1 locus -> suppress (no false evidence)
+            continue
         if segs is None or not gset:
             n_unplaced += 1
             continue
@@ -157,7 +170,8 @@ def main():
         for lo, hi in segs:
             sys.stdout.write("%s\t%s\t%d\t%s\n" % (rid, a.contig, lo, gs))
             n_emit += 1
-    sys.stderr.write("reads=%d emitted_rows=%d unplaced=%d\n" % (n_reads, n_emit, n_unplaced))
+    sys.stderr.write("reads=%d emitted_rows=%d unplaced=%d ambiguous=%d\n"
+                     % (n_reads, n_emit, n_unplaced, n_ambig))
 
 
 if __name__ == "__main__":
