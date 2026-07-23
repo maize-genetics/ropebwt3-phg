@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prototype: unite a read's SMEMs by colinear chaining + strict set intersection.
 
-Reads `ropebwt3 mem -p N` output and emits a per-read PS4G side-channel
+Reads `ropebwt3 mem -p N` output and emits a per-read PS4G file
 (readName, refContig, refPos, gameteSet), one row per exon SEGMENT, carrying the
 whole-read intersection of the informative colinear SMEM gamete sets.
 

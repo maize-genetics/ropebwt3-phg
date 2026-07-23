@@ -37,12 +37,12 @@ awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
      END{if(n)print n"\t"l}' "$G/pangenome.fa" | gzip > "$IDX.len.gz"
 "$RB" lift --ref-prefix=B73 -k 61 -s 500 -o "$G/idx.lift" "$IDX" "$G/pangenome.fa"
 
-echo "# 4. stock refmap -> single-base PS4G + per-read side-channel; table -> reads.refmap"
+echo "# 4. stock refmap -> single-base PS4G + per-read PS4G file; table -> reads.refmap"
 "$RB" refmap --ref-prefix=B73 --max-occ=-1 --lift "$G/idx.lift" \
-    --ps4g "$R/out.ps4g" --ps4g-reads "$R/reads.ps4g" --bin-size 1 \
+    --ps4g "$R/out.ps4g" --ps4g-per-read "$R/reads.ps4g" --bin-size 1 \
     "$IDX" "$R/reads.fq" > "$R/reads.refmap"
 
 echo "# 5. Tier-A scoring vs oracle truth  (also written to $OUT/score.txt)"
 python3 "$EVAL/score.py" --truth "$R/truth.tsv" --refmap "$R/reads.refmap" \
-    --ps4g "$R/out.ps4g" --ps4g-reads "$R/reads.ps4g" \
+    --ps4g "$R/out.ps4g" --ps4g-per-read "$R/reads.ps4g" \
     --gametes "$G/gametes.tsv" | tee "$OUT/score.txt"

@@ -56,7 +56,7 @@ For each read, instead of one core:
 
 ## Implementation (prefer Python post-processing; minimal C)
 
-We already emit a per-read side-channel (`--ps4g-reads`) with the *one* chosen
+We already emit a per-read PS4G file (`--ps4g-per-read`) with the *one* chosen
 placement. Chaining needs **all SMEMs per read** with their gamete sets and
 reference projections. Two build options:
 
@@ -65,11 +65,11 @@ reference projections. Two build options:
   (`experiments/ref-sensitivity/e4/liftover.py: project_robust`) to place each
   SMEM occurrence on the reference, map SA interval → gametes via `sid2g`, then
   chain + refine + emit in Python. No C change; leans on code already in the repo.
-- **B — extend the C side-channel to per-SMEM (cleaner, later).** Add
+- **B — extend the C per-read PS4G file to per-SMEM (cleaner, later).** Add
   `refmap --smem-out=FILE` emitting one row per (read, SMEM): `read, qStart, qEnd,
   matchLen, refContig, refPos, gameteSet`. Then the Python chainer consumes that
   directly (no separate `mem` run / re-projection). This is the natural successor
-  to `--ps4g-reads` and reuses the same `write_ps4g_read` plumbing in `search.c`.
+  to `--ps4g-per-read` and reuses the same `write_ps4g_read` plumbing in `search.c`.
 
 Recommended: build **A** first to validate the algorithm and the metric gains on
 the simulator, then promote the hot path to **B**.
@@ -81,10 +81,10 @@ rnaseq_ps4g/chain/
   project.py    # SMEM occurrences -> reference coords (reuse e4 liftover)
   chain.py      # colinear clustering + intron-gap segmentation + chimera flag
   refine.py     # combine per-SMEM gamete sets along a chain
-  emit.py       # per-segment, exact-base PS4G rows (+ per-read side-channel)
+  emit.py       # per-segment, exact-base PS4G rows (+ per-read PS4G file)
 ```
 `eval/score.py` and `eval/analyze_junctions.py` are already the scorers; the new
-emitter just replaces stock refmap's PS4G/side-channel in `run_stage0.sh`.
+emitter just replaces stock refmap's PS4G/per-read file in `run_stage0.sh`.
 
 ## Validation (same simulator, honest deltas)
 Re-run the RESULTS sweeps against the chaining emitter and expect, vs the stock
@@ -117,13 +117,13 @@ tandem-duplicate, highly-divergent, chimera, intron-retention.
 - `chain/chain_prototype.py`: SMEM collect from `mem -p` → in-order colinear DP
   chain scored by (anchor-count, bases) → spatial-compactness bound
   (`--max-ref-span`, rejects distant chimeras) → strict whole-read set
-  intersection → per-exon-segment emission (per-read side-channel schema).
+  intersection → per-exon-segment emission (per-read PS4G file schema).
   Handles negative strand and junctions; excludes carrier-only/chimeric SMEMs.
 - `sim/sim_rnaseq.py`: added `--library sense|antisense|unstranded`.
 - `tests/test_chain.py`: 5 unit tests (within-exon ±, junction linkage, chimera
   exclusion, out-of-order rejection). Verified on real reads r000000/1/2:
   r000002 emits `{0}` (spurious W22 removed vs stock `{0,4}`); junction r000001
   covers both exons with the correct intersection `{0,1,2,4}`.
-- TODO: score.py side-channel-only + multi-row-per-read (junction per-segment
+- TODO: score.py per-read PS4G file-only + multi-row-per-read (junction per-segment
   scoring); carrier-only SMEM lift projection (non-B73 sources / PAV);
   extrapolate segment start to the read-start base; then the RESULTS.md sweeps.

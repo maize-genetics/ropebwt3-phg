@@ -83,7 +83,7 @@ write all outputs to an explicit `--outdir`, never into the repo.
   `resolution` and `exact`%. Placement uses interval overlap because refmap
   extrapolates a full-read `[cL,cR)` from the exact core.
 - **Strict per-read attribution.** The emitted set for a read is its *exact*
-  contribution, read from a **per-read PS4G side-channel** (`refmap --ps4g-reads`,
+  contribution, read from a **per-read PS4G file** (`refmap --ps4g-per-read`,
   one row per EXACT/PLACED read with its exact gameteSet) — not a lookup into the
   aggregated PS4G, so co-located reads never mix. This makes `missed-IBS` a true
   **0** (a read's core-based set is always a superset of its full-read IBS set)

@@ -5,10 +5,10 @@ A spliced read covers N exon segments in the reference. Per-segment PS4G emissio
 (HANDOFF 2.2) wants evidence at *every* segment; stock refmap emits one placement
 per read (its longest exact core), so only one segment of a junction read gets
 evidence and the rest of that read's exonic support is lost. This script measures
-that gap from the per-read side-channel (refmap --ps4g-reads).
+that gap from the per-read PS4G file (refmap --ps4g-per-read).
 
 Usage:
-  analyze_junctions.py --truth truth.tsv --ps4g-reads reads.ps4g --gametes gametes.tsv
+  analyze_junctions.py --truth truth.tsv --ps4g-per-read reads.ps4g --gametes gametes.tsv
 """
 import argparse
 
@@ -59,13 +59,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--truth", required=True)
-    ap.add_argument("--ps4g-reads", dest="ps4g_reads", required=True)
+    ap.add_argument("--ps4g-per-read", dest="ps4g_per_read", required=True)
     ap.add_argument("--gametes", required=True)
     a = ap.parse_args()
 
     name2idx = parse_gametes(a.gametes)
     truth = parse_truth(a.truth)
-    side = parse_side(a.ps4g_reads)
+    side = parse_side(a.ps4g_per_read)
 
     # bucket by number of junctions the read spans
     classes = [("within-exon (0 junc)", lambda j: j == 0),

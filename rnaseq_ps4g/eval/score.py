@@ -122,8 +122,8 @@ def parse_truth(path, name2idx):
     return out
 
 
-def parse_ps4g_reads(path):
-    """The per-read PS4G side-channel from refmap --ps4g-reads:
+def parse_ps4g_per_read(path):
+    """The per-read PS4G file from refmap --ps4g-per-read:
     readName -> (contig, pos, frozenset(gamete indices)). This is the exact set a
     read contributes, before aggregation, so each read is attributed strictly."""
     out = {}
@@ -165,8 +165,8 @@ def main():
     ap.add_argument("--truth", required=True)
     ap.add_argument("--refmap", required=True)
     ap.add_argument("--ps4g", required=True)
-    ap.add_argument("--ps4g-reads", dest="ps4g_reads", required=True,
-                    help="per-read PS4G side-channel (refmap --ps4g-reads): exact "
+    ap.add_argument("--ps4g-per-read", dest="ps4g_per_read", required=True,
+                    help="per-read PS4G file (refmap --ps4g-per-read): exact "
                          "per-read gameteSet, for strict attribution")
     ap.add_argument("--gametes", help="gametes.tsv to validate against PS4G header")
     a = ap.parse_args()
@@ -174,7 +174,7 @@ def main():
     name2idx, idx2name, pos_sets = parse_gametes_header(a.ps4g)
     table = parse_refmap_table(a.refmap, name2idx)
     truth = parse_truth(a.truth, name2idx)
-    per_read = parse_ps4g_reads(a.ps4g_reads)  # readName -> (contig, pos, exact set)
+    per_read = parse_ps4g_per_read(a.ps4g_per_read)  # readName -> (contig, pos, exact set)
 
     # the individual's founder set: reads are sampled from one gamete now
     # (homozygous), a heterozygous individual (two gametes) later. Non-founder
@@ -208,7 +208,7 @@ def main():
                 rows_in_span += 1
 
     # --- per-read scoring. The emitted gamete set is the *exact* set the read
-    # contributed, read from the per-read side-channel (strict attribution) -- no
+    # contributed, read from the per-read PS4G file (strict attribution) -- no
     # lookup into the aggregated PS4G, so co-located reads never mix.
     def bucket():
         return {"n": 0,
@@ -234,7 +234,7 @@ def main():
             continue
         sc_contig, sc_pos, es = sc[0], sc[1], set(sc[2])
         # emitted interval for the wrong-region test: prefer the table's [cL,cR)
-        # (exact), else reconstruct [pos, pos+read_len) from the side-channel.
+        # (exact), else reconstruct [pos, pos+read_len) from the per-read PS4G file.
         if rec is not None and rec["coord"] is not None:
             at_locus = placed_at_locus(rec, t["segments"])
         else:
@@ -288,7 +288,7 @@ def main():
                      b["res_sum"] / r, 100.0 * b["exact"] / r))
 
     print("== imputation outcome (per read; recall/founder-dropout/misplaced/unmapped sum to 100%) ==")
-    print("reads=%d  emitted (per-read side-channel)=%d" % (len(truth), len(per_read)))
+    print("reads=%d  emitted (per-read PS4G file)=%d" % (len(truth), len(per_read)))
     report("ALL", allb)
     report("error-free", clean)
     report("with-error", noisy)
