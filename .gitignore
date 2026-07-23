@@ -3,6 +3,10 @@
 *.a
 Makefile.bak
 
+# Python
+__pycache__/
+*.pyc
+
 # compiled binary
 /ropebwt3
 
