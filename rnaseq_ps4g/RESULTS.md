@@ -71,6 +71,26 @@ often don't land on the exact start base (interval-tolerant recall is still 99.5
 but single-base PS4G positions are imprecise). Emitting each SMEM at its **own**
 start base (segmentation) fixes this too.
 
+## 3. Chaining prototype — first result (set-based colinear chaining)
+
+`chain/chain_prototype.py` over `ropebwt3 mem -p`, 20k within-exon reads, 1% error,
+vs the stock-refmap baseline:
+
+| metric | stock refmap | chaining |
+|--|--:|--:|
+| spurious founders / read | 0.402 | **0.055** (~7× fewer) |
+| reads with ≥1 spurious | 31.1% | **5.0%** |
+| error-free spurious / read | — | **0.000** |
+| source-dropout | 0% | **0.10%** (21/20000 unplaced) |
+
+Strict intersection over the colinear chain removes ~7/8 of the false founders
+while the true founder survives every intersection (source-dropout ≈ 0), as the
+construction argument predicts. On junction reads the same chainer covers **both**
+exons at valid bases (unit-tested; e.g. r000001 → `{0,1,2,4}` at both exon starts).
+Speed caveat: the `mem -p` prototype is locate-bound on the sparse `-s16` SSA (373 s
+for the 20k `mem` step); the chaining itself is instant, and the planned C
+`--smem-out` avoids per-position locate (uses the SA interval → gametes directly).
+
 ## Conclusion
 
 Both experiments point to the same fix: **stop relying on one core per read.**
