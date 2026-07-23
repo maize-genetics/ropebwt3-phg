@@ -40,6 +40,7 @@ typedef struct {
 	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
 	int64_t kmer_cluster;                   // refmap: cluster tolerance for agreeing k-mers (bp)
 	char *ps4g_fn;      // refmap: write a PS4G file here (NULL = off)
+	char *ps4g_reads_fn;// refmap: write a per-read PS4G side-channel here (NULL = off)
 	char *npy_fn;       // refmap: write a numpy (.npy) training/inference array here (NULL = off)
 	char *label_bed_fn; // refmap: diploid training labels (chrom start end sampleA [sampleB]), NULL = off
 	int64_t bin_size;   // refmap: PS4G/npy position bin size in bp (default 256)
@@ -67,7 +68,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->lift_win = 500000, opt->lift_mad = 200000;
 	opt->kmer_len = 0;    // off by default (whole-read placement)
 	opt->kmer_step = 15, opt->min_agree = 2, opt->kmer_cluster = 2000;
-	opt->ps4g_fn = 0, opt->npy_fn = 0, opt->label_bed_fn = 0;
+	opt->ps4g_fn = 0, opt->ps4g_reads_fn = 0, opt->npy_fn = 0, opt->label_bed_fn = 0;
 	opt->bin_size = 256;
 	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
 	opt->target_hits = 0; // off by default (read the whole input)
@@ -106,6 +107,7 @@ typedef struct {
 	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
+	FILE *ps4g_reads_fp;   // refmap --ps4g-reads: per-read PS4G side-channel, NULL unless requested
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
 } pipeline_t;
@@ -763,6 +765,24 @@ static void refmap_rst_accumulate(rb3_ps4g_acc_t *acc, const refmap_rst_t *r)
 		rb3_ps4g_acc_add(acc, r->ref_sid, r->cL, r->gametes, r->n_gametes);
 }
 
+// --ps4g-reads: the per-read PS4G *before* aggregation -- one line per EXACT/PLACED
+// read with the exact gameteSet it contributes, so a scorer can attribute each
+// read's evidence strictly (no lookup into the collapsed PS4G). refContig is the
+// bare contig part of the reference name (same first-'_' split as ps4g.c).
+static void write_ps4g_read(FILE *fp, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r)
+{
+	int32_t k;
+	const char *nm, *us;
+	if (fp == 0 || r->n_gametes <= 0 || r->ref_sid < 0) return;
+	if (r->status != RB3_RM_EXACT && r->status != RB3_RM_PLACED) return;
+	nm = f->sid->name[r->ref_sid];
+	us = strchr(nm, '_');
+	fprintf(fp, "%s\t%s\t%ld\t", s->name? s->name : "?", us? us + 1 : nm, (long)r->cL);
+	for (k = 0; k < r->n_gametes; ++k)
+		fprintf(fp, "%s%d", k? "," : "", r->gametes[k]);
+	fputc('\n', fp);
+}
+
 // --target-hits: count a written record toward the target if it's PLACED or EXACT.
 // t->p is const (step_t's writers are meant to be read-only); the hit counter is
 // the one deliberately mutable exception, so cast it away at this single call site
@@ -787,6 +807,7 @@ static void write_refmap(step_t *t)
 				write_refmap1(&out, f, s, &r->sub[k], kmer);
 				fputs(out.s, stdout);
 				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
+				write_ps4g_read(p->ps4g_reads_fp, f, s, &r->sub[k]);
 				refmap_count_hit(p, r->sub[k].status);
 				free(r->sub[k].gametes);
 			}
@@ -795,6 +816,7 @@ static void write_refmap(step_t *t)
 			write_refmap1(&out, f, s, r, kmer);
 			fputs(out.s, stdout);
 			refmap_rst_accumulate(p->ps4g_acc, r);
+			write_ps4g_read(p->ps4g_reads_fp, f, s, r);
 			refmap_count_hit(p, r->status);
 		}
 		free(r->carriers);
@@ -1018,6 +1040,7 @@ static ko_longopt_t long_options[] = {
 	{ "min-agree",       ko_required_argument, 318 },
 	{ "kmer-cluster",    ko_required_argument, 319 },
 	{ "ps4g",            ko_required_argument, 320 },
+	{ "ps4g-reads",      ko_required_argument, 326 },
 	{ "npy",             ko_required_argument, 321 },
 	{ "label-bed",       ko_required_argument, 322 },
 	{ "bin-size",        ko_required_argument, 323 },
@@ -1090,6 +1113,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 318) opt.min_agree = atoi(o.arg);
 		else if (c == 319) opt.kmer_cluster = rb3_parse_num(o.arg);
 		else if (c == 320) opt.ps4g_fn = o.arg;      // PS4G output (parents/gametes supporting each ref position)
+		else if (c == 326) opt.ps4g_reads_fn = o.arg; // per-read PS4G side-channel (exact per-read gameteSet)
 		else if (c == 321) opt.npy_fn = o.arg;       // numpy training/inference array
 		else if (c == 322) opt.label_bed_fn = o.arg; // diploid training labels: chrom start end sampleA [sampleB]
 		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
@@ -1148,6 +1172,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --kmer-cluster=NUM  agreeing k-mers must fall within NUM bp [%ld]\n", (long)opt.kmer_cluster);
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 			fprintf(stderr, "  --ps4g=FILE       write PS4G v2.0 gamete-support counts (EXACT+PLACED reads)\n");
+			fprintf(stderr, "  --ps4g-reads=FILE write a per-read PS4G side-channel (exact gameteSet per read)\n");
 			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
 			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
 			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
@@ -1203,7 +1228,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		return 1;
 	}
 	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
-	p.gtab = 0, p.ps4g_acc = 0, p.label_bed = 0;
+	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_reads_fp = 0, p.label_bed = 0;
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
 		int64_t k, plen;
@@ -1255,19 +1280,30 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 3)
 				fprintf(stderr, "[M::%s] loaded liftover over %ld sequences\n", __func__, (long)rb3_lift_n_seq(p.lift));
 		}
-		if (opt.ps4g_fn || opt.npy_fn) {
-			p.gtab = rb3_gtab_build(p.fmi.sid);
-			p.ps4g_acc = rb3_ps4g_acc_init(opt.bin_size);
-			if (opt.label_bed_fn) {
-				p.label_bed = rb3_bed_read(opt.label_bed_fn, p.gtab, p.fmi.sid, opt.ref_prefix);
-				if (p.label_bed == 0) {
-					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to read --label-bed '%s'\n", opt.label_bed_fn);
+		if (opt.ps4g_fn || opt.npy_fn || opt.ps4g_reads_fn) {
+			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, and the per-read side-channel
+			if (opt.ps4g_fn || opt.npy_fn) {
+				p.ps4g_acc = rb3_ps4g_acc_init(opt.bin_size);
+				if (opt.label_bed_fn) {
+					p.label_bed = rb3_bed_read(opt.label_bed_fn, p.gtab, p.fmi.sid, opt.ref_prefix);
+					if (p.label_bed == 0) {
+						if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to read --label-bed '%s'\n", opt.label_bed_fn);
+						free(p.is_ref);
+						return 1;
+					}
+				}
+			}
+			if (opt.ps4g_reads_fn) {
+				p.ps4g_reads_fp = fopen(opt.ps4g_reads_fn, "w");
+				if (p.ps4g_reads_fp == 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write --ps4g-reads '%s'\n", opt.ps4g_reads_fn);
 					free(p.is_ref);
 					return 1;
 				}
+				fprintf(p.ps4g_reads_fp, "readName\trefContig\trefPos\tgameteSet\n");
 			}
 		}
-	} else if (opt.ps4g_fn || opt.npy_fn || opt.label_bed_fn || opt.target_hits > 0) {
+	} else if (opt.ps4g_fn || opt.npy_fn || opt.ps4g_reads_fn || opt.label_bed_fn || opt.target_hits > 0) {
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap\n");
 		return 1;
 	}
@@ -1301,6 +1337,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}
+	if (p.ps4g_reads_fp) fclose(p.ps4g_reads_fp);
 	rb3_bed_destroy(p.label_bed);
 	rb3_gtab_destroy(p.gtab);
 	rb3_fmi_free(&p.fmi);

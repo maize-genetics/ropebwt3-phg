@@ -1,0 +1,142 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RNAseq &rarr; PS4G &middot; Module 0 report</title>
+<style>
+:root{--card:#141b2e;--ink:#e6ebf5;--mut:#94a3b8;--line:#26304a;--grn:#16a34a}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.55 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+background:linear-gradient(180deg,#0b1020,#0e1424);color:var(--ink)}
+.wrap{max-width:960px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:26px;margin:0 0 4px} h2{font-size:18px;margin:30px 0 12px;
+border-bottom:1px solid var(--line);padding-bottom:6px}
+.sub{color:var(--mut);margin:0 0 20px}
+.badges{display:flex;flex-wrap:wrap;gap:12px;margin:18px 0}
+.badge{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:150px}
+.badge .n{font-size:22px;font-weight:700} .badge .l{color:var(--mut);font-size:12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+th{color:var(--mut);font-weight:600}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+pre{background:#0a0f1e;border:1px solid var(--line);border-radius:10px;padding:12px 14px;overflow:auto;font-size:12.5px;color:#cbd5e1}
+.pipe{display:flex;flex-wrap:wrap;gap:8px;align-items:center;color:var(--mut);font-size:13px}
+.pipe span{background:#0a0f1e;border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--ink)}
+.grid{stroke:#22304d;stroke-width:1} .ax{fill:#7c8aa5;font-size:11px}
+.leg{display:flex;gap:18px;margin:6px 0 0;font-size:13px;flex-wrap:wrap}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;vertical-align:middle}
+.mut{color:var(--mut)} .ok{color:var(--grn);font-weight:600}
+.bad{color:#f87171;font-weight:600;font-size:11px}
+</style></head><body><div class="wrap">
+<h1>RNAseq &rarr; PS4G &mdash; Module 0</h1>
+<p class="sub">Synthetic RNAseq read simulator with exact ground truth + Tier-A
+scoring, scored from the individual's perspective. Baseline = stock
+<code>ropebwt3 refmap</code> (no aligner code yet).</p>
+
+<div class="badges">
+<div class="badge"><div class="n">99&ndash;100%</div><div class="l">recall (true founder)</div></div>
+<div class="badge"><div class="n ok">0.0%</div><div class="l">founder-dropout (all error rates)</div></div>
+<div class="badge"><div class="n ok">&le;1.3%</div><div class="l">misplaced</div></div>
+<div class="badge"><div class="n">~1.1/rd</div><div class="l">IBS founders (inherent)</div></div>
+</div>
+
+<h2>Pipeline</h2>
+<div class="card"><div class="pipe">
+<span>sim_genomes.py</span>&rarr;<span>sim_rnaseq.py</span>&rarr;<span>ropebwt3 build/ssa/lift</span>
+&rarr;<span>refmap --ps4g --bin-size 1</span>&rarr;<span>score.py</span></div>
+<p class="mut" style="margin:12px 0 0">Truth is exact by construction (each genotype
+carries an exact block map to the reference). Positions are single-base. Gamete
+indices follow the <code>ps4g.c</code> sorted-name rule, so simulator, aligner and
+GRITS agree. Non-ancestral mutations are lowercased in the genotype FASTAs (cosmetic;
+ropebwt3 folds case).</p></div>
+
+<h2>Synthetic pangenome</h2>
+<p class="mut">5 related genotypes, ~300&nbsp;kb each. Exons conserved
+(~1% pairwise SNP); introns + intergenic churned by indels/dups (~&frac12; shared);
+PAV genes.</p>
+<div class="card"><table><tr><th>genotype</th><th>role</th><th>length</th><th>PAV-absent</th></tr>
+<tr><td><b>B73</b></td><td>reference</td><td>326,015 bp</td><td>-</td></tr><tr><td><b>CML247</b></td><td>carrier</td><td>272,937 bp</td><td>-</td></tr><tr><td><b>Ki3</b></td><td>carrier</td><td>269,786 bp</td><td>gene1</td></tr><tr><td><b>Mo17</b></td><td>carrier</td><td>272,129 bp</td><td>gene2</td></tr><tr><td><b>W22</b></td><td>carrier</td><td>276,066 bp</td><td>-</td></tr></table></div>
+
+<h2>Scoring model &mdash; imputation outcome per read</h2>
+<div class="card"><p style="margin:0 0 8px">Every read falls in exactly one outcome (sum to 100%):</p>
+<table><tr><th>outcome</th><th>meaning</th></tr>
+<tr><td><b>recall</b></td><td>placed at the correct locus &amp; true founder present &mdash; what imputation needs</td></tr>
+<tr><td><b>founder-dropout</b> <span class=bad>critical</span></td><td>placed right, but the true founder is <b>missing</b> &mdash; its support is lost</td></tr>
+<tr><td><b>misplaced</b> <span class=bad>critical</span></td><td>evidence emitted at the wrong locus &mdash; false support elsewhere</td></tr>
+<tr><td><b>unmapped</b></td><td>no confident placement (UNPLACED/MULTI) &mdash; evidence lost</td></tr></table>
+<p class="mut" style="margin:12px 0 0"><b>founder-dropout and misplaced are the errors that
+hurt imputation.</b> For recall reads the true founder is already present; the <i>other</i>
+founders are a secondary specificity measure: <b>IBS founders</b> = non-source founders
+identical over the read span (identity-by-state, inherent ambiguity); <b>spurious founders</b>
+= founders added only because error shortened the match (not truly consistent &mdash; a
+specificity cost the CRF's multihot absorbs, it does not drop the true founder);
+<b>missed-IBS</b> = IBS founders missed (~0 with strict attribution).</p></div>
+
+<h2>Baseline vs error rate</h2>
+<div class="card">
+<svg viewBox="0 0 680 340" width="100%" style="max-width:680px">
+<line x1="48" y1="284.0" x2="660" y2="284.0" class="grid"/><text x="42" y="288.0" class="ax">0</text><line x1="48" y1="218.5" x2="660" y2="218.5" class="grid"/><text x="42" y="222.5" class="ax">25</text><line x1="48" y1="153.0" x2="660" y2="153.0" class="grid"/><text x="42" y="157.0" class="ax">50</text><line x1="48" y1="87.5" x2="660" y2="87.5" class="grid"/><text x="42" y="91.5" class="ax">75</text><line x1="48" y1="22.0" x2="660" y2="22.0" class="grid"/><text x="42" y="26.0" class="ax">100</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="48.0,22.0 201.0,22.8 354.0,23.6 507.0,25.1 660.0,25.4"/>
+<polyline fill="none" stroke="#94a3b8" stroke-width="2.5" points="48.0,284.0 201.0,237.6 354.0,202.5 507.0,154.6 660.0,124.2"/>
+<polyline fill="none" stroke="#f59e0b" stroke-width="2.5" points="48.0,284.0 201.0,283.2 354.0,282.4 507.0,280.9 660.0,280.6"/>
+<circle cx="48.0" cy="22.0" r="3" fill="#2563eb"/><circle cx="201.0" cy="22.8" r="3" fill="#2563eb"/><circle cx="354.0" cy="23.6" r="3" fill="#2563eb"/><circle cx="507.0" cy="25.1" r="3" fill="#2563eb"/><circle cx="660.0" cy="25.4" r="3" fill="#2563eb"/><circle cx="48.0" cy="284.0" r="3" fill="#94a3b8"/><circle cx="201.0" cy="237.6" r="3" fill="#94a3b8"/><circle cx="354.0" cy="202.5" r="3" fill="#94a3b8"/><circle cx="507.0" cy="154.6" r="3" fill="#94a3b8"/><circle cx="660.0" cy="124.2" r="3" fill="#94a3b8"/><circle cx="48.0" cy="284.0" r="3" fill="#f59e0b"/><circle cx="201.0" cy="283.2" r="3" fill="#f59e0b"/><circle cx="354.0" cy="282.4" r="3" fill="#f59e0b"/><circle cx="507.0" cy="280.9" r="3" fill="#f59e0b"/><circle cx="660.0" cy="280.6" r="3" fill="#f59e0b"/><text x="48.0" y="304" class="ax" text-anchor="middle">0.0%</text><text x="201.0" y="304" class="ax" text-anchor="middle">0.5%</text><text x="354.0" y="304" class="ax" text-anchor="middle">1.0%</text><text x="507.0" y="304" class="ax" text-anchor="middle">2.0%</text><text x="660.0" y="304" class="ax" text-anchor="middle">3.0%</text>
+<text x="354.0" y="324" class="ax" text-anchor="middle">substitution error rate</text>
+</svg>
+<div class="leg">
+<span><span class="dot" style="background:#2563eb"></span>recall (%)</span>
+<span><span class="dot" style="background:#f59e0b"></span>misplaced &mdash; critical (%)</span>
+<span><span class="dot" style="background:#94a3b8"></span>spurious founders &mdash; secondary (%)</span></div>
+<table style="margin-top:14px">
+<tr><th>error</th><th>recall</th><th>founder-dropout</th><th>misplaced</th><th>spurious founders (secondary)</th><th>IBS founders</th></tr>
+<tr><td>0.0%</td><td>100.0%</td><td>0.0%</td><td>0.0%</td><td>0.0% <span class=mut>(0.00/rd)</span></td><td>1.12 /rd</td></tr><tr><td>0.5%</td><td>99.7%</td><td>0.0%</td><td>0.3%</td><td>17.7% <span class=mut>(0.22/rd)</span></td><td>1.12 /rd</td></tr><tr><td>1.0%</td><td>99.4%</td><td>0.0%</td><td>0.6%</td><td>31.1% <span class=mut>(0.40/rd)</span></td><td>1.12 /rd</td></tr><tr><td>2.0%</td><td>98.8%</td><td>0.0%</td><td>1.2%</td><td>49.4% <span class=mut>(0.68/rd)</span></td><td>1.12 /rd</td></tr><tr><td>3.0%</td><td>98.7%</td><td>0.0%</td><td>1.3%</td><td>61.0% <span class=mut>(0.90/rd)</span></td><td>1.13 /rd</td></tr></table>
+<p class="mut" style="margin:10px 0 0"><b>Read this the right way:</b> the
+imputation-critical errors stay near zero &mdash; founder-dropout is 0.0% at every
+rate and misplaced &le;1.3%, so the true founder is essentially always recovered at
+the right locus. The big-looking <b>spurious founders</b> curve (0&rarr;61%) is the
+<i>benign</i> one: the true founder is still present, there are just extra founders
+that error made consistent over a shortened match &mdash; honest ambiguity the CRF's
+multihot absorbs, alongside ~1.1/read of genuine IBS founders. Strict per-read
+attribution (refmap <code>--ps4g-reads</code>) makes missed-IBS a true 0.0%.</p>
+</div>
+
+<h2>Sample outputs</h2>
+<div class="card"><b>Gamete map</b> (<code>gametes.tsv</code>, matches PS4G header):
+<pre>0	B73
+1	CML247
+2	Ki3
+3	Mo17
+4	W22</pre>
+<b>PS4G</b> (<code>out.ps4g</code>, single-base positions):
+<pre>#PS4G
+#version=2.0
+#TotalUniqueCounts: 19998
+#gamete	gameteIndex	count
+#B73	0	19901
+#CML247	1	13813
+#Ki3	2	3748
+#Mo17	3	6560
+...
+gameteSet	refContig	refPosBinned	count
+0,4	chr1	40611	1
+0,4	chr1	40613	6
+0,2,3,4	chr1	40613	1
+0,4	chr1	40614	3
+0,4	chr1	40615	3
+0,2,3,4	chr1	40615	1</pre>
+<b>Per-read truth</b> (<code>truth.tsv</code>):
+<pre>read_id	source_genotype	transcript	strand	exon_segments	n_junctions	error_positions	oracle_set_per_span	is_PAV
+r000000	B73	B73:gene0	+	chr1:40696-40846	0	17,34,62	0,1,2,4	0
+r000001	B73	B73:gene1	-	chr1:86796-86946	0		0,1	0
+r000002	B73	B73:gene1	-	chr1:86750-86900	0		0,1	0</pre></div>
+
+<h2>Files &amp; reproduce</h2>
+<div class="card"><pre>/workdir/esb33/rnaseq-stage0/
+  genomes/  *.fa pangenome.fa annot.gff3 gametes.tsv sim.json idx.fmd(.ssa/.len.gz) idx.lift
+  reads/    reads.fq truth.tsv answerkey.bed out.ps4g reads.refmap
+  score.txt report.html</pre>
+<pre>make omp=0
+sh rnaseq_ps4g/run_stage0.sh            # defaults to /workdir/esb33/rnaseq-stage0
+python3 -m pytest rnaseq_ps4g/tests/    # 6 tests</pre></div>
+
+<p class="mut" style="margin-top:26px;font-size:12px">Generated 2026-07-23 &middot;
+stock refmap baseline (8k reads, seed 11) &middot; next: Section 5.0 gap report.</p>
+</div></body></html>
