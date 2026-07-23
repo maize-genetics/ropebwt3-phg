@@ -38,12 +38,15 @@ def parse_truth(path):
 
 
 def parse_side(path):
+    """readName -> list of (contig, pos, set). Stock refmap emits one row per read;
+    the chaining emitter emits one per exon segment."""
     out = {}
     with open(path) as f:
         f.readline()
         for line in f:
             rid, contig, pos, gs = line.rstrip("\n").split("\t")
-            out[rid] = (contig, int(pos), {int(x) for x in gs.split(",") if gs})
+            out.setdefault(rid, []).append(
+                (contig, int(pos), {int(x) for x in gs.split(",") if gs}))
     return out
 
 
@@ -77,38 +80,36 @@ def main():
             continue
         n = len(rids)
         seg_instances = 0     # total true exon segments across these reads
-        near = 0              # read placed near a true exon (interval [pos,pos+L) overlaps a segment)
-        valid_base = 0        # the emitted base itself lands inside a true exon (exact)
-        recall_iv = 0         # placed near a true exon AND source founder in the set
+        near = 0              # read placed near a true exon (some row's [pos,pos+L) overlaps a segment)
+        covered = 0           # true exon segments with an emitted base inside them (valid-base coverage)
+        recall_iv = 0         # placed near a true exon AND source founder in the emitted set
         for rid in rids:
             t = truth[rid]
             segs = t["segs"]
             seg_instances += len(segs)
             L = sum(hi - lo for _, lo, hi in segs) or 1   # read length in ref bases
-            e = side.get(rid)
-            if e is None:
+            rows = side.get(rid)
+            if not rows:
                 continue
-            contig, pos, gset = e
-            if seg_of(pos, contig, segs) >= 0:
-                valid_base += 1
-            if any(c == contig and pos < hi and lo < pos + L for c, lo, hi in segs):
+            allset = set().union(*[r[2] for r in rows])
+            # a segment is covered if some emitted base lands inside it
+            for (c, lo, hi) in segs:
+                if any(rc == c and lo <= rp < hi for (rc, rp, _) in rows):
+                    covered += 1
+            if any(rc == c and rp < hi and lo < rp + L
+                   for (rc, rp, _) in rows for (c, lo, hi) in segs):
                 near += 1
-                if name2idx.get(t["src"]) in gset:
+                if name2idx.get(t["src"]) in allset:
                     recall_iv += 1
         pct = lambda x, d: 100.0 * x / d if d else 0.0
-        ceil = pct(n, seg_instances)          # structural coverage ceiling = 1/N
         print("%-22s n=%-5d segments/read=%.2f  recall(near-exon)=%.1f%%" % (
             label, n, seg_instances / n, pct(recall_iv, n)))
-        print("%-22s   segment coverage: <=%.1f%% possible (1 emission/read, %d segs); "
-              "valid emitted base=%.1f%% (%d/%d)" % (
-              "", ceil, seg_instances, pct(valid_base, seg_instances), valid_base, seg_instances))
-    print("\nTwo distinct failures on spliced reads:")
-    print(" - STRUCTURAL: stock refmap emits ONE position/read, so per-segment coverage is")
-    print("   capped at 1/N -- a spliced read's other exons get no evidence.")
-    print(" - COORDINATE: the whole-read [cL,cR) extrapolation is invalid across a junction,")
-    print("   so even the one emitted base usually lands OFF the true exons (valid-base rate")
-    print("   collapses for junction reads). Splice segmentation (emit each colinear SMEM at")
-    print("   its own exon) fixes both -> ~100% coverage at valid bases. See NEXT_STEPS.md.")
+        print("%-22s   segment coverage (valid emitted base) = %.1f%% (%d/%d segments)" % (
+              "", pct(covered, seg_instances), covered, seg_instances))
+    print("\nSegment coverage = fraction of true exon segments that receive an emitted")
+    print("base. Stock refmap emits one position/read (capped at 1/N for a spliced read,")
+    print("and its extrapolated base often lands off the exons); the chaining emitter emits")
+    print("each colinear SMEM at its own exon -> covers all N exons at valid bases.")
 
 
 if __name__ == "__main__":

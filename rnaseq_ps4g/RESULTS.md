@@ -99,6 +99,38 @@ Run it: `sh rnaseq_ps4g/run_stage0.sh` now emits both `score.txt` (stock) and
 `run_stage0.sh` builds the SSA dense (`-s4`); the chaining itself is instant, and a
 C `--smem-out` would drop the separate `mem` pass entirely.
 
+## 4. Chaining on junction (spliced) reads
+
+8k reads, `--max-junctions 2` (≈48% within-exon, 49% one-junction, 3% two-junction),
+scored against the **whole-read oracle** (intersection of per-segment oracle sets —
+a spliced read's founder must match every exon). **S** = stock, **C** = chaining.
+
+Set quality (all reads):
+
+| error | recall S→C | misplaced S→C | spurious/read S→C | resolution S→C |
+|--:|--:|--:|--:|--:|
+| 0.00 | 84.2→91.4% | 15.8→**0.0%** | 0.14→**0.06** | 0.933→0.952 |
+| 0.01 | 87.7→97.0% | 12.3→**0.0%** | 0.52→**0.17** | 0.825→0.923 |
+| 0.02 | 90.1→98.8% |  9.9→**0.0%** | 0.80→**0.26** | 0.754→0.900 |
+
+Per-segment coverage (fraction of true exon segments getting a valid emitted base),
+at 1% error:
+
+| read class | stock | chaining |
+|--|--:|--:|
+| within-exon | 58.3% | **100%** |
+| one-junction | 8.5% | **67.7%** |
+| two-junction | 5.4% | **50.2%** |
+
+Chaining emits one row per exon, so a spliced read covers **all** its exons at valid
+bases (stock covers ≤1/N, and its extrapolated base usually lands off the exons —
+even within-exon it hits the true base only 58% of the time). Chaining also
+converts stock's false **misplaced** (12% at 1% error, from cross-junction
+coordinate extrapolation) into honest recall/unmapped, and cuts spurious founders.
+Remaining chaining gaps: exon fragments below the 19 bp SMEM floor can't be covered
+(so one/two-junction coverage caps below 100%), and a few hard reads go `unmapped`
+rather than mis-mapped — the safe direction (lost evidence, not false evidence).
+
 ## Conclusion
 
 Both experiments point to the same fix: **stop relying on one core per read.**
