@@ -98,6 +98,49 @@ multihot absorbs, alongside ~1.1/read of genuine IBS founders. Strict per-read
 attribution (refmap <code>--ps4g-reads</code>) makes missed-IBS a true 0.0%.</p>
 </div>
 
+<h2>Minimum SMEM length is the wrong knob <span class=mut style="font-weight:400">(HANDOFF decision 1)</span></h2>
+<div class="card">
+<svg viewBox="0 0 620 280" width="100%" style="max-width:620px"><line x1="44" y1="230.0" x2="604" y2="230.0" class="grid"/><text x="38" y="234.0" class="ax">0</text><line x1="44" y1="177.0" x2="604" y2="177.0" class="grid"/><text x="38" y="181.0" class="ax">25</text><line x1="44" y1="124.0" x2="604" y2="124.0" class="grid"/><text x="38" y="128.0" class="ax">50</text><line x1="44" y1="71.0" x2="604" y2="71.0" class="grid"/><text x="38" y="75.0" class="ax">75</text><line x1="44" y1="18.0" x2="604" y2="18.0" class="grid"/><text x="38" y="22.0" class="ax">100</text><polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="44.0,20.5 230.7,26.1 417.3,41.7 604.0,67.8"/><circle cx="44.0" cy="20.5" r="3" fill="#2563eb"/><circle cx="230.7" cy="26.1" r="3" fill="#2563eb"/><circle cx="417.3" cy="41.7" r="3" fill="#2563eb"/><circle cx="604.0" cy="67.8" r="3" fill="#2563eb"/><polyline fill="none" stroke="#f59e0b" stroke-width="2.5" points="44.0,230.0 230.7,224.5 417.3,208.6 604.0,182.3"/><circle cx="44.0" cy="230.0" r="3" fill="#f59e0b"/><circle cx="230.7" cy="224.5" r="3" fill="#f59e0b"/><circle cx="417.3" cy="208.6" r="3" fill="#f59e0b"/><circle cx="604.0" cy="182.3" r="3" fill="#f59e0b"/><polyline fill="none" stroke="#94a3b8" stroke-width="2.5" points="44.0,125.3 230.7,127.2 417.3,132.3 604.0,141.6"/><circle cx="44.0" cy="125.3" r="3" fill="#94a3b8"/><circle cx="230.7" cy="127.2" r="3" fill="#94a3b8"/><circle cx="417.3" cy="132.3" r="3" fill="#94a3b8"/><circle cx="604.0" cy="141.6" r="3" fill="#94a3b8"/><text x="44.0" y="248" class="ax" text-anchor="middle">19</text><text x="230.7" y="248" class="ax" text-anchor="middle">40</text><text x="417.3" y="248" class="ax" text-anchor="middle">50</text><text x="604.0" y="248" class="ax" text-anchor="middle">60</text><text x="324.0" y="266" class="ax" text-anchor="middle">min SMEM length (-l)</text></svg>
+<div class="leg">
+<span><span class="dot" style="background:#2563eb"></span>recall (%)</span>
+<span><span class="dot" style="background:#f59e0b"></span>unmapped (%)</span>
+<span><span class="dot" style="background:#94a3b8"></span>spurious founders (%)</span></div>
+<p class="mut" style="margin:6px 0 0">Chart at 2% error; table shows 1% / 2% error.</p>
+<table style="margin-top:8px">
+<tr><th>-l (min core)</th><th>recall</th><th>unmapped</th><th>spurious founders</th></tr>
+<tr><td>19</td><td>99.4% / 98.8%</td><td>0.0% / 0.0%</td><td>31.1% / 49.4%</td></tr><tr><td>40</td><td>99.3% / 96.2%</td><td>0.2% / 2.6%</td><td>31.0% / 48.5%</td></tr><tr><td>50</td><td>97.8% / 88.8%</td><td>1.6% / 10.1%</td><td>30.3% / 46.1%</td></tr><tr><td>60</td><td>93.3% / 76.5%</td><td>6.2% / 22.5%</td><td>28.2% / 41.7%</td></tr></table>
+<p class="mut" style="margin:10px 0 0">Raising the minimum exact-core length barely
+lowers <b>spurious founders</b> (31&rarr;28% @1%, 49&rarr;42% @2%) or misplaced, but
+craters <b>recall</b> and raises <b>unmapped</b> (to 22% at 2% error). The single-
+longest-core design has a specificity floor <code>-l</code> cannot break &mdash;
+spurious founders come from the core matching other founders <i>over its span</i>
+(conserved exons), not short off-target hits. Keep <code>-l</code> low; specificity
+needs chaining across the read's SMEMs, not a higher floor.</p></div>
+
+<h2>Exon-spanning (junction) reads are badly served</h2>
+<div class="card"><p class="mut" style="margin:0 0 8px">8k reads, up to 2 junctions,
+1% error (48% within-exon, 49% one-junction, 3% two-junction).</p>
+<table>
+<tr><th>read class</th><th>reads</th><th>segs/read</th><th>recall (near-exon)</th><th>coverage cap</th><th>valid emitted base</th></tr>
+<tr><td><b>within-exon</b></td><td>3857</td><td>1.00</td><td>99.5%</td><td>&le;100%</td><td>58.3%</td></tr><tr><td><b>one-junction</b></td><td>3932</td><td>2.00</td><td>75.7%</td><td>&le;50%</td><td>8.5%</td></tr><tr><td><b>two-junction</b></td><td>211</td><td>3.00</td><td>95.7%</td><td>&le;33%</td><td>5.4%</td></tr></table>
+<p class="mut" style="margin:12px 0 0">Two independent failures on spliced reads:
+<b>structural</b> &mdash; stock refmap emits one position/read, so a read spanning N
+exons covers at most 1 (per-segment coverage capped at 1/N); and <b>coordinate</b>
+&mdash; the whole-read [cL,cR) is extrapolated as if contiguous, invalid across a
+junction, so the one emitted base usually lands off the exons (valid-base rate
+58%&rarr;8.5%). On this 51%-junction set overall recall falls 99&rarr;88% and
+misplaced rises 0.6&rarr;12%. Fix = splice segmentation: emit each colinear SMEM at
+its own exon start base.</p></div>
+
+<h2>Next: unite information across a read's SMEMs</h2>
+<div class="card"><p class="mut" style="margin:0">Both results point to the same fix:
+stop using one core per read. Collect all of a read's SMEMs, <b>chain</b> the
+colinear ones, <b>refine the founder set across the chain</b> (lowers spurious
+without raising <code>-l</code>, because a founder must be exact over the whole read),
+and <b>emit per exon segment</b> at each segment's own start base (covers all exons,
+valid positions). Python prototype over <code>ropebwt3 mem</code> first, then a C
+<code>--smem-out</code>. Design in <code>rnaseq_ps4g/NEXT_STEPS.md</code>.</p></div>
+
 <h2>Sample outputs</h2>
 <div class="card"><b>Gamete map</b> (<code>gametes.tsv</code>, matches PS4G header):
 <pre>0	B73
@@ -138,5 +181,5 @@ sh rnaseq_ps4g/run_stage0.sh            # defaults to /workdir/esb33/rnaseq-stag
 python3 -m pytest rnaseq_ps4g/tests/    # 6 tests</pre></div>
 
 <p class="mut" style="margin-top:26px;font-size:12px">Generated 2026-07-23 &middot;
-stock refmap baseline (8k reads, seed 11) &middot; next: Section 5.0 gap report.</p>
+stock refmap baseline (8k reads, seed 11) &middot; next: unite SMEMs (chaining), see NEXT_STEPS.md.</p>
 </div></body></html>
