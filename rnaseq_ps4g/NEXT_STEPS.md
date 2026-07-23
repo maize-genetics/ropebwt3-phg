@@ -101,3 +101,29 @@ tandem-duplicate, highly-divergent, chimera, intron-retention.
   vote/consistency threshold (robust to one bad SMEM)?
 - Do we want per-SMEM emission (option B) now, or is the `mem`-based prototype
   enough to set the min_len floor and quantify the chaining gain first?
+
+## Backlog
+
+- **Remove `--kmer`** (Ed, longer-term). The `--kmer` mode (`refmap_query_kmer` /
+  `refmap_kmer_votes` in `search.c`, options `--kmer/--kmer-step/--min-agree/
+  --kmer-cluster`, and the MAPQ calibration) is a separate positional k-mer-
+  agreement *placement* path that emits confidence columns but **no PS4G/npy**.
+  Set-based colinear chaining supersedes its purpose (multi-seed agreement for
+  specificity) *and* produces refined PS4G founder sets. Once chaining lands and
+  is validated, delete `--kmer` and its options to cut surface area.
+
+## Progress (prototype, this session)
+
+- `chain/chain_prototype.py`: SMEM collect from `mem -p` → in-order colinear DP
+  chain scored by (anchor-count, bases) → spatial-compactness bound
+  (`--max-ref-span`, rejects distant chimeras) → strict whole-read set
+  intersection → per-exon-segment emission (per-read side-channel schema).
+  Handles negative strand and junctions; excludes carrier-only/chimeric SMEMs.
+- `sim/sim_rnaseq.py`: added `--library sense|antisense|unstranded`.
+- `tests/test_chain.py`: 5 unit tests (within-exon ±, junction linkage, chimera
+  exclusion, out-of-order rejection). Verified on real reads r000000/1/2:
+  r000002 emits `{0}` (spurious W22 removed vs stock `{0,4}`); junction r000001
+  covers both exons with the correct intersection `{0,1,2,4}`.
+- TODO: score.py side-channel-only + multi-row-per-read (junction per-segment
+  scoring); carrier-only SMEM lift projection (non-B73 sources / PAV);
+  extrapolate segment start to the read-start base; then the RESULTS.md sweeps.

@@ -110,6 +110,10 @@ def main():
     ap.add_argument("--max-junctions", type=int, default=0,
                     help="reject reads spanning more than this many junctions "
                          "(0 = within-exon only, the Stage-0 default)")
+    ap.add_argument("--library", choices=["sense", "antisense", "unstranded"],
+                    default="sense",
+                    help="read strand vs the mRNA: sense (default), antisense, or "
+                         "unstranded (per-read coin flip)")
     ap.add_argument("--expr-sigma", type=float, default=1.0,
                     help="log-normal expression sigma (0 = uniform)")
     ap.add_argument("--max-tries", type=int, default=20)
@@ -188,8 +192,16 @@ def main():
                 seg_strs.append("%s:%d-%d" % (contig, ref[0], ref[1]))
             oracle_strs.append(",".join(map(str, oset)))
 
+        # library strand: sense = mRNA orientation; antisense = its reverse
+        # complement; unstranded = a coin flip per read. Oracle/segments are
+        # strand-independent (ropebwt3 maps both strands), so only the emitted
+        # sequence flips; error positions are in the emitted read's coordinates.
+        antisense = (a.library == "antisense" or
+                     (a.library == "unstranded" and rng.random() < 0.5))
+        base = simlib.revcomp(clean) if antisense else clean
+
         # apply substitution error
-        r = list(clean)
+        r = list(base)
         errs = []
         for j, c in enumerate(r):
             if c in sub and rng.random() < a.error:
