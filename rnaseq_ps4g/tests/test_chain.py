@@ -68,6 +68,18 @@ def test_chimera_penalized_prefers_compact_chain():
     assert flag == "ok" and g == {0, 1, 2, 4}, (flag, g)
 
 
+def test_gtag_splice_check():
+    # canonical GT..AG intron between two exons -> chained (2 segments); the same
+    # gap over non-canonical reference -> the link is rejected (only one exon).
+    ref = "A" * 1000 + "GT" + "C" * 196 + "AG" + "A" * 1000   # intron [1000,1200)
+    ej = smem(0, 70, 930, "+", {0, 1})      # ref [930,1000) -> donor at 1000
+    ei = smem(70, 150, 1200, "+", {0, 1})   # ref [1200,1280) -> acceptor before 1200
+    segs, g, flag = cp.chain_and_intersect([ej, ei], 30, max_intron=2000, refseq=ref)
+    assert flag == "ok" and len(segs) == 2, (flag, segs)         # canonical -> spliced
+    segs, g, flag = cp.chain_and_intersect([ej, ei], 30, max_intron=2000, refseq="A" * 3000)
+    assert len(segs) == 1, segs                                  # non-canonical -> not chained
+
+
 def test_tandem_dup_ambiguous():
     # a SMEM with two reference occurrences (tandem duplication) -> the read maps to
     # two loci -> flagged ambiguous, not placed at an arbitrary one.

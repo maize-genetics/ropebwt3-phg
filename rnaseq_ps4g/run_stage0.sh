@@ -51,7 +51,7 @@ python3 "$EVAL/score.py" --truth "$R/truth.tsv" --refmap "$R/reads.refmap" \
 echo "# 6. chaining emitter: unite each read's SMEMs -> per-read PS4G (per exon segment)"
 "$RB" mem -l 19 -p 16 "$IDX" "$R/reads.fq" 2>/dev/null | \
     python3 "$CHAIN/chain_prototype.py" --gametes "$G/gametes.tsv" \
-        --ref-prefix B73 > "$R/reads.chain.ps4g"
+        --ref-prefix B73 --ref-fasta "$G/pangenome.fa" > "$R/reads.chain.ps4g"
 
 echo "# 7. Tier-A scoring of chaining  (also written to $OUT/score.chain.txt)"
 python3 "$EVAL/score.py" --truth "$R/truth.tsv" \

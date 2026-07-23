@@ -146,7 +146,7 @@ Measured on a fixtured genome (6k reads, 1% error):
 
 | fixture | old behaviour | now |
 |--|--|--|
-| **large intron** (gene5, 5 kb) | rejected by the 2 kb cap → under-served | 155/264 junction reads chain **both exons** across the 5 kb intron |
+| **large intron** (gene5, 5 kb) | rejected by a hard 2 kb cap | placed across the 5 kb intron **when `--max-intron ≥ 5 kb`** (155/264 both exons); at the conservative 500 bp default it is intentionally not linked (GT–AG makes raising the cap chimera-safe) |
 | **tandem duplication** (gene0≡gene0dup) | placed at an arbitrary copy (false position) | **0/3181** placed — all flagged **ambiguous** (no false evidence) |
 
 Within-exon results are unchanged (penalty ≈ 0 for contiguous reads: recall 99.9%,
@@ -156,25 +156,55 @@ misplaced 0.0%, spurious 5.0%).
 
 Chimeras (two-transcript fusions, `read_class=chimera`) are artifacts from no real
 founder, so a chain that **bridges the two loci** fabricates a fusion/linkage that
-does not exist. Chaining's uniting behaviour makes this *worse* than stock, and it
-is tunable by `--max-intron`. 8k reads, 50% chimera, 1% error:
+does not exist. Chaining's uniting behaviour makes this *worse* than stock. Two
+defenses gate it: a `--max-intron` cap on the reference jump, and a **GT–AG
+splice-site check**. 8k reads, 50% chimera, 1% error:
 
 | | placed (any) | **fabricated fusion** (chain bridges >10 kb) |
 |--|--:|--:|
 | stock refmap | 93% | **0%** (one position/read — can't span two loci) |
-| chaining, `--max-intron 200000` | 99.9% | **18.3%** |
-| chaining, `--max-intron 20000` (new default) | 99.9% | **0.0%** |
+| chaining, `--max-intron 200000`, no GT–AG | 99.9% | **18.3%** |
+| chaining, `--max-intron 500` (default) | 99.9% | **0.0%** |
 
-Fabricated-fusion rate vs `--max-intron`: 0% up to 20 kb, then 15% @100 kb, 18% @200 kb.
-Genes here are ≥30 kb apart and the large-intron fixture is 5 kb, so **max-intron in
-~[6 kb, 20 kb] rejects every cross-gene fusion while still placing the 5 kb intron** —
-the old 200 kb default was simply too loose. The default is now **20 kb**; raise it
-for large-intron organisms (at the cost of more chimeric fusions).
+Genes here are ≥30 kb apart, so a tight cap alone kills every cross-gene fusion; the
+default is **500 bp** (`--max-intron`) — conservative, trading large-intron *power*
+for chimera *specificity* per the operating choice. Fabricated fusion vs cap (no
+GT–AG): 0% ≤20 kb, 15% @100 kb, 18% @200 kb.
 
-`--max-intron` cannot catch a chimera fusing two genes *closer* than the cap; the
-real discriminator there is **canonical splice sites (GT–AG)**, which needs real
-sequence (the sim uses random bases) — a future filter. The `read_class` label is
-what lets us keep this rate honest.
+### GT–AG splice-site validation
+
+`sim_genomes` now writes **canonical splice motifs** into every reference intron
+(GT‥AG in transcription orientation — genomic `GT‥AG` for `+` genes, `CT‥AC` for
+`−`; 17/17 introns verified). The chainer (`--ref-fasta`) then requires an
+intron-sized chain link to have canonical boundaries, searching a small ±`slack`
+window because a SMEM end drifts a few bp from the true splice site (microhomology /
+error near the junction).
+
+The payoff is that GT–AG lets you **raise `--max-intron`** to place large real
+introns while still rejecting far chimeras — a lever the cap alone can't give (the
+cap trades away *all* large introns). At `--max-intron 200000`, GT–AG cuts fabricated
+fusion from 18.3% toward zero; `slack` trades junction recovery against chimera
+leakage (junction "both-exon" baseline without GT–AG is 45.8%):
+
+| `slack` | fabricated fusion | normal-junction both-exon |
+|--:|--:|--:|
+| 2 | 2.8% | 31.7% |
+| 6 (default) | 8.8% | 38.5% |
+| 12 | 13.8% | 43.8% |
+
+At the **tight default cap (500 bp)** GT–AG is a *redundant* second gate on
+chimeras (the cap already gives 0% fusion) — its value is unlocked when the cap is
+raised. Crucially, GT–AG only ever rejects the intron **link** (the read still
+places at one exon; the second exon is dropped → benign `missed-IBS`/coverage),
+so it **never** causes founder-dropout or misplacement — the safe direction.
+
+Scored at the final defaults (`--max-intron 500`, GT–AG on, canonical genome, 1%
+error), the imputation-critical metrics stay perfect:
+
+| set | recall | founder-dropout | misplaced | spurious | missed-IBS |
+|--|--:|--:|--:|--:|--:|
+| within-exon (8k) | 99.9% | **0.0%** | **0.0%** | 6.5% | 0.0% |
+| junction, `--max-junctions 2` (8k) | 97.0% | **0.0%** | **0.0%** | 16.3% | 7.4% |
 
 ## Conclusion
 

@@ -67,7 +67,32 @@ def read_smems(fp, ref_prefix, name2idx, max_occ):
         yield cur, rows
 
 
-def chain_and_intersect(smems, gap_intron, max_intron=20000, gap_coef=0.02):
+def canonical_splice(refseq, strand, lo, hi, slack=6):
+    """Does the reference intron near [lo,hi) have canonical splice motifs (GT..AG
+    in transcription orientation; '-' strand checked on the reverse complement)?
+
+    The exon/intron boundary implied by a SMEM's end drifts a few bp from the true
+    splice site (microhomology: an intron base coincidentally matches the adjacent
+    exon, so the SMEM over/under-runs). Like real spliced aligners we therefore
+    search a small ±`slack` window on each boundary for the canonical motif. A
+    non-canonical intron-sized gap is a chimera/artifact, not a real splice."""
+    if hi - lo < 4:
+        return True                       # too small to be a real intron -> allow
+    n = len(refseq)
+    # transcription-orientation GT..AG on the forward strand reads GT..AG for a '+'
+    # intron and CT..AC (revcomp) for a '-' intron.
+    low_motif, high_motif = ("GT", "AG") if strand == "+" else ("CT", "AC")
+    for d in range(max(0, lo - slack), min(n - 1, lo + slack) + 1):
+        if refseq[d:d + 2] != low_motif:
+            continue
+        for a in range(max(d + 4, hi - slack), min(n, hi + slack) + 1):
+            if refseq[a - 2:a] == high_motif:
+                return True
+    return False
+
+
+def chain_and_intersect(smems, gap_intron, max_intron=500, gap_coef=0.02,
+                        refseq=None, splice_min=10):
     """Return (segments, gset, flag) for one read. flag is 'ok', 'unplaced' (no
     chain) or 'ambiguous' (maps to >1 reference locus -- not confidently placeable).
 
@@ -111,6 +136,13 @@ def chain_and_intersect(smems, gap_intron, max_intron=20000, gap_coef=0.02):
             unexplained = max(0, dr - dq)                     # intron length / paralog jump
             if unexplained > max_intron:                      # implausible -> reject the link
                 continue
+            # GT-AG splice-site check: an intron-sized gap must have canonical
+            # boundaries, else it is a non-canonical (chimeric) junction -> reject.
+            if refseq is not None:
+                wj, wi = cand[j]["qe"] - cand[j]["qs"], cand[i]["qe"] - cand[i]["qs"]
+                lo, hi = (rj + wj, ri) if strand == "+" else (ri + wi, rj)
+                if hi - lo >= splice_min and not canonical_splice(refseq, strand, lo, hi):
+                    continue
             score = (best[j][0] + 1, best[j][1] + w[i] - gap_coef * unexplained)
             if cand[j]["qs"] <= cand[i]["qs"] and score > best[i]:
                 best[i] = score
@@ -146,22 +178,32 @@ def main():
     ap.add_argument("--contig", default="chr1")
     ap.add_argument("--max-occ", type=int, default=5, help="SMEMs with count > this are repeats (skipped)")
     ap.add_argument("--gap-intron", type=int, default=30, help="reference gap starting a new exon segment")
-    ap.add_argument("--max-intron", type=int, default=20000,
+    ap.add_argument("--max-intron", type=int, default=500,
                     help="reject a chain link whose unexplained reference jump "
                          "(Δref - Δquery) exceeds this (plausible intron ceiling). "
-                         "Lower = fewer chimeric cross-gene fusions but caps real "
-                         "intron size; raise for large-intron organisms")
+                         "Conservative default trades junction power for specificity; "
+                         "raise for large-intron organisms")
     ap.add_argument("--gap-coef", type=float, default=0.02,
                     help="penalty per bp of unexplained reference jump; disfavors "
                          "distant/chimeric links vs a compact chain of equal anchor count")
+    ap.add_argument("--ref-fasta",
+                    help="reference (or pangenome) FASTA; enables the GT-AG splice-"
+                         "site check so an intron-gap link must have canonical motifs")
+    ap.add_argument("--splice-min", type=int, default=10,
+                    help="reference gap size above which the GT-AG check applies")
     a = ap.parse_args()
 
     name2idx = parse_gametes(a.gametes)
+    refseq = None
+    if a.ref_fasta:
+        fa = simlib.read_fasta(a.ref_fasta)
+        refseq = next((v for k, v in fa.items() if k.startswith(a.ref_prefix)), None)
     sys.stdout.write("readName\trefContig\trefPos\tgameteSet\n")
     n_reads = n_emit = n_unplaced = n_ambig = 0
     for rid, smems in read_smems(sys.stdin, a.ref_prefix, name2idx, a.max_occ):
         n_reads += 1
-        segs, gset, flag = chain_and_intersect(smems, a.gap_intron, a.max_intron, a.gap_coef)
+        segs, gset, flag = chain_and_intersect(smems, a.gap_intron, a.max_intron,
+                                               a.gap_coef, refseq, a.splice_min)
         if flag == "ambiguous":
             n_ambig += 1                      # maps to >1 locus -> suppress (no false evidence)
             continue

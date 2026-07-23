@@ -53,6 +53,16 @@ def mutate(rng, s, rate):
     return "".join(out)
 
 
+def canon_intron(s, strand):
+    """Force canonical splice motifs at an intron's boundaries. In transcription
+    orientation the intron is GT..AG; on the genomic forward strand a '+' gene's
+    intron reads GT..AG, a '-' gene's reads CT..AC (= revcomp of GT..AG)."""
+    if len(s) < 4:
+        return s
+    d, ac = ("GT", "AG") if strand == "+" else ("CT", "AC")
+    return d + s[2:-2] + ac
+
+
 def build_reference(rng, a):
     """Return (ref_seq, genes, regions). genes: list of dicts with reference
     coords {id, strand, exons:[(r0,r1)], introns:[(r0,r1)]}. regions: list of
@@ -100,7 +110,7 @@ def build_reference(rng, a):
                     ilen = int(a.large_intron_kb * 1000)
                 else:
                     ilen = rng.randint(a.intron_min, a.intron_max)
-                pieces.append(("intron", rand_seq(rng, ilen)))
+                pieces.append(("intron", canon_intron(rand_seq(rng, ilen), strand)))
         # emit the gene, then an identical adjacent copy if it is a tandem duplicate
         for copy in range(2 if gi in tandem else 1):
             gid = "gene%d" % gi if copy == 0 else "gene%ddup" % gi
