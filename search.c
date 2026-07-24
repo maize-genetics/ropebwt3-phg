@@ -9,6 +9,9 @@
 #include "lift.h"
 #include "ps4g.h"
 #include "hitcount.h"
+#include "khashl-km.h"
+
+KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
@@ -57,6 +60,8 @@ typedef struct {
 	int64_t max_intron;    // chain: reject a chain link whose unexplained ref jump (dRef-dQuery) exceeds this
 	int32_t gap_intron;    // chain: reference gap (bp) that starts a new exon segment
 	int32_t chain_max_occ; // chain: SMEMs with FM-interval size > this are uninformative (skipped)
+	char *ref_fasta;       // chain: reference (or pangenome) FASTA -> GT-AG splice-site check (NULL = off)
+	int32_t splice_min;    // chain: reference gap size (bp) above which the GT-AG check applies
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -71,6 +76,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->min_occ = 1;
 	opt->min_len = 19;
 	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = 5; // chain defaults (mirror chain_prototype.py)
+	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -121,6 +127,7 @@ typedef struct {
 	rb3_seqio_t *fp;
 	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
 	int64_t n_ref;   // refmap: number of reference sequences
+	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
@@ -878,13 +885,81 @@ static void write_refmap(step_t *t)
 /********************************************************************
  * chain: unite a read's SMEMs by colinear chaining + strict set
  * intersection, emitting a per-read PS4G row per exon segment.
- * Native port of rnaseq_ps4g/chain/chain_prototype.py (sans the GT-AG
- * splice check, which needs the reference sequence). Reuses the MEM
+ * Native port of rnaseq_ps4g/chain/chain_prototype.py, including the optional
+ * GT-AG splice check when --ref-fasta loads the reference contigs. Reuses the MEM
  * SMEM+locate machinery: each s->mem[i] has its query span and located
  * occurrences; gametes come from gtab->sid2g, reference occurrences from
  * is_ref (pos_stranded gives the forward coordinate + strand).
  ********************************************************************/
 #define RB3_CHAIN_GAP_NUM 2   // gap penalty numerator: 0.02 * 100 (score scaled x100 to stay integer)
+#define RB3_CHAIN_SLACK   6   // ±bp window searched around a SMEM boundary for the canonical splice motif
+
+/* Load reference contig sequences for the GT-AG splice check. Reads every record
+ * of a reference (or whole-pangenome) FASTA and keeps, keyed by index sequence id,
+ * an uppercase copy of the sequence for each contig marked in is_ref[]. Non-reference
+ * records (other founders) and names absent from the index are ignored. Returns the
+ * number of reference contigs filled; p->ref_seq[k] stays NULL for any not found. */
+static int64_t chain_load_ref(pipeline_t *p, const char *fn)
+{
+	rb3_seqio_t *fp;
+	rb3_name2sid_t *h;
+	int64_t k, n_loaded = 0;
+	const char *name;
+	char *ss;
+	int64_t len;
+	int absent;
+	p->ref_seq = RB3_CALLOC(char*, p->fmi.sid->n_seq);
+	h = rb3_name2sid_init();                       // reference contig name -> index sid
+	for (k = 0; k < p->fmi.sid->n_seq; ++k)
+		if (p->is_ref[k]) {
+			khint_t itr = rb3_name2sid_put(h, p->fmi.sid->name[k], &absent);
+			kh_val(h, itr) = (int32_t)k;
+		}
+	fp = rb3_seq_open(fn, 0);
+	if (fp == 0) { rb3_name2sid_destroy(h); free(p->ref_seq); p->ref_seq = 0; return -1; }
+	while ((ss = rb3_seq_read1(fp, &len, &name)) != 0) {
+		khint_t itr;
+		int32_t sid;
+		char *cp;
+		int64_t i;
+		if (name == 0) continue;
+		itr = rb3_name2sid_get(h, name);
+		if (itr == kh_end(h)) continue;            // not a reference contig -> skip
+		sid = kh_val(h, itr);
+		if (p->ref_seq[sid]) continue;             // first record for this name wins
+		cp = RB3_MALLOC(char, len + 1);
+		for (i = 0; i < len; ++i) { char c = ss[i]; cp[i] = (c >= 'a' && c <= 'z')? c - 32 : c; }
+		cp[len] = 0;
+		p->ref_seq[sid] = cp;
+		++n_loaded;
+	}
+	rb3_seq_close(fp);
+	rb3_name2sid_destroy(h);
+	return n_loaded;
+}
+
+/* Does the reference intron spanning forward coordinates [lo,hi) have canonical
+ * splice motifs? GT..AG in transcription orientation reads GT..AG on the forward
+ * strand for a '+' gene and CT..AC (reverse complement) for a '-' gene. A SMEM's
+ * end drifts a few bp from the true splice site (microhomology), so search a ±slack
+ * window on each boundary, mirroring canonical_splice() in chain_prototype.py. */
+static int chain_canonical_splice(const char *refseq, int64_t reflen, int8_t strand, int64_t lo, int64_t hi)
+{
+	const int slack = RB3_CHAIN_SLACK;
+	int64_t d, a, dlo, dhi;
+	const char *low_motif = strand? "CT" : "GT", *high_motif = strand? "AC" : "AG";
+	if (hi - lo < 4) return 1;                     // too small to be a real intron -> allow
+	dlo = lo - slack < 0? 0 : lo - slack;
+	dhi = lo + slack < reflen - 1? lo + slack : reflen - 1;
+	for (d = dlo; d <= dhi; ++d) {
+		if (d + 1 >= reflen || refseq[d] != low_motif[0] || refseq[d+1] != low_motif[1]) continue;
+		int64_t alo = d + 4 > hi - slack? d + 4 : hi - slack;
+		int64_t ahi = hi + slack < reflen? hi + slack : reflen;
+		for (a = alo; a <= ahi; ++a)
+			if (a >= 2 && refseq[a-2] == high_motif[0] && refseq[a-1] == high_motif[1]) return 1;
+	}
+	return 0;
+}
 
 typedef struct {
 	int32_t qs, qe;       // query span
@@ -971,6 +1046,13 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s)
 			if (dq < 0) dq = 0;
 			unexp = dr - dq; if (unexp < 0) unexp = 0;    // intron length / paralog jump
 			if (unexp > p->opt->max_intron) continue;     // implausible -> reject the link
+			if (p->ref_seq && cs[i].rsid == cs[j].rsid && p->ref_seq[cs[j].rsid]) { // GT-AG splice-site check
+				int32_t wj = cs[j].qe - cs[j].qs, wi = cs[i].qe - cs[i].qs;
+				int64_t lo = strand? ri + wi : rj + wj, hi = strand? rj : ri; // forward intron bounds
+				if (hi - lo >= p->opt->splice_min &&
+					!chain_canonical_splice(p->ref_seq[cs[j].rsid], f->sid->len[cs[j].rsid], strand, lo, hi))
+					continue;                             // non-canonical intron gap -> reject the link
+			}
 			anch = cs[j].anch + 1;
 			sc = cs[j].sc + (int64_t)(cs[i].qe - cs[i].qs) * 100 - RB3_CHAIN_GAP_NUM * unexp;
 			if (anch > cs[i].anch || (anch == cs[i].anch && sc > cs[i].sc))
@@ -1247,6 +1329,8 @@ static ko_longopt_t long_options[] = {
 	{ "max-intron",      ko_required_argument, 330 },
 	{ "gap-intron",      ko_required_argument, 331 },
 	{ "chain-max-occ",   ko_required_argument, 332 },
+	{ "ref-fasta",       ko_required_argument, 333 },
+	{ "splice-min",      ko_required_argument, 334 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1324,6 +1408,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 330) opt.max_intron = rb3_parse_num(o.arg);    // chain: max unexplained ref jump per link
 		else if (c == 331) opt.gap_intron = atoi(o.arg);             // chain: ref gap that starts a new exon segment
 		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
+		else if (c == 333) opt.ref_fasta = o.arg;                    // chain: reference FASTA -> GT-AG splice check
+		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1391,6 +1477,15 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all founders together, not per-genome; 0 for --kmer mode)\n");
 		}
+		if (strcmp(argv[0], "chain") == 0) {
+			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
+			fprintf(stderr, "  --max-intron=NUM  reject a chain link whose unexplained ref jump exceeds this [%ld]\n", (long)opt.max_intron);
+			fprintf(stderr, "  --gap-intron=INT  reference gap starting a new exon segment [%d]\n", opt.gap_intron);
+			fprintf(stderr, "  --chain-max-occ=INT  SMEMs with interval size > this are uninformative (skipped) [%d]\n", opt.chain_max_occ);
+			fprintf(stderr, "  --ref-fasta=FILE  reference/pangenome FASTA -> GT-AG splice check on intron-gap links\n");
+			fprintf(stderr, "  --splice-min=INT  ref gap size above which the GT-AG check applies [%d]\n", opt.splice_min);
+			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
+		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
 		}
@@ -1439,7 +1534,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.ref_seq = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
@@ -1494,6 +1589,16 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.algo == RB3_SA_CHAIN || opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
 			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, the per-read PS4G file, and chain
+			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
+				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);
+				if (n_load < 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to open --ref-fasta '%s'\n", opt.ref_fasta);
+					free(p.is_ref);
+					return 1;
+				}
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] loaded %ld of %ld reference contigs for the GT-AG splice check\n", __func__, (long)n_load, (long)p.n_ref);
+			}
 			if (opt.ps4g_fn || opt.npy_fn) {
 				p.ps4g_acc = rb3_ps4g_acc_init(opt.bin_size);
 				if (opt.label_bed_fn) {
@@ -1553,6 +1658,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	if (p.ps4g_per_read_fp) fclose(p.ps4g_per_read_fp);
 	rb3_bed_destroy(p.label_bed);
 	rb3_gtab_destroy(p.gtab);
+	if (p.ref_seq) {
+		int64_t k;
+		for (k = 0; k < p.fmi.sid->n_seq; ++k) free(p.ref_seq[k]);
+		free(p.ref_seq);
+	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
 	rb3_lift_destroy(p.lift);

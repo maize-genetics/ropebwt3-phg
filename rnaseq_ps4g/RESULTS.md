@@ -234,10 +234,18 @@ measurable cost over placing one — and ~2.7× faster than the Python pipeline,
 emitting the richer united, per-segment PS4G. Run it:
 `ropebwt3 chain --ref-prefix B73 idx.fmd reads.fq > reads.ps4g`.
 
-**Not yet in C**: the GT–AG splice check (needs reference-sequence access at the
-intron boundaries); `ropebwt3 chain` equals `chain_prototype.py` *without*
-`--ref-fasta`. Adding it (load the reference contigs, look up the boundary motifs
-with the same ±slack search) is the next step.
+**GT–AG splice check (now in C).** `ropebwt3 chain --ref-fasta ref.fa` loads the
+reference contigs (keyed by index sequence name; uppercased) and applies the same
+canonical-motif gate as the Python `--ref-fasta`: an intron-sized chain link
+(`Δref ≥ --splice-min`, default 10) must have `GT..AG` boundaries (`CT..AC` on a
+`−` gene), searched in a ±6 bp window at the already-known chain coordinate — a
+**positional** lookup, not a re-query of the index. Byte-identical to the Python
+prototype *with* `--ref-fasta` in every regime tested (5k reads, `--max-intron`
+500 and 200 000: **0 diffs**), and it reshapes real chains (324 rows changed vs
+no-ref on 5k reads). Cost is negligible — 20k reads/16 threads: 0.088 s (no-ref)
+→ 0.090 s (GT–AG), the check being O(slack) only on intron links plus a one-time
+ref load. End-to-end (20k reads): recall 99.9%, founder-dropout 0.0%, misplaced
+0.0%. Run it: `ropebwt3 chain --ref-prefix B73 --ref-fasta ref.fa idx.fmd reads.fq`.
 
 ## Conclusion
 

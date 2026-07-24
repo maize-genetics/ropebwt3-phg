@@ -132,6 +132,11 @@ tandem-duplicate, highly-divergent, chimera, intron-retention.
 - DONE (C): `ropebwt3 chain` — native chaining in search.c, byte-identical to the
   Python prototype (6453/6453 rows), as fast as stock refmap (0.49s vs 0.50s/100k),
   ~2.7× faster than mem|python. RESULTS §6.
-- TODO: GT-AG splice check in C (needs reference-sequence access — load the ref
-  contigs, look up boundary motifs with the ±slack search); carrier-only SMEM lift
-  projection (non-B73 sources / PAV); remove `--kmer` (backlog).
+- DONE (C): GT-AG splice check in C (`--ref-fasta` + `--splice-min`). Loads the
+  reference contigs (name->sid via khashl, uppercased) and applies the same
+  canonical-motif ±slack gate positionally at the known chain coordinate.
+  Byte-identical to the Python `--ref-fasta` (0 diffs, max-intron 500 & 200k);
+  negligible cost. RESULTS §6.
+- TODO: carrier-only SMEM lift projection (non-B73 sources / PAV) — the one case
+  where a positional ref lookup can't help (no reference intron); an index-query
+  motif check in the carrier is the right tool there. Remove `--kmer` (backlog).
