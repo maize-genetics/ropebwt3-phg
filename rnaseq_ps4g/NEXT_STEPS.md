@@ -104,6 +104,21 @@ tandem-duplicate, highly-divergent, chimera, intron-retention.
 
 ## Backlog
 
+- **Rename "carrier" (terminology cleanup)** (Ed). The RefMap engine calls a
+  pangenome member that contains a read a "carrier" (247 uses across 27 files;
+  also spelled "founder"). Ed: neither is a good name -- these objects are the
+  **assembled genomes** that make up the pangenome. Move to an assembly-based
+  term. Open decisions before doing it:
+  - Term: `assembly` is cleanest; avoid `reference assembly` because "reference"
+    already means the single B73 coordinate backbone in RefMap.
+  - Keep a distinct relational label for "the assemblies a given read hit"
+    (was "carrier") vs "any pangenome assembly"? e.g. "hit assemblies".
+  - Also unify the other scattered names for the same object -- `gamete` (PS4G),
+    `taxa` (`--max-occ` auto count), `sample` -- onto the chosen term, or leave
+    PS4G's `gamete` as its own domain term.
+  - Scope: new `rnaseq_ps4g/` code only; repo-wide comments/docs; or full rename
+    including the `--walk-mode=per-carrier` CLI value + `lift.h` public names
+    (the last breaks the CLI/ABI).
 - **Remove `--kmer`** (Ed, longer-term). The `--kmer` mode (`refmap_query_kmer` /
   `refmap_kmer_votes` in `search.c`, options `--kmer/--kmer-step/--min-agree/
   --kmer-cluster`, and the MAPQ calibration) is a separate positional k-mer-
