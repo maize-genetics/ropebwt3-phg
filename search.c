@@ -75,7 +75,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->n_threads = 4;
 	opt->min_occ = 1;
 	opt->min_len = 19;
-	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = 5; // chain defaults (mirror chain_prototype.py)
+	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = -1; // chain: chain_max_occ<0 = auto (2*#samples, cap 256)
 	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
@@ -1481,7 +1481,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
 			fprintf(stderr, "  --max-intron=NUM  reject a chain link whose unexplained ref jump exceeds this [%ld]\n", (long)opt.max_intron);
 			fprintf(stderr, "  --gap-intron=INT  reference gap starting a new exon segment [%d]\n", opt.gap_intron);
-			fprintf(stderr, "  --chain-max-occ=INT  SMEMs with interval size > this are uninformative (skipped) [%d]\n", opt.chain_max_occ);
+			fprintf(stderr, "  --chain-max-occ=INT  skip SMEMs whose FM interval exceeds this [auto: min(2*#samples,256)]\n");
 			fprintf(stderr, "  --ref-fasta=FILE  reference/pangenome FASTA -> GT-AG splice check on intron-gap links\n");
 			fprintf(stderr, "  --splice-min=INT  ref gap size above which the GT-AG check applies [%d]\n", opt.splice_min);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
@@ -1559,8 +1559,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (rb3_verbose >= 3)
 			fprintf(stderr, "[M::%s] %ld of %ld sequences marked as reference\n", __func__, (long)p.n_ref, (long)p.fmi.sid->n_seq);
-		// count distinct taxa (sequence-name prefixes before '_') for the auto --max-occ default
-		if (opt.max_occ < 0) {
+		{ // N = distinct taxa (name prefixes before '_'); drives sample-relative caps
 			int64_t k, m, n_taxa = 0;
 			char **pre = RB3_CALLOC(char*, p.fmi.sid->n_seq);
 			for (k = 0; k < p.fmi.sid->n_seq; ++k) {
@@ -1573,9 +1572,22 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 			for (m = 0; m < n_taxa; ++m) free(pre[m]);
 			free(pre);
-			opt.max_occ = n_taxa;
-			if (rb3_verbose >= 3)
-				fprintf(stderr, "[M::%s] auto --max-occ = %ld (distinct taxa)\n", __func__, (long)opt.max_occ);
+			if (opt.max_occ < 0) { // refmap: auto occurrence cap = N
+				opt.max_occ = n_taxa;
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] auto --max-occ = %ld (distinct taxa)\n", __func__, (long)opt.max_occ);
+			}
+			if (opt.algo == RB3_SA_CHAIN) { // sample-relative caps: an FM interval counts BOTH strands, so
+				// sequence present once per taxon has size ~2N; admit that (cap 256 to stay byte-sized).
+				if (opt.chain_max_occ < 0) {
+					int64_t c = 2 * n_taxa;
+					opt.chain_max_occ = c < 256? (int32_t)c : 256;
+				}
+				if (opt.max_pos < opt.chain_max_occ) // locate all occurrences the filter admits
+					opt.max_pos = opt.swo.max_pos = opt.chain_max_occ;
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] chain: N=%ld -> --chain-max-occ=%d, max_pos=%d\n", __func__, (long)n_taxa, opt.chain_max_occ, opt.max_pos);
+			}
 		}
 		if (opt.lift_fn) { // E4: load the carrier->reference liftover
 			p.lift = rb3_lift_restore(opt.lift_fn);
