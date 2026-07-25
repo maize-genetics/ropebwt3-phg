@@ -15,7 +15,7 @@ Compute N once from the taxa count (search.c, in the is_ref block) and derive th
 | 2 | `max_pos` (chain) | search.c | # located occ/SMEM → gamete set | 64 | `>= chain_max_occ` | **DONE** |
 | 3 | `RB3_RM_MAX_CARRIER` | search.c | carriers kept per placed read (refmap) | 64 | 256 (byte ceiling) | **DONE** |
 | 4 | `tmp[256]` gamete cap | ps4g.c | gametes per PS4G event | 256 | keep 256 (byte ceiling) | keep |
-| 5 | k-mer locate `pos[64]`/cap | lift.c | carrier hits per k-mer (lift build) | 64 | `min(2N,256)` | TODO |
+| 5 | k-mer locate `pos[64]`/cap | lift.c | carrier hits per k-mer (lift build) | 64 | `min(2N,256)` | skip (lift k-mer retired w/ --kmer) |
 
 Already correct (the pattern): refmap `--max-occ` `<0 = auto = #taxa`.
 
@@ -28,9 +28,9 @@ Already correct (the pattern): refmap `--max-occ` `<0 = auto = #taxa`.
   zero speed/memory change; only alters behavior for N>64 (its purpose). #5 skipped
   (lift k-mer path; being retired with --kmer). #4 kept as byte ceiling.
 
-## Remaining work (#3, #5)
-Replace fixed-size stack arrays (`rsids[64]`, `rposs[64]`, `v[64]`, `car_seen[64]`,
-`carriers[64]` in refmap_place*/refmap_query; `pos[64]` in lift.c) with N-sized
-(min(N or 2N, 256)) allocations, and raise the corresponding `1<<16`/`64` locate
-caps consistently. Lower risk to do together with a small helper that returns the
-byte-capped N-derived bound.
+## Status
+#1, #2, #3 done (chain + refmap). #4 kept as the byte ceiling. #5 skipped (the lift
+builder's k-mer anchoring is being retired with `--kmer`). Not yet empirically tested
+on a >64-founder graph (none in hand) — #3 is byte-identical for N<=64 and correct by
+construction above it; worth a synthetic >64-sample check before the PanAnd across-
+genera row.
