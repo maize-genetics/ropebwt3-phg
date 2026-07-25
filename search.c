@@ -1001,13 +1001,13 @@ static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb)
 // Projection window (bp) for the PAV path: the breakpoint is the nearest anchor, so a
 // modest window suffices and keeps the O(anchors^2) projection cheap (vs lift_win 500kb).
 #define RB3_CHAIN_PAV_WIN 50000
-#define RB3_CHAIN_PAV_NPROJ 8   // occurrences of the representative SMEM to project (ambiguity check)
+#define RB3_CHAIN_PAV_NPROJ 4   // occurrences of the representative SMEM to project (ambiguity check)
 
 // Carrier-only (PAV) fallback for reads with NO reference-hitting SMEM: place the read
 // at the nearest B73 breakpoint via the liftover, emitting one row `pav:<contig>` with
 // the intersected carrier gamete set. Requires --lift. Presence/absence only (no
 // internal resolution) -- see design/pav-carrier-coordinates-scope.md.
-static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s)
+static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1041,7 +1041,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s)
 			int64_t rlen = f->sid->len[sidx];
 			int64_t cfp = (r->pos[k].sid&1)? rlen - (r->pos[k].pos + (en - st)) : r->pos[k].pos;
 			int64_t rsid, rpos; int mode;
-			if (!rb3_lift_project_bp(p->lift, 0, sidx, cfp, RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
+			if (!rb3_lift_project_bp(p->lift, km, sidx, cfp, RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
 			if (n_proj == 0) bp_rsid = rsid, bp_rpos = rpos;
 			else if (rsid != bp_rsid || llabs(rpos - bp_rpos) > p->opt->gap_intron) ambiguous = 1;
 			++n_proj;
@@ -1057,7 +1057,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s)
 	free(acc);
 }
 
-static void chain_emit(const pipeline_t *p, const m_seq_t *s)
+static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1093,7 +1093,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s)
 		cs[n].n_ref = nref, cs[n].gam = g, cs[n].n_gam = ng;
 		++n;
 	}
-	if (n == 0) { free(cs); if (p->lift) chain_emit_pav(p, s); return; } // no ref anchor -> try PAV breakpoint
+	if (n == 0) { free(cs); if (p->lift) chain_emit_pav(p, s, km); return; } // no ref anchor -> try PAV breakpoint
 	for (i = 0; i < n; ++i) (cs[i].rstrand? &spanm : &spanp)[0] += cs[i].qe - cs[i].qs;
 	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
 	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }
@@ -1173,12 +1173,13 @@ static void write_per_seq(step_t *t)
 	const pipeline_t *p = t->p;
 	int32_t i, j;
 	kstring_t out = {0,0,0};
+	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
 		free(s->seq);
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
-			chain_emit(p, s);
+			chain_emit(p, s, km);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
@@ -1252,6 +1253,7 @@ static void write_per_seq(step_t *t)
 		}
 		free(s->name); free(s->mem); free(s->gap);
 	}
+	if (km) km_destroy(km);
 	free(out.s);
 	free(t->rst);
 	free(t->rst_rev);

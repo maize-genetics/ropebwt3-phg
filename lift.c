@@ -250,14 +250,21 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	}
 	n = b - a;
 	if (n < min_support) return 0;
-	// majority reference sequence in the window
+	// majority reference sequence in the window. O(n) via a small first-seen tally
+	// (a window touches only a handful of reference sids); tie-break = earliest first
+	// occurrence, identical to the previous O(n^2) scan so refmap output is unchanged.
 	best_rsid = -1, best_n = 0;
-	for (i = a; i < b; ++i) {
-		int64_t rs = pt[i].rsid; cnt = 0;
-		int64_t j;
-		for (j = a; j < b; ++j) if (pt[j].rsid == rs) ++cnt;
-		if (cnt > best_n) best_n = cnt, best_rsid = rs;
+	{
+		int64_t vals[256], cnts[256]; int nv = 0, u;
+		for (i = a; i < b; ++i) {
+			int64_t rs = pt[i].rsid, f = -1;
+			for (u = 0; u < nv; ++u) if (vals[u] == rs) { f = u; break; }
+			if (f < 0) { if (nv < 256) { vals[nv] = rs; cnts[nv] = 1; ++nv; } } // >256 distinct: degenerate, drop
+			else ++cnts[f];
+		}
+		for (u = 0; u < nv; ++u) if (cnts[u] > best_n) best_n = cnts[u], best_rsid = vals[u];
 	}
+	(void)cnt;
 	if (best_n < min_support) return 0;
 	// residuals for slope +1 (rpos-cpos) and -1 (rpos+cpos) over majority-chr points
 	resP = Kmalloc(km, int64_t, best_n);
