@@ -223,12 +223,15 @@ static int64_t i64_median(int64_t *a, int64_t n)
 	return a[n>>1];
 }
 
-// Project a carrier hit (csid, cpos) to a reference coordinate. Returns 1 and sets
-// *out_rsid,*out_rpos on success; returns 0 (NULL slot) when not confidently
-// collinear. win/max_mad in bp, min_support minimum anchors in window.
-int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
-					 int64_t win, int64_t max_mad, int32_t min_support,
-					 int64_t *out_rsid, int64_t *out_rpos)
+// Core projector. Finds the reference coordinate for a carrier hit by fitting a
+// colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
+// colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
+// falls back to the nearest reference anchor = the closest reference BREAKPOINT and
+// sets *out_mode=1; a colinear projection sets *out_mode=0. Returns 0 when there is
+// no confident reference nearby at all. win/max_mad in bp, min_support min anchors.
+static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+							 int64_t win, int64_t max_mad, int32_t min_support, int allow_bp,
+							 int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
 {
 	int64_t lo = lf->off[csid], hi = lf->off[csid + 1];
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
@@ -276,13 +279,49 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 		kfree(km, cpP); kfree(km, cpM);
 		if (madP <= madM) sign = 1, med = mP;
 		else sign = -1, med = mM;
-		if ((madP <= madM? madP : madM) > max_mad) { kfree(km, resP); kfree(km, resM); return 0; }
+		if ((madP <= madM? madP : madM) > max_mad) { // not colinear: an insertion between flanks
+			kfree(km, resP); kfree(km, resM);
+			if (!allow_bp) return 0;
+			{ // breakpoint: nearest reference anchor (by carrier distance) on the majority chr
+				int64_t best_d = -1, bp = -1;
+				for (i = a; i < b; ++i) if (pt[i].rsid == best_rsid) {
+					int64_t d = llabs(pt[i].cpos - cpos);
+					if (best_d < 0 || d < best_d) best_d = d, bp = pt[i].rpos;
+				}
+				if (bp < 0) return 0;
+				*out_rsid = best_rsid, *out_rpos = bp;
+				if (out_mode) *out_mode = 1;
+				return 1;
+			}
+		}
 	}
 	*out_rsid = best_rsid;
 	*out_rpos = sign * cpos + med;
 	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
+	if (out_mode) *out_mode = 0;
 	kfree(km, resP); kfree(km, resM);
 	return 1;
+}
+
+// Project a carrier hit (csid, cpos) to a reference coordinate. Returns 1 and sets
+// *out_rsid,*out_rpos on success; returns 0 (NULL slot) when not confidently
+// collinear. win/max_mad in bp, min_support minimum anchors in window.
+int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+					 int64_t win, int64_t max_mad, int32_t min_support,
+					 int64_t *out_rsid, int64_t *out_rpos)
+{
+	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 0, out_rsid, out_rpos, 0);
+}
+
+// Like rb3_lift_project, but when the locus is NOT colinear (a PAV/insertion between
+// the flanking anchors) it returns the nearest reference anchor = the closest
+// reference breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0). Used
+// by `chain` to place carrier-only (PAV) reads at the flanking reference breakpoint.
+int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+						int64_t win, int64_t max_mad, int32_t min_support,
+						int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
+{
+	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode);
 }
 
 /* ---- the `lift` subcommand (build + dump) ------------------------------ */

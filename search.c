@@ -994,6 +994,69 @@ static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb)
 	return k;
 }
 
+// Tight colinearity tolerance (bp) for the PAV path: a carrier position whose flanking
+// reference anchors disagree by more than this is inside an insertion -> use the nearest
+// reference anchor (breakpoint) rather than a projected-through-the-insertion coordinate.
+#define RB3_CHAIN_PAV_MAD 64
+// Projection window (bp) for the PAV path: the breakpoint is the nearest anchor, so a
+// modest window suffices and keeps the O(anchors^2) projection cheap (vs lift_win 500kb).
+#define RB3_CHAIN_PAV_WIN 50000
+#define RB3_CHAIN_PAV_NPROJ 8   // occurrences of the representative SMEM to project (ambiguity check)
+
+// Carrier-only (PAV) fallback for reads with NO reference-hitting SMEM: place the read
+// at the nearest B73 breakpoint via the liftover, emitting one row `pav:<contig>` with
+// the intersected carrier gamete set. Requires --lift. Presence/absence only (no
+// internal resolution) -- see design/pav-carrier-coordinates-scope.md.
+static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t i, k, na = 0, *acc = 0, rep = -1, rep_len = 0;
+	for (i = 0; i < s->n_mem; ++i) { // collect carrier-only informative SMEMs; intersect gamete sets
+		m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, ng = 0, nref = 0, *g, m;
+		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+		g = RB3_MALLOC(int32_t, r->n_pos);
+		for (k = 0; k < r->n_pos; ++k) {
+			int32_t sidx = r->pos[k].sid>>1;
+			g[ng++] = gt->sid2g[sidx];
+			if (p->is_ref[sidx]) nref++;
+		}
+		if (nref > 0) { free(g); continue; } // has a reference hit -> not a PAV SMEM
+		qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
+		for (k = 0, m = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k];
+		ng = m;
+		if (acc == 0) { acc = RB3_MALLOC(int32_t, ng); memcpy(acc, g, ng * sizeof(int32_t)); na = ng; }
+		else na = chain_isect(acc, na, g, ng);
+		free(g);
+		if (en - st > rep_len) rep_len = en - st, rep = i;
+	}
+	if (rep < 0 || na == 0) { free(acc); return; } // no carrier SMEM, or founders disagree
+	{ // project the representative SMEM's carrier occurrences to a reference breakpoint
+		m_sai_pos_t *r = &s->mem[rep];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, n_proj = 0, ambiguous = 0;
+		int64_t bp_rsid = -1, bp_rpos = -1;
+		for (k = 0; k < r->n_pos && k < RB3_CHAIN_PAV_NPROJ; ++k) {
+			int32_t sidx = r->pos[k].sid>>1;
+			int64_t rlen = f->sid->len[sidx];
+			int64_t cfp = (r->pos[k].sid&1)? rlen - (r->pos[k].pos + (en - st)) : r->pos[k].pos;
+			int64_t rsid, rpos; int mode;
+			if (!rb3_lift_project_bp(p->lift, 0, sidx, cfp, RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
+			if (n_proj == 0) bp_rsid = rsid, bp_rpos = rpos;
+			else if (rsid != bp_rsid || llabs(rpos - bp_rpos) > p->opt->gap_intron) ambiguous = 1;
+			++n_proj;
+		}
+		if (n_proj > 0 && !ambiguous) { // one row at the breakpoint, flagged pav:
+			const char *nm = f->sid->name[bp_rsid], *us = strchr(nm, '_');
+			const char *contig = us? us + 1 : nm;
+			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp_rpos);
+			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+			putchar('\n');
+		}
+	}
+	free(acc);
+}
+
 static void chain_emit(const pipeline_t *p, const m_seq_t *s)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -1030,7 +1093,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s)
 		cs[n].n_ref = nref, cs[n].gam = g, cs[n].n_gam = ng;
 		++n;
 	}
-	if (n == 0) { free(cs); return; }
+	if (n == 0) { free(cs); if (p->lift) chain_emit_pav(p, s); return; } // no ref anchor -> try PAV breakpoint
 	for (i = 0; i < n; ++i) (cs[i].rstrand? &spanm : &spanp)[0] += cs[i].qe - cs[i].qs;
 	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
 	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }

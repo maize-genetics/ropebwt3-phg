@@ -17,6 +17,13 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 					 int64_t win, int64_t max_mad, int32_t min_support,
 					 int64_t *out_rsid, int64_t *out_rpos);
 
+// Like rb3_lift_project, but when the locus is not colinear (a PAV/insertion between
+// the flanking anchors) it returns the nearest reference anchor = the closest
+// breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0).
+int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+						int64_t win, int64_t max_mad, int32_t min_support,
+						int64_t *out_rsid, int64_t *out_rpos, int *out_mode);
+
 int main_lift(int argc, char *argv[]);
 
 #endif
