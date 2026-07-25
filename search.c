@@ -30,10 +30,11 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_R
 // hardcoded to 8 (an arbitrary suffix-array-traversal-order subset once a
 // locus is shared by more founders than that -- see the Oh43 real-data eval,
 // where it silently dropped the read's own true founder from ~11% of sites).
-// Matches the existing 64-slot rb3_ssa_multi() locate buffers (search.c
-// refmap_query/refmap_query_kmer) so this cap never truncates anything the
-// locate step didn't already truncate first.
-#define RB3_RM_MAX_CARRIER 64
+// Sized to the rb3_ssa_multi() locate cap so it never truncates below the locate.
+// This should scale with the #samples in the index (a locus can be shared by up to
+// N founders); capped at 256 to keep counts byte-sized (Ed). For N>256 the extra
+// carriers are truncated (accepted). See docs/sample-relative-thresholds.md (#3).
+#define RB3_RM_MAX_CARRIER 256
 
 typedef struct {
 	uint32_t flag;
@@ -640,8 +641,8 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 
 	// locate a sample of occurrences; separate reference hits (exact) from carriers
-	pos = Kmalloc(km, rb3_pos_t, 64);
-	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, 64, pos);
+	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_CARRIER);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_CARRIER, pos);
 	{
 		int ref_found = 0;
 		for (i = 0; i < np; ++i) {
@@ -655,7 +656,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		if (ref_found) {
 			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
-				int32_t tmp[64], m;
+				int32_t tmp[RB3_RM_MAX_CARRIER], m;
 				for (i = 0, m = 0; i < np; ++i) tmp[m++] = p->gtab->sid2g[pos[i].sid>>1];
 				r->gametes = RB3_MALLOC(int32_t, m);
 				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
