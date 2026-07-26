@@ -63,6 +63,7 @@ typedef struct {
 	int32_t chain_max_occ; // chain: SMEMs with FM-interval size > this are uninformative (skipped)
 	char *ref_fasta;       // chain: reference (or pangenome) FASTA -> GT-AG splice-site check (NULL = off)
 	int32_t splice_min;    // chain: reference gap size (bp) above which the GT-AG check applies
+	int32_t pav_min_len;   // chain --lift: min LONGEST carrier-only SMEM to emit a pav: row
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -75,9 +76,10 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	memset(opt, 0, sizeof(rb3_mopt_t));
 	opt->n_threads = 4;
 	opt->min_occ = 1;
-	opt->min_len = 19;
+	opt->min_len = 31;    // plant pangenomes: 19 is too short to be specific (Ed, 2026-07-26)
 	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = -1; // chain: chain_max_occ<0 = auto (2*#samples, cap 256)
 	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
+	opt->pav_min_len = 60;  // chain --lift: carrier-only specificity floor; see chain_emit_pav
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -1001,18 +1003,48 @@ static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb)
 // Projection window (bp) for the PAV path: the breakpoint is the nearest anchor, so a
 // modest window suffices and keeps the O(anchors^2) projection cheap (vs lift_win 500kb).
 #define RB3_CHAIN_PAV_WIN 50000
-#define RB3_CHAIN_PAV_NPROJ 4   // occurrences of the representative SMEM to project (ambiguity check)
+#define RB3_CHAIN_PAV_NPROJ 4   // occurrences of the anchor SMEM to project (ambiguity check)
+#define RB3_CHAIN_PAV_NSEED 8   // seed occurrences of the longest SMEM tried as a cluster anchor
+// Carrier-space bound (bp) on a cluster's unexplained gap: two carrier-only SMEMs are
+// "the same locus" only if their carrier offsets track their query offsets to within this.
+#define RB3_CHAIN_PAV_CLUSTER 100000
+
+typedef struct {
+	int32_t qs, qe;        // query span
+	int32_t *gam, n_gam;   // sorted, deduped gamete indices over all occurrences
+	int32_t mi;            // index into s->mem
+} pav_sm_t;
+
+// Forward-strand carrier position of occurrence `t` of a SMEM of length `len`.
+static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_t len)
+{
+	int32_t sidx = t->sid>>1;
+	return (t->sid&1)? f->sid->len[sidx] - (t->pos + len) : t->pos;
+}
 
 // Carrier-only (PAV) fallback for reads with NO reference-hitting SMEM: place the read
 // at the nearest B73 breakpoint via the liftover, emitting one row `pav:<contig>` with
 // the intersected carrier gamete set. Requires --lift. Presence/absence only (no
 // internal resolution) -- see design/pav-carrier-coordinates-scope.md.
+//
+// The gamete sets are intersected only over SMEMs that are COLINEAR IN CARRIER SPACE.
+// A read originates from one assembly, so its carrier-only SMEMs must be colinear in that
+// assembly's coordinates; intersecting across unrelated loci (a PAV fragment plus an
+// unrelated repeat fragment) silently drops the true source assembly. Measured before this
+// clustering existed: 33% source dropout on 3'-tag RNAseq, concentrated in confidently-
+// wrong singletons -- see RopeBWTGrits-eval/experiments/pav_e1_findings_2026-07-26.md.
+// This mirrors what chain_emit does in reference space (colinear DP, then intersect over
+// the winning chain only).
 static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
-	int32_t i, k, na = 0, *acc = 0, rep = -1, rep_len = 0;
-	for (i = 0; i < s->n_mem; ++i) { // collect carrier-only informative SMEMs; intersect gamete sets
+	int32_t i, j, k, n = 0, na = 0, *acc = 0, sd = -1, sd_len = 0;
+	int32_t *clu = 0, n_clu = 0, *cand = 0, best_o = -1;
+	int64_t best_sc = -1;
+	pav_sm_t *cs;
+	cs = RB3_CALLOC(pav_sm_t, s->n_mem);
+	for (i = 0; i < s->n_mem; ++i) { // collect carrier-only informative SMEMs
 		m_sai_pos_t *r = &s->mem[i];
 		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, ng = 0, nref = 0, *g, m;
 		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
@@ -1025,36 +1057,100 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		if (nref > 0) { free(g); continue; } // has a reference hit -> not a PAV SMEM
 		qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
 		for (k = 0, m = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k];
-		ng = m;
-		if (acc == 0) { acc = RB3_MALLOC(int32_t, ng); memcpy(acc, g, ng * sizeof(int32_t)); na = ng; }
-		else na = chain_isect(acc, na, g, ng);
-		free(g);
-		if (en - st > rep_len) rep_len = en - st, rep = i;
+		cs[n].qs = st, cs[n].qe = en, cs[n].gam = g, cs[n].n_gam = m, cs[n].mi = i;
+		if (en - st > sd_len) sd_len = en - st, sd = n;
+		++n;
 	}
-	if (rep < 0 || na == 0) { free(acc); return; } // no carrier SMEM, or founders disagree
-	{ // project the representative SMEM's carrier occurrences to a reference breakpoint
-		m_sai_pos_t *r = &s->mem[rep];
-		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, n_proj = 0, ambiguous = 0;
-		int64_t bp_rsid = -1, bp_rpos = -1;
-		for (k = 0; k < r->n_pos && k < RB3_CHAIN_PAV_NPROJ; ++k) {
-			int32_t sidx = r->pos[k].sid>>1;
-			int64_t rlen = f->sid->len[sidx];
-			int64_t cfp = (r->pos[k].sid&1)? rlen - (r->pos[k].pos + (en - st)) : r->pos[k].pos;
-			int64_t rsid, rpos; int mode;
-			if (!rb3_lift_project_bp(p->lift, km, sidx, cfp, RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
-			if (n_proj == 0) bp_rsid = rsid, bp_rpos = rpos;
+	if (n == 0) { free(cs); return; } // no carrier-only SMEM
+	// Cluster in carrier space: seed on the longest SMEM and, for each of its carrier
+	// occurrences, keep the SMEMs whose carrier offset tracks their query offset. The
+	// highest-scoring cluster (bases covered) wins; its seed occurrence is the anchor.
+	clu = RB3_MALLOC(int32_t, n);
+	cand = RB3_MALLOC(int32_t, n);
+	{
+		m_sai_pos_t *rs = &s->mem[cs[sd].mi];
+		for (k = 0; k < rs->n_pos && k < RB3_CHAIN_PAV_NSEED; ++k) {
+			int32_t sid_o = rs->pos[k].sid>>1, str_o = rs->pos[k].sid&1, nc = 0;
+			int64_t cp_o = pav_fwd_pos(f, &rs->pos[k], sd_len), sc = sd_len;
+			cand[nc++] = sd;
+			for (j = 0; j < n; ++j) {
+				m_sai_pos_t *rj;
+				int32_t len_j, u, hit = 0;
+				if (j == sd) continue;
+				rj = &s->mem[cs[j].mi];
+				len_j = cs[j].qe - cs[j].qs;
+				for (u = 0; u < rj->n_pos && !hit; ++u) {
+					int64_t dq, dc;
+					if ((rj->pos[u].sid>>1) != sid_o || (rj->pos[u].sid&1) != str_o) continue;
+					dq = cs[j].qs - cs[sd].qs;
+					dc = pav_fwd_pos(f, &rj->pos[u], len_j) - cp_o;
+					if (str_o) dc = -dc;                     // reverse: query fwd -> carrier fwd back
+					if ((dq > 0 && dc < 0) || (dq < 0 && dc > 0)) continue;      // out of order
+					if (llabs(dc - dq) > RB3_CHAIN_PAV_CLUSTER) continue;        // implausible jump
+					hit = 1;
+				}
+				if (hit) cand[nc++] = j, sc += len_j;
+			}
+			if (sc > best_sc) {
+				best_sc = sc, best_o = k, n_clu = nc;
+				memcpy(clu, cand, nc * sizeof(int32_t));
+			}
+		}
+	}
+	// Two suppression rules, both calibrated on B97 vs the NAM PHG (pav_e1b):
+	// (1) INCOHERENT read: the winning cluster must contain EVERY carrier-only SMEM. If any
+	//     is left out, the read's SMEMs cannot be reconciled to one carrier locus (chimera,
+	//     adapter, mispriming) and the emitted set is near-worthless -- source recall by
+	//     cluster/total was 1/1 68%, 2/2 94%, but 1/2 17%, 1/3 16%, 1/4 8%, 1/5 1.5%.
+	//     Before clustering existed, the strict all-SMEM intersection collapsed these to
+	//     na==0 and dropped them by accident; that accident was doing real work.
+	// (2) SPECIFICITY FLOOR: a short carrier-only match is not specific enough to name the
+	//     assemblies it came from. Source recall vs cluster bases (3'-tag, single-SMEM):
+	//     31-39bp 20%, 40-49 37%, 50-59 56%, 60-79 71%, 80-119 78%. `min_len` (31) is the
+	//     floor for anchoring to the REFERENCE, where a colinear chain adds confirmation;
+	//     the carrier-only path has no such confirmation and needs its own, longer floor.
+	//     The floor is on the LONGEST single match (sd_len), not the cluster total: summing
+	//     several short SMEMs clears any total-bases floor while no individual match is
+	//     specific (a 7-SMEM class of 728 full-length rows did exactly that, at 0% recall).
+	if (best_o >= 0 && n_clu == n && sd_len >= p->opt->pav_min_len) {
+		acc = RB3_MALLOC(int32_t, cs[clu[0]].n_gam);
+		na = cs[clu[0]].n_gam;
+		memcpy(acc, cs[clu[0]].gam, na * sizeof(int32_t));
+		for (i = 1; i < n_clu; ++i) na = chain_isect(acc, na, cs[clu[i]].gam, cs[clu[i]].n_gam);
+	}
+	if (na > 0) { // project the cluster's anchor occurrence to a reference breakpoint
+		m_sai_pos_t *r = &s->mem[cs[sd].mi];
+		int32_t n_proj = 0, ambiguous = 0;
+		int64_t bp_rsid = -1, bp_rpos = -1, rsid, rpos;
+		int bp_mode = -1, mode;
+		if (rb3_lift_project_bp(p->lift, km, (int32_t)(r->pos[best_o].sid>>1),
+								pav_fwd_pos(f, &r->pos[best_o], sd_len),
+								RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode))
+			bp_rsid = rsid, bp_rpos = rpos, bp_mode = mode, n_proj = 1;
+		for (k = 0; k < r->n_pos && k < RB3_CHAIN_PAV_NPROJ; ++k) { // dispersed-repeat check
+			if (k == best_o) continue;
+			if (!rb3_lift_project_bp(p->lift, km, (int32_t)(r->pos[k].sid>>1),
+									 pav_fwd_pos(f, &r->pos[k], sd_len),
+									 RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
+			if (bp_rsid < 0) bp_rsid = rsid, bp_rpos = rpos, bp_mode = mode; // anchor failed -> fallback
 			else if (rsid != bp_rsid || llabs(rpos - bp_rpos) > p->opt->gap_intron) ambiguous = 1;
 			++n_proj;
 		}
-		if (n_proj > 0 && !ambiguous) { // one row at the breakpoint, flagged pav:
+		if (n_proj > 0 && !ambiguous && bp_rsid >= 0) { // one row at the breakpoint, flagged pav:
 			const char *nm = f->sid->name[bp_rsid], *us = strchr(nm, '_');
 			const char *contig = us? us + 1 : nm;
 			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp_rpos);
 			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
-			putchar('\n');
+			// 5th column = PAV mode: 1 = true insertion (flanking anchors not colinear,
+			// position is the nearest reference breakpoint), 0 = colinear projection
+			// (sequence IS in the reference but too diverged to share a SMEM -- a
+			// divergent allele, not a PAV). Distinguishing them is required to
+			// interpret the carrier-only rate; see chain_emit_pav header.
+			printf("\t%d\n", bp_mode);
 		}
 	}
-	free(acc);
+	for (i = 0; i < n; ++i) free(cs[i].gam);
+	free(acc); free(clu); free(cand); free(cs);
 }
 
 static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
@@ -1093,11 +1189,16 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 		cs[n].n_ref = nref, cs[n].gam = g, cs[n].n_gam = ng;
 		++n;
 	}
-	if (n == 0) { free(cs); if (p->lift) chain_emit_pav(p, s, km); return; } // no ref anchor -> try PAV breakpoint
+	if (n == 0) { // no ref anchor -> try the PAV breakpoint path (which reads s->mem[].pos)
+		free(cs);
+		if (p->lift) chain_emit_pav(p, s, km);
+		for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos);
+		return;
+	}
 	for (i = 0; i < n; ++i) (cs[i].rstrand? &spanm : &spanp)[0] += cs[i].qe - cs[i].qs;
 	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
 	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }
-	if (n == 0) { free(cs); return; }
+	if (n == 0) { free(cs); for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos); return; }
 	qsort(cs, n, sizeof(chain_sm_t), chain_cmp_sm);
 	for (i = 0; i < n; ++i) cs[i].anch = 1, cs[i].sc = (int64_t)(cs[i].qe - cs[i].qs) * 100, cs[i].prev = -1;
 	for (i = 0; i < n; ++i) { // colinear in-order DP: maximize (#anchors, bases - gap_penalty)
@@ -1397,6 +1498,7 @@ static ko_longopt_t long_options[] = {
 	{ "chain-max-occ",   ko_required_argument, 332 },
 	{ "ref-fasta",       ko_required_argument, 333 },
 	{ "splice-min",      ko_required_argument, 334 },
+	{ "pav-min-len",     ko_required_argument, 335 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1476,6 +1578,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
 		else if (c == 333) opt.ref_fasta = o.arg;                    // chain: reference FASTA -> GT-AG splice check
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
+		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: carrier-only specificity floor
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1550,6 +1653,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --chain-max-occ=INT  skip SMEMs whose FM interval exceeds this [auto: min(2*#samples,256)]\n");
 			fprintf(stderr, "  --ref-fasta=FILE  reference/pangenome FASTA -> GT-AG splice check on intron-gap links\n");
 			fprintf(stderr, "  --splice-min=INT  ref gap size above which the GT-AG check applies [%d]\n", opt.splice_min);
+			fprintf(stderr, "  --lift=FILE       `ropebwt3 lift` map; enables PAV breakpoint anchoring: reads with\n");
+			fprintf(stderr, "                    no reference SMEM emit one `pav:<contig>` row at the nearest\n");
+			fprintf(stderr, "                    reference breakpoint, plus a 5th column (1 = true insertion,\n");
+			fprintf(stderr, "                    0 = colinear = a divergent allele, not a PAV)\n");
+			fprintf(stderr, "  --pav-min-len=INT min LONGEST carrier-only SMEM to emit a pav: row; the\n");
+			fprintf(stderr, "                    carrier-only path has no colinear reference confirmation, so it\n");
+			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
