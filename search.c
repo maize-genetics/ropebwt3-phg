@@ -49,6 +49,7 @@ typedef struct {
 	int64_t max_occ;   // refmap: reject reads/anchors occurring > max_occ times (0 = off; <0 = auto = #taxa)
 	int64_t max_bracket; // refmap: reject a PLACED if |cR-cL| > max_bracket (0 = off)
 	int8_t two_flank;  // refmap: require both flanks to anchor concordantly (1 = on)
+	int8_t allow_walk; // refmap: opt in to the DEPRECATED flank-walking path (no --lift)
 	char *lift_fn;     // refmap: liftover file -> project carrier hits instead of walking
 	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
 	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
@@ -1022,6 +1023,25 @@ static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_
 	return (t->sid&1)? f->sid->len[sidx] - (t->pos + len) : t->pos;
 }
 
+// Max share (%) one base may occupy in the anchor before it is called low-complexity.
+#define RB3_CHAIN_PAV_MAXBASE 80
+
+// Is the query span [qs,qe) dominated by a single base? LENGTH IS NOT SPECIFICITY for a
+// homopolymer: a 76 bp pure poly-A read has a 76 bp exact match, clears any length floor,
+// and lands wherever some assembly happens to carry a long enough A-run. Measured: 772 such
+// rows (741 full-length, 31 3'-tag) at **0.0%** source recall -- every one named the wrong
+// assembly. 3'-tag libraries generate these by design (polyA priming), so gate on
+// composition, not length. See pav_e1_findings_2026-07-26.md.
+static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
+{
+	int32_t cnt[7], i, c, best = 0, n = qe - qs;
+	if (n <= 0) return 0;
+	for (i = 0; i < 7; ++i) cnt[i] = 0;
+	for (i = qs; i < qe; ++i) { c = s->seq[i]; if (c < 0 || c > 6) c = 6; ++cnt[c]; }
+	for (i = 0; i < 7; ++i) if (cnt[i] > best) best = cnt[i];
+	return best * 100 >= RB3_CHAIN_PAV_MAXBASE * n;
+}
+
 // Carrier-only (PAV) fallback for reads with NO reference-hitting SMEM: place the read
 // at the nearest B73 breakpoint via the liftover, emitting one row `pav:<contig>` with
 // the intersected carrier gamete set. Requires --lift. Presence/absence only (no
@@ -1112,7 +1132,9 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 	//     The floor is on the LONGEST single match (sd_len), not the cluster total: summing
 	//     several short SMEMs clears any total-bases floor while no individual match is
 	//     specific (a 7-SMEM class of 728 full-length rows did exactly that, at 0% recall).
-	if (best_o >= 0 && n_clu == n && sd_len >= p->opt->pav_min_len) {
+	// (3) LOW COMPLEXITY: reject a homopolymer-dominated anchor -- long but not specific.
+	if (best_o >= 0 && n_clu == n && sd_len >= p->opt->pav_min_len
+		&& !pav_low_complexity(s, cs[sd].qs, cs[sd].qe)) {
 		acc = RB3_MALLOC(int32_t, cs[clu[0]].n_gam);
 		na = cs[clu[0]].n_gam;
 		memcpy(acc, cs[clu[0]].gam, na * sizeof(int32_t));
@@ -1499,6 +1521,7 @@ static ko_longopt_t long_options[] = {
 	{ "ref-fasta",       ko_required_argument, 333 },
 	{ "splice-min",      ko_required_argument, 334 },
 	{ "pav-min-len",     ko_required_argument, 335 },
+	{ "walk",            ko_no_argument,       336 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1579,6 +1602,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 333) opt.ref_fasta = o.arg;                    // chain: reference FASTA -> GT-AG splice check
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
 		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: carrier-only specificity floor
+		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1622,12 +1646,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (strcmp(argv[0], "refmap") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
-			fprintf(stderr, "  --max-walk=NUM    max bases to walk outward along carriers per flank [%d]\n", opt.max_walk);
-			fprintf(stderr, "  --walk-mode=STR   carrier path: consensus|strict|per-carrier [consensus]\n");
+			fprintf(stderr, "  --lift=FILE       REQUIRED (standard): project carrier hits via a `ropebwt3 lift` map\n");
+			fprintf(stderr, "  --walk            opt in to the DEPRECATED flank-walking path instead of --lift\n");
+			fprintf(stderr, "  --max-walk=NUM    DEPRECATED (--walk only) max bases to walk per flank [%d]\n", opt.max_walk);
+			fprintf(stderr, "  --walk-mode=STR   DEPRECATED (--walk only) consensus|strict|per-carrier [consensus]\n");
 			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
 			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
 			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
-			fprintf(stderr, "  --lift=FILE       project carrier hits via a `ropebwt3 lift` map instead of walking\n");
 			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
 			fprintf(stderr, "  --lift-mad=NUM    liftover max residual MAD [%ld]\n", (long)opt.lift_mad);
 			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
@@ -1723,6 +1748,18 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: refmap needs the sampled suffix array (.ssa) and sequence names (.len.gz)\n");
 			return 1;
 		}
+		// refmap: --lift is the standard resolution path. Flank walking is deprecated (it did
+		// not work well) and used to be the SILENT default when --lift was omitted, so an
+		// invocation that simply forgot --lift got the deprecated path and plausible-looking
+		// output. Require an explicit choice instead of defaulting to the bad one.
+		if (opt.algo == RB3_SA_REFMAP && opt.lift_fn == 0 && !opt.allow_walk) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "ERROR: refmap needs --lift=FILE (the standard path; build it with `ropebwt3 lift`).\n"
+								"       Flank walking is DEPRECATED and no longer the default; pass --walk to opt in.\n");
+			return 1;
+		}
+		if (opt.algo == RB3_SA_REFMAP && opt.allow_walk && opt.lift_fn == 0 && rb3_verbose >= 1)
+			fprintf(stderr, "WARNING: --walk selects the deprecated flank-walking path; prefer --lift=FILE.\n");
 		plen = strlen(opt.ref_prefix);
 		p.is_ref = RB3_CALLOC(uint8_t, p.fmi.sid->n_seq);
 		for (k = 0; k < p.fmi.sid->n_seq; ++k)
