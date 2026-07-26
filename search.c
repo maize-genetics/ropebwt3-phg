@@ -65,6 +65,7 @@ typedef struct {
 	char *ref_fasta;       // chain: reference (or pangenome) FASTA -> GT-AG splice-site check (NULL = off)
 	int32_t splice_min;    // chain: reference gap size (bp) above which the GT-AG check applies
 	int32_t pav_min_len;   // chain --lift: min LONGEST carrier-only SMEM to emit a pav: row
+	int32_t trim_polya;    // trim a terminal poly-A/poly-T run of >= this many bp (0 = off)
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -81,6 +82,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = -1; // chain: chain_max_occ<0 = auto (2*#samples, cap 256)
 	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
 	opt->pav_min_len = 60;  // chain --lift: carrier-only specificity floor; see chain_emit_pav
+	opt->trim_polya = 0;    // off by default; see m_trim_polya
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -190,6 +192,52 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
 							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen);
 
+// Length of a terminal homopolymer run of `base`, scanning inward from one end. Scored scan:
+// +1 per matching base, -RB3_TRIM_MM per mismatch, cut at the highest-scoring prefix. This
+// absorbs sequencing error inside the tail without letting the scan run past the tail boundary
+// and latch onto incidental A/T bases in genuine sequence -- a plain mismatch budget over-trims
+// real sequence by several bp (verified: a 40 bp poly-T head cut 45 bases).
+#define RB3_TRIM_MM   3   // mismatch penalty
+#define RB3_TRIM_DROP 12  // stop once the score falls this far below the best (≈4 mismatches)
+static int32_t trim_run(const uint8_t *seq, int32_t len, int32_t step, uint8_t base, int32_t min_run)
+{
+	int32_t i, k, sc = 0, best = 0, bestk = 0;
+	for (k = 0; k < len; ++k) {
+		i = step > 0? k : len - 1 - k;
+		sc += (seq[i] == base)? 1 : -RB3_TRIM_MM;
+		if (sc > best) best = sc, bestk = k + 1;
+		else if (sc < best - RB3_TRIM_DROP) break;
+	}
+	return bestk >= min_run? bestk : 0;
+}
+
+// Trim a homopolymer tail: poly-A at the 3' end, or poly-T at the 5' end (the same tail on a
+// reverse-complemented read). 3'-tag protocols prime on polyA and misprime on internal A-runs
+// >=4 bp, so many reads carry a homopolymer tail with only a short informative remainder. The
+// PAV specificity floor discards those reads (3'-tag: 2,363 rows at 20.5% source recall, mean
+// longest A/T run 13.6 bp vs 4.0 bp for the high-recall population). A read that is entirely
+// homopolymer trims to length 0 and yields no SMEMs, which is the correct outcome.
+//
+// MEASURED: this is a NO-OP for the chain/PAV pipeline, which is why it is off by default.
+// Trimming cannot lengthen the informative core -- SMEM search already isolates it, since a
+// polyA tail does not extend a genomic exact match unless the reference also carries A's there.
+// On those same 2,363 reads: mean longest SMEM 42.6 bp untrimmed vs 42.7 bp trimmed, and 56
+// reads lost outright. Whole-pipeline effect at --trim-polya=8 (3'-tag): reference rows
+// 80,521 -> 80,287, pav source recall 76.2% -> 76.3%, ref source recall 96.5% -> 96.8%.
+// The harmful polyA case is entirely covered by pav_low_complexity() instead. Kept because it
+// is correct and cheap, and may matter for other read types or consumers.
+// See pav_e1_findings_2026-07-26.md.
+static void m_trim_polya(m_seq_t *s, int32_t min_run)
+{
+	int32_t cut;
+	if (s->len <= 0) return;
+	cut = trim_run(s->seq, s->len, -1, 1, min_run);          // poly-A at the 3' end
+	if (cut > 0) s->len -= cut;
+	if (s->len <= 0) { s->len = 0; return; }
+	cut = trim_run(s->seq, s->len, 1, 4, min_run);           // poly-T at the 5' end
+	if (cut > 0) { memmove(s->seq, s->seq + cut, s->len - cut); s->len -= cut; }
+}
+
 static void worker_for_seq(void *data, long i, int tid)
 {
 	step_t *t = (step_t*)data;
@@ -199,6 +247,7 @@ static void worker_for_seq(void *data, long i, int tid)
 	if (rb3_dbg_flag & RB3_DBG_QNAME)
 		fprintf(stderr, "Q\t%s\t%d\n", s->name, tid);
 	rb3_char2nt6(s->len, s->seq);
+	if (p->opt->trim_polya > 0) m_trim_polya(s, p->opt->trim_polya);
 	if (p->opt->algo == RB3_SA_SW) { // BWA-SW
 		rb3_sw(b->km, &p->opt->swo, &p->fmi, s->len, s->seq, &t->rst[i]);
 		if (t->rst_rev) {
@@ -1522,6 +1571,7 @@ static ko_longopt_t long_options[] = {
 	{ "splice-min",      ko_required_argument, 334 },
 	{ "pav-min-len",     ko_required_argument, 335 },
 	{ "walk",            ko_no_argument,       336 },
+	{ "trim-polya",      ko_required_argument, 337 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1603,6 +1653,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
 		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: carrier-only specificity floor
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
+		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1685,6 +1736,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST carrier-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    carrier-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
+			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
+			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
