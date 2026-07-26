@@ -66,6 +66,7 @@ typedef struct {
 	int32_t splice_min;    // chain: reference gap size (bp) above which the GT-AG check applies
 	int32_t pav_min_len;   // chain --lift: min LONGEST carrier-only SMEM to emit a pav: row
 	int32_t trim_polya;    // trim a terminal poly-A/poly-T run of >= this many bp (0 = off)
+	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -83,6 +84,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
 	opt->pav_min_len = 60;  // chain --lift: carrier-only specificity floor; see chain_emit_pav
 	opt->trim_polya = 0;    // off by default; see m_trim_polya
+	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -1053,7 +1055,7 @@ static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb)
 // Projection window (bp) for the PAV path: the breakpoint is the nearest anchor, so a
 // modest window suffices and keeps the O(anchors^2) projection cheap (vs lift_win 500kb).
 #define RB3_CHAIN_PAV_WIN 50000
-#define RB3_CHAIN_PAV_NPROJ 4   // occurrences of the anchor SMEM to project (ambiguity check)
+#define RB3_CHAIN_PAV_NPROJ 16  // occurrences of the seed SMEM to project (majority + median consensus)
 #define RB3_CHAIN_PAV_NSEED 8   // seed occurrences of the longest SMEM tried as a cluster anchor
 // Carrier-space bound (bp) on a cluster's unexplained gap: two carrier-only SMEMs are
 // "the same locus" only if their carrier offsets track their query offsets to within this.
@@ -1189,35 +1191,58 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		memcpy(acc, cs[clu[0]].gam, na * sizeof(int32_t));
 		for (i = 1; i < n_clu; ++i) na = chain_isect(acc, na, cs[clu[i]].gam, cs[clu[i]].n_gam);
 	}
-	if (na > 0) { // project the cluster's anchor occurrence to a reference breakpoint
+	// CONSENSUS projection. Previously the breakpoint came from ONE occurrence of the seed
+	// (best_o), with a 30 bp agreement check over the first 4. refmap_place_lift has always
+	// done better: project EVERY carrier, take the majority reference sequence, then the MEDIAN
+	// position among that majority. That asymmetry let reads at one locus anchor via different
+	// carriers and jump: E3 found 16% of loci whose breakpoints spread >5x the region's true
+	// extent (median true span 4.9 kb, median spread 40.6 kb). Consensus + a dispersion test is
+	// both the fix and the per-read form of "suppress the scattered ones".
+	if (na > 0) {
 		m_sai_pos_t *r = &s->mem[cs[sd].mi];
-		int32_t n_proj = 0, ambiguous = 0;
-		int64_t bp_rsid = -1, bp_rpos = -1, rsid, rpos;
-		int bp_mode = -1, mode;
-		if (rb3_lift_project_bp(p->lift, km, (int32_t)(r->pos[best_o].sid>>1),
-								pav_fwd_pos(f, &r->pos[best_o], sd_len),
-								RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode))
-			bp_rsid = rsid, bp_rpos = rpos, bp_mode = mode, n_proj = 1;
-		for (k = 0; k < r->n_pos && k < RB3_CHAIN_PAV_NPROJ; ++k) { // dispersed-repeat check
-			if (k == best_o) continue;
+		int64_t prs[RB3_CHAIN_PAV_NPROJ], prp[RB3_CHAIN_PAV_NPROJ], v[RB3_CHAIN_PAV_NPROJ];
+		int pmd[RB3_CHAIN_PAV_NPROJ];
+		int32_t np = 0, nmaj = 0, bestn = 0, n_mode1 = 0;
+		int64_t best_rsid = -1, med = 0, disp = 0;
+		for (k = 0; k < r->n_pos && np < RB3_CHAIN_PAV_NPROJ; ++k) {
+			int64_t rsid, rpos; int mode;
 			if (!rb3_lift_project_bp(p->lift, km, (int32_t)(r->pos[k].sid>>1),
 									 pav_fwd_pos(f, &r->pos[k], sd_len),
 									 RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
-			if (bp_rsid < 0) bp_rsid = rsid, bp_rpos = rpos, bp_mode = mode; // anchor failed -> fallback
-			else if (rsid != bp_rsid || llabs(rpos - bp_rpos) > p->opt->gap_intron) ambiguous = 1;
-			++n_proj;
+			prs[np] = rsid, prp[np] = rpos, pmd[np] = mode, ++np;
 		}
-		if (n_proj > 0 && !ambiguous && bp_rsid >= 0) { // one row at the breakpoint, flagged pav:
-			const char *nm = f->sid->name[bp_rsid], *us = strchr(nm, '_');
+		for (k = 0; k < np; ++k) { // majority reference sequence
+			int32_t c = 0;
+			for (j = 0; j < np; ++j) if (prs[j] == prs[k]) ++c;
+			if (c > bestn) bestn = c, best_rsid = prs[k];
+		}
+		for (k = 0; k < np; ++k) if (prs[k] == best_rsid) { v[nmaj++] = prp[k]; if (pmd[k] == 1) ++n_mode1; }
+		for (k = 1; k < nmaj; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
+		if (nmaj > 0) {
+			med = v[nmaj >> 1];
+			for (k = 0; k < nmaj; ++k) { int64_t d = llabs(v[k] - med); if (d > disp) disp = d; }
+		}
+		// SUPPRESS when the occurrences do not agree on WHERE this is: require a majority of
+		// projections on one reference sequence, and their spread within one grid cell. A read
+		// whose own carriers disagree by more than the emitted resolution cannot be placed.
+		if (nmaj > 0 && bestn == np && disp <= (p->opt->pav_grid > 0? p->opt->pav_grid : p->opt->gap_intron)) {
+			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
 			const char *contig = us? us + 1 : nm;
-			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp_rpos);
+			// Snap to --pav-grid. The design calls PAV "presence/absence only (no internal
+			// resolution)", but emission never enforced that, so single-base coordinates
+			// promised a precision the method does not have and fragmented one insertion's
+			// evidence across many bins (mean 6.3). Snapping collapses it -- safe because E3
+			// showed source recall is 100% in every spread bucket, i.e. the assembly sets are
+			// right and only the aggregation key moved. 5 kb -> 72% of insertions in one bin.
+			int64_t bp = p->opt->pav_grid > 0? med / p->opt->pav_grid * p->opt->pav_grid : med;
+			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
 			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 			// 5th column = PAV mode: 1 = true insertion (flanking anchors not colinear,
 			// position is the nearest reference breakpoint), 0 = colinear projection
 			// (sequence IS in the reference but too diverged to share a SMEM -- a
 			// divergent allele, not a PAV). Distinguishing them is required to
 			// interpret the carrier-only rate; see chain_emit_pav header.
-			printf("\t%d\n", bp_mode);
+			printf("\t%d\n", n_mode1 * 2 >= nmaj? 1 : 0);
 		}
 	}
 	for (i = 0; i < n; ++i) free(cs[i].gam);
@@ -1572,6 +1597,7 @@ static ko_longopt_t long_options[] = {
 	{ "pav-min-len",     ko_required_argument, 335 },
 	{ "walk",            ko_no_argument,       336 },
 	{ "trim-polya",      ko_required_argument, 337 },
+	{ "pav-grid",        ko_required_argument, 338 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1654,6 +1680,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: carrier-only specificity floor
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
+		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1733,6 +1760,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    no reference SMEM emit one `pav:<contig>` row at the nearest\n");
 			fprintf(stderr, "                    reference breakpoint, plus a 5th column (1 = true insertion,\n");
 			fprintf(stderr, "                    0 = colinear = a divergent allele, not a PAV)\n");
+			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid, and require the\n");
+			fprintf(stderr, "                    seed's carrier projections to agree within it (0 = off) [%d]\n", opt.pav_grid);
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST carrier-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    carrier-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
