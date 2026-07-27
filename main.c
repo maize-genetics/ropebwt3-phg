@@ -36,7 +36,7 @@ static int usage(FILE *fp)
 	fprintf(fp, "    merge      merge BWTs\n");
 	fprintf(fp, "    plain2fmd  convert BWT in plain text to FMD\n");
 	fprintf(fp, "    ssa        generate sampled suffix array\n");
-	fprintf(fp, "    lift       build carrier->reference liftover for refmap --lift\n");
+	fprintf(fp, "    lift       build assembly->reference liftover for refmap --lift\n");
 	fprintf(fp, "  Miscellaneous:\n");
 	fprintf(fp, "    get        retrieve the i-th sequence from BWT\n");
 	fprintf(fp, "    stat       basic statistics of BWT\n");
