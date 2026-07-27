@@ -67,6 +67,7 @@ typedef struct {
 	int32_t pav_min_len;   // chain --lift: min LONGEST carrier-only SMEM to emit a pav: row
 	int32_t trim_polya;    // trim a terminal poly-A/poly-T run of >= this many bp (0 = off)
 	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
+	int8_t pav_mode0;      // chain --lift: colinear (mode0) rows: 0 = ordinary row, 1 = pav: row, 2 = drop
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -85,6 +86,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_min_len = 60;  // chain --lift: carrier-only specificity floor; see chain_emit_pav
 	opt->trim_polya = 0;    // off by default; see m_trim_polya
 	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
+	opt->pav_mode0 = 0;     // colinear rows have a real reference coordinate -> ordinary row
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -1228,6 +1230,24 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		if (nmaj > 0 && bestn == np && disp <= (p->opt->pav_grid > 0? p->opt->pav_grid : p->opt->gap_intron)) {
 			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
 			const char *contig = us? us + 1 : nm;
+			int is_bp = n_mode1 * 2 >= nmaj;   // majority of projections were true breakpoints
+			// A colinear (mode 0) row is NOT a PAV: the sequence is in the reference, just too
+			// diverged to share a SMEM, and the projection is a real colinear coordinate rather
+			// than a flanking breakpoint. It therefore deserves the ordinary schema and its exact
+			// position (no grid snapping, which exists only because a breakpoint is approximate).
+			// Caveat measured on B97: colinear rows match mode1 on genomic (100.0%) and
+			// full-length (97.7% vs 98.4%) source recall, but are 9.4 pts worse on 3'-tag
+			// (75.0% vs 84.4%) -- those reads still have no reference SMEM, so the coordinate is
+			// lifted from a carrier and is one step less direct. Hence the policy switch.
+			if (!is_bp) {
+				if (p->opt->pav_mode0 == 2) goto pav_done;          // drop
+				if (p->opt->pav_mode0 == 0) {                        // ordinary row, exact position
+					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
+					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+					putchar('\n');
+					goto pav_done;
+				}
+			}
 			// Snap to --pav-grid. The design calls PAV "presence/absence only (no internal
 			// resolution)", but emission never enforced that, so single-base coordinates
 			// promised a precision the method does not have and fragmented one insertion's
@@ -1242,9 +1262,10 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// (sequence IS in the reference but too diverged to share a SMEM -- a
 			// divergent allele, not a PAV). Distinguishing them is required to
 			// interpret the carrier-only rate; see chain_emit_pav header.
-			printf("\t%d\n", n_mode1 * 2 >= nmaj? 1 : 0);
+			printf("\t%d\n", is_bp? 1 : 0);
 		}
 	}
+pav_done:
 	for (i = 0; i < n; ++i) free(cs[i].gam);
 	free(acc); free(clu); free(cand); free(cs);
 }
@@ -1598,6 +1619,7 @@ static ko_longopt_t long_options[] = {
 	{ "walk",            ko_no_argument,       336 },
 	{ "trim-polya",      ko_required_argument, 337 },
 	{ "pav-grid",        ko_required_argument, 338 },
+	{ "pav-mode0",       ko_required_argument, 339 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1681,6 +1703,12 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
 		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
+		else if (c == 339) {                                         // chain --lift: colinear-row policy
+			if (strcmp(o.arg, "ordinary") == 0) opt.pav_mode0 = 0;
+			else if (strcmp(o.arg, "pav") == 0) opt.pav_mode0 = 1;
+			else if (strcmp(o.arg, "drop") == 0) opt.pav_mode0 = 2;
+			else { fprintf(stderr, "ERROR: --pav-mode0 must be ordinary|pav|drop\n"); return 1; }
+		}
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1760,6 +1788,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    no reference SMEM emit one `pav:<contig>` row at the nearest\n");
 			fprintf(stderr, "                    reference breakpoint, plus a 5th column (1 = true insertion,\n");
 			fprintf(stderr, "                    0 = colinear = a divergent allele, not a PAV)\n");
+			fprintf(stderr, "  --pav-mode0=STR   colinear (mode 0) carrier-only rows -- sequence that IS in the\n");
+			fprintf(stderr, "                    reference but too diverged to share a SMEM. These have a real\n");
+			fprintf(stderr, "                    colinear coordinate, not a breakpoint: ordinary|pav|drop\n");
+			fprintf(stderr, "                    [ordinary = emit as a normal row at the exact position]\n");
 			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid, and require the\n");
 			fprintf(stderr, "                    seed's carrier projections to agree within it (0 = off) [%d]\n", opt.pav_grid);
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST carrier-only SMEM to emit a pav: row; the\n");
