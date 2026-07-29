@@ -1,3 +1,4 @@
+#include <math.h>
 #include "fm-index.h"
 #include "align.h"
 #include "rb3priv.h"
@@ -5,6 +6,7 @@
 #include "ketopt.h"
 #include "kthread.h"
 #include "kalloc.h"
+#include "lift.h"
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP } rb3_search_algo_t;
 
@@ -28,6 +30,13 @@ typedef struct {
 	char *ref_prefix;  // refmap: reference sequences are those whose name starts with this
 	int32_t max_walk;  // refmap: max bases to walk outward along carriers, per flank
 	int8_t walk_mode;  // refmap: RB3_WALK_*
+	int64_t max_occ;   // refmap: reject reads/anchors occurring > max_occ times (0 = off; <0 = auto = #taxa)
+	int64_t max_bracket; // refmap: reject a PLACED if |cR-cL| > max_bracket (0 = off)
+	int8_t two_flank;  // refmap: require both flanks to anchor concordantly (1 = on)
+	char *lift_fn;     // refmap: liftover file -> project carrier hits instead of walking
+	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
+	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
+	int64_t kmer_cluster;                   // refmap: cluster tolerance for agreeing k-mers (bp)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -43,6 +52,13 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->algo = RB3_SA_MEM_TG;
 	opt->max_walk = 5000;
 	opt->walk_mode = RB3_WALK_CONSENSUS;
+	opt->max_occ = 0;     // off by default (E0 baseline)
+	opt->max_bracket = 0; // off by default
+	opt->two_flank = 0;   // off by default
+	opt->lift_fn = 0;     // off by default (walk)
+	opt->lift_win = 500000, opt->lift_mad = 200000;
+	opt->kmer_len = 0;    // off by default (whole-read placement)
+	opt->kmer_step = 15, opt->min_agree = 2, opt->kmer_cluster = 2000;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -75,6 +91,7 @@ typedef struct {
 	rb3_seqio_t *fp;
 	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
 	int64_t n_ref;   // refmap: number of reference sequences
+	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
 } pipeline_t;
 
 typedef struct {
@@ -87,6 +104,7 @@ typedef struct {
 #define RB3_RM_PLACED   1
 #define RB3_RM_ONE_SIDE 2
 #define RB3_RM_EXACT    3
+#define RB3_RM_MULTI    4 // query occurs > max_occ times (repeat/retro): not placed
 
 typedef struct refmap_rst_s {
 	int8_t status;       // RB3_RM_*
@@ -100,6 +118,7 @@ typedef struct refmap_rst_s {
 	rb3_pos_t *carriers; // a few carrier (sid,pos); allocated with RB3_MALLOC
 	int32_t n_sub;       // per-carrier mode: number of sub-results (one per carrier)
 	struct refmap_rst_s *sub; // per-carrier mode: one placement per carrier
+	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 } refmap_rst_t;
 
 typedef struct {
@@ -293,12 +312,17 @@ static void refmap_place(void *km, const pipeline_t *p, const m_seq_t *s, const 
 	gotL = refmap_anchor_flank(km, p, Lf, Ll, 0, &sidL, &strandL, &coordL, &mlenL);
 	gotR = refmap_anchor_flank(km, p, Rf, Rl, 1, &sidR, &strandR, &coordR, &mlenR);
 	kfree(km, Lf); kfree(km, Rf);
-	if (gotL && gotR && sidL == sidR && strandL == strandR) {
+	int concord = (gotL && gotR && sidL == sidR && strandL == strandR);
+	if (concord && o->max_bracket > 0) { // E1 collinearity: the two anchors must bracket a small zone
+		int64_t lo = coordL < coordR? coordL : coordR, hi = coordL < coordR? coordR : coordL;
+		if (hi - lo > o->max_bracket) concord = 0; // anchors too far apart -> paralogous, not collinear
+	}
+	if (concord) {
 		r->status = RB3_RM_PLACED, r->ref_sid = sidL, r->strand = strandL;
 		r->cL = coordL < coordR? coordL : coordR;
 		r->cR = coordL < coordR? coordR : coordL;
 		r->ins_size = (int64_t)(Ll - mlenL) + s->len + (Rl - mlenR);
-	} else if (gotL || gotR) {
+	} else if (!o->two_flank && (gotL || gotR)) { // E1: with two_flank, a lone anchor is not trusted
 		r->status = RB3_RM_ONE_SIDE;
 		if (gotL) r->ref_sid = sidL, r->strand = strandL, r->cL = coordL;
 		else      r->ref_sid = sidR, r->strand = strandR, r->cR = coordR;
@@ -359,6 +383,10 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 		}
 	}
 	if (best_len < min_len) return 0; // too short to anchor confidently
+	// E2: the anchor must be (near-)single-copy across taxa, not a repeat. best_iv is the longest
+	// reference-matching stretch, so it has the smallest interval; if even that exceeds max_occ the
+	// flank is stuck in a repeat and the located coordinate cannot be trusted.
+	if (p->opt->max_occ > 0 && best_iv.size > p->opt->max_occ) return 0;
 	if (rb3_ssa_multi_ref(km, f, f->ssa, best_iv.x[0], best_iv.x[0] + best_iv.size, p->is_ref, 1, 1<<16, pos) <= 0)
 		return 0;
 	pos_stranded(f->sid, &pos[0], best_len, &clen, &rst, &ren);
@@ -373,10 +401,144 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 	return 1;
 }
 
+// Place a carrier-only query by PROJECTING its carrier hits to the reference via
+// the liftover (the E4 "second SSA"), instead of walking outward. The majority
+// reference sequence among the per-carrier projections wins; NULL projections
+// (no confident collinear support) are dropped, and if none survive -> UNPLACED.
+static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int64_t rsids[8], rposs[8], best_rsid = -1, med, v[8];
+	int32_t n = 0, k, j, bestn, m;
+	for (k = 0; k < r->n_car_list && n < 8; ++k) {
+		int64_t clen, st, en, rsid, rpos;
+		pos_stranded(f->sid, &r->carriers[k], s->len, &clen, &st, &en);
+		if (rb3_lift_project(p->lift, km, (int32_t)(r->carriers[k].sid >> 1), st,
+							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
+			rsids[n] = rsid, rposs[n] = rpos, ++n;
+	}
+	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
+	for (k = 0, bestn = 0; k < n; ++k) {           // majority reference sequence
+		int32_t c = 0;
+		for (j = 0; j < n; ++j) if (rsids[j] == rsids[k]) ++c;
+		if (c > bestn) bestn = c, best_rsid = rsids[k];
+	}
+	for (k = 0, m = 0; k < n; ++k) if (rsids[k] == best_rsid) v[m++] = rposs[k];
+	for (k = 1; k < m; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
+	med = v[m >> 1];
+	r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
+	r->cL = r->cR = med, r->ins_size = 0;
+}
+
+// One reference-coordinate vote from a k-mer.
+typedef struct { int64_t rsid, rpos; int32_t kmer; } refmap_vote_t;
+
+static int refmap_vote_cmp(const void *a, const void *b)
+{
+	const refmap_vote_t *x = (const refmap_vote_t*)a, *y = (const refmap_vote_t*)b;
+	if (x->rsid != y->rsid) return x->rsid < y->rsid? -1 : 1;
+	if (x->rpos != y->rpos) return x->rpos < y->rpos? -1 : 1;
+	return 0;
+}
+
+// Map the k-mer-agreement signals to a Phred-scaled MAPQ. The number of agreeing
+// k-mers is a well-calibrated, error-rate-robust precision predictor (measured on
+// maize NAM, 0-1% substitution: 1->~0.77, 2->~0.87, 3->~0.92, 4->~0.95, 5->~0.96,
+// >=6->~0.97). A runner-up cluster that ties the winner is an ambiguous locus and
+// caps precision (measured ~0.85). MAPQ = -10*log10(1 - precision). The raw agree/
+// second columns are emitted too, for callers who prefer their own thresholds.
+static inline int refmap_kmer_mapq(int agree, int second)
+{
+	static const double prec[7] = { 0.0, 0.77, 0.87, 0.92, 0.95, 0.96, 0.97 };
+	double p = prec[agree < 1? 1 : (agree > 6? 6 : agree)];
+	if (second >= agree && p > 0.85) p = 0.85;   // tie with a runner-up locus -> ambiguous
+	if (p > 0.99999) p = 0.99999;
+	return (int)(-10.0 * log10(1.0 - p) + 0.499);
+}
+
+// Collect the reference-coordinate votes of one k-mer (only if it is a full-length
+// exact, single-copy-per-taxon match): a reference hit votes directly; a carrier
+// hit votes via the liftover projection. An error-containing k-mer has no
+// full-length match and contributes nothing.
+static void refmap_kmer_votes(void *km, const pipeline_t *p, const uint8_t *q, int32_t K, int32_t ki,
+							  refmap_vote_t **votes, int64_t *nv, int64_t *mv, rb3_pos_t *pos, int64_t cap)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_mopt_t *o = p->opt;
+	rb3_sai_t Iq;
+	int64_t np, j;
+	if (!refmap_query_interval(f, K, q, &Iq) || Iq.size < 1 || Iq.size > cap) return;
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, cap, pos);
+	for (j = 0; j < np; ++j) {
+		int64_t sx = pos[j].sid >> 1, clen, st, en, rsid, rpos;
+		pos_stranded(f->sid, &pos[j], K, &clen, &st, &en); // st = forward start of the k-mer
+		if (p->is_ref[sx]) rsid = sx, rpos = st;
+		else if (!(p->lift && rb3_lift_project(p->lift, km, (int32_t)sx, st, o->lift_win, o->lift_mad, 4, &rsid, &rpos)))
+			continue;
+		Kgrow(km, refmap_vote_t, *votes, *nv, *mv);
+		(*votes)[*nv].rsid = rsid, (*votes)[*nv].rpos = rpos, (*votes)[*nv].kmer = ki, (*nv)++;
+	}
+}
+
+// Place a read from its k-mers: tile it, project each k-mer to the reference, and
+// place only where >= min_agree DISTINCT k-mers agree on a locus (cluster within
+// kmer_cluster on one reference sequence). Tolerates sequencing error (an
+// error-free k-mer votes even when the whole read fails to match exactly) and
+// raises precision (a lone paralogous k-mer is outvoted). See docs experiment E4.
+static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
+{
+	const rb3_mopt_t *o = p->opt;
+	int32_t K = o->kmer_len, ki = 0;
+	int64_t off, last_off, nv = 0, mv = 0, cap = o->max_occ > 0? o->max_occ : 8, i;
+	int64_t best_support = 0, second_support = 0, best_rsid = -1, best_pos = -1;
+	uint64_t all_mask = 0;
+	refmap_vote_t *votes = 0;
+	rb3_pos_t *pos = Kmalloc(km, rb3_pos_t, cap);
+
+	memset(r, 0, sizeof(*r));
+	r->status = RB3_RM_UNPLACED, r->qlen = s->len, r->ref_sid = -1, r->cL = r->cR = -1;
+	if (s->len < K) { kfree(km, pos); return; }
+
+	for (off = 0; off + K <= s->len; off += o->kmer_step)
+		refmap_kmer_votes(km, p, s->seq + off, K, ki++, &votes, &nv, &mv, pos, cap);
+	last_off = (s->len - K) / o->kmer_step * o->kmer_step;
+	if (last_off != s->len - K)                     // ensure the 3' end is tiled
+		refmap_kmer_votes(km, p, s->seq + (s->len - K), K, ki++, &votes, &nv, &mv, pos, cap);
+	kfree(km, pos);
+
+	// n_vote = distinct k-mers that cast any vote (informative tiles)
+	for (i = 0; i < nv; ++i) if (votes[i].kmer < 64) all_mask |= 1ULL << votes[i].kmer;
+	r->n_vote = __builtin_popcountll(all_mask);
+
+	// cluster the votes; support = number of DISTINCT k-mers in the cluster. Track the
+	// top-2 cluster supports (best drives the placement; second measures competition).
+	qsort(votes, nv, sizeof(refmap_vote_t), refmap_vote_cmp);
+	for (i = 0; i < nv; ) {
+		int64_t j = i, rs = votes[i].rsid, start = votes[i].rpos, support = 0;
+		uint64_t kmask = 0;
+		for (; j < nv && votes[j].rsid == rs && votes[j].rpos - start <= o->kmer_cluster; ++j)
+			if (votes[j].kmer < 64 && !(kmask >> votes[j].kmer & 1))
+				kmask |= 1ULL << votes[j].kmer, ++support;
+		if (support > best_support)
+			second_support = best_support, best_support = support, best_rsid = rs, best_pos = votes[(i + j) >> 1].rpos;
+		else if (support > second_support)
+			second_support = support;
+		i = j;
+	}
+	kfree(km, votes);
+	r->agree = (int32_t)best_support, r->second = (int32_t)second_support;
+	if (best_support >= o->min_agree) {
+		r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
+		r->cL = r->cR = best_pos, r->ins_size = 0, r->n_carrier = (int32_t)best_support;
+		r->mapq = refmap_kmer_mapq((int32_t)best_support, (int32_t)second_support);
+	}
+}
+
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	rb3_sai_t Iq;
+	if (p->opt->kmer_len > 0) { refmap_query_kmer(km, p, s, r); return; }
 	rb3_pos_t *pos;
 	int64_t np, i;
 	int car_seen[8], n_car = 0;
@@ -397,6 +559,13 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		kfree(km, mem.a);
 		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
+	}
+
+	// E2: an informative read maps at most once per taxon; a read occurring > max_occ times is a
+	// repeat/retro and cannot be placed confidently (it would be reported at one arbitrary copy).
+	if (p->opt->max_occ > 0 && Iq.size > p->opt->max_occ) {
+		r->status = RB3_RM_MULTI;
+		return;
 	}
 
 	// locate a sample of occurrences; separate reference hits (exact) from carriers
@@ -423,6 +592,11 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 	r->n_car_list = n_car, r->n_carrier = n_car;
 	kfree(km, pos);
+
+	if (p->lift) { // E4: project carrier hits to the reference instead of walking
+		refmap_place_lift(km, p, s, r);
+		return;
+	}
 
 	if (p->opt->walk_mode == RB3_WALK_PERCARRIER && n_car > 0) {
 		// place each carrier separately, following that one carrier through divergences
@@ -512,9 +686,9 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 	rb3_sprintf_lite(out, "//\n");
 }
 
-static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r)
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer)
 {
-	static const char *status_str[4] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT" };
+	static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
 	int32_t k;
 	out->l = 0;
 	write_name(out, s);
@@ -535,6 +709,8 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 		rb3_sprintf_lite(out, "\t%ld\t%ld", (long)(r->cR - r->cL), (long)r->ins_size);
 	else
 		rb3_sprintf_lite(out, "\t.\t.");
+	if (kmer) // --kmer confidence: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
+		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%d", r->n_vote, r->agree, r->second, r->mapq);
 	rb3_sprintf_lite(out, "\n");
 }
 
@@ -547,14 +723,15 @@ static void write_refmap(step_t *t)
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
 		refmap_rst_t *r = &t->refmap[j];
+		int kmer = p->opt->kmer_len > 0;
 		if (r->n_sub > 0) { // per-carrier mode: one line per carrier (sub->carriers borrows r->carriers)
 			for (k = 0; k < r->n_sub; ++k) {
-				write_refmap1(&out, f, s, &r->sub[k]);
+				write_refmap1(&out, f, s, &r->sub[k], kmer);
 				fputs(out.s, stdout);
 			}
 			free(r->sub);
 		} else {
-			write_refmap1(&out, f, s, r);
+			write_refmap1(&out, f, s, r, kmer);
 			fputs(out.s, stdout);
 		}
 		free(r->carriers);
@@ -766,6 +943,16 @@ static ko_longopt_t long_options[] = {
 	{ "ref-prefix",      ko_required_argument, 307 },
 	{ "max-walk",        ko_required_argument, 308 },
 	{ "walk-mode",       ko_required_argument, 309 },
+	{ "max-occ",         ko_required_argument, 310 },
+	{ "two-flank",       ko_no_argument,       311 },
+	{ "max-bracket",     ko_required_argument, 312 },
+	{ "lift",            ko_required_argument, 313 },
+	{ "lift-win",        ko_required_argument, 314 },
+	{ "lift-mad",        ko_required_argument, 315 },
+	{ "kmer",            ko_required_argument, 316 },
+	{ "kmer-step",       ko_required_argument, 317 },
+	{ "min-agree",       ko_required_argument, 318 },
+	{ "kmer-cluster",    ko_required_argument, 319 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -822,6 +1009,16 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			else if (strcmp(o.arg, "per-carrier") == 0) opt.walk_mode = RB3_WALK_PERCARRIER;
 			else { fprintf(stderr, "ERROR: --walk-mode must be consensus, strict or per-carrier\n"); return 1; }
 		}
+		else if (c == 310) opt.max_occ = atol(o.arg);     // E2: occurrence cap; <0 = auto (#taxa)
+		else if (c == 311) opt.two_flank = 1;             // E1: require both flanks to anchor
+		else if (c == 312) opt.max_bracket = rb3_parse_num(o.arg); // E1: max |cR-cL| for a PLACED
+		else if (c == 313) opt.lift_fn = o.arg;           // E4: liftover file (project, not walk)
+		else if (c == 314) opt.lift_win = rb3_parse_num(o.arg);
+		else if (c == 315) opt.lift_mad = rb3_parse_num(o.arg);
+		else if (c == 316) opt.kmer_len = atoi(o.arg);    // k-mer-agreement placement (0 = off)
+		else if (c == 317) opt.kmer_step = atoi(o.arg);
+		else if (c == 318) opt.min_agree = atoi(o.arg);
+		else if (c == 319) opt.kmer_cluster = rb3_parse_num(o.arg);
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -863,6 +1060,16 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
 			fprintf(stderr, "  --max-walk=NUM    max bases to walk outward along carriers per flank [%d]\n", opt.max_walk);
 			fprintf(stderr, "  --walk-mode=STR   carrier path: consensus|strict|per-carrier [consensus]\n");
+			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
+			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
+			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
+			fprintf(stderr, "  --lift=FILE       project carrier hits via a `ropebwt3 lift` map instead of walking\n");
+			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
+			fprintf(stderr, "  --lift-mad=NUM    liftover max residual MAD [%ld]\n", (long)opt.lift_mad);
+			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
+			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
+			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
+			fprintf(stderr, "  --kmer-cluster=NUM  agreeing k-mers must fall within NUM bp [%ld]\n", (long)opt.kmer_cluster);
 			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
@@ -913,7 +1120,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0;
 	if (opt.algo == RB3_SA_REFMAP) { // mark the reference sequences by name prefix
 		int64_t k, plen;
 		if (opt.ref_prefix == 0) {
@@ -936,6 +1143,34 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (rb3_verbose >= 3)
 			fprintf(stderr, "[M::%s] %ld of %ld sequences marked as reference\n", __func__, (long)p.n_ref, (long)p.fmi.sid->n_seq);
+		// count distinct taxa (sequence-name prefixes before '_') for the auto --max-occ default
+		if (opt.max_occ < 0) {
+			int64_t k, m, n_taxa = 0;
+			char **pre = RB3_CALLOC(char*, p.fmi.sid->n_seq);
+			for (k = 0; k < p.fmi.sid->n_seq; ++k) {
+				const char *nm = p.fmi.sid->name[k];
+				const char *us = strchr(nm, '_');
+				int32_t plen = us? (int32_t)(us - nm) : (int32_t)strlen(nm), dup = 0;
+				for (m = 0; m < n_taxa; ++m)
+					if ((int32_t)strlen(pre[m]) == plen && strncmp(pre[m], nm, plen) == 0) { dup = 1; break; }
+				if (!dup) { pre[n_taxa] = RB3_MALLOC(char, plen + 1); memcpy(pre[n_taxa], nm, plen); pre[n_taxa][plen] = 0; ++n_taxa; }
+			}
+			for (m = 0; m < n_taxa; ++m) free(pre[m]);
+			free(pre);
+			opt.max_occ = n_taxa;
+			if (rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s] auto --max-occ = %ld (distinct taxa)\n", __func__, (long)opt.max_occ);
+		}
+		if (opt.lift_fn) { // E4: load the carrier->reference liftover
+			p.lift = rb3_lift_restore(opt.lift_fn);
+			if (p.lift == 0) {
+				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);
+				free(p.is_ref);
+				return 1;
+			}
+			if (rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s] loaded liftover over %ld sequences\n", __func__, (long)rb3_lift_n_seq(p.lift));
+		}
 	}
 	if (opt.flag & RB3_MF_WRITE_ALL) {
 		puts("CC\tQS  queryName  queryLen  numHap");
@@ -954,5 +1189,6 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
+	rb3_lift_destroy(p.lift);
 	return 0;
 }

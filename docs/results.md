@@ -4,6 +4,10 @@ Outputs from the synthetic locus in `docs/experiments.md` (seed 42), run on the
 optimized build (`make omp=0`). Columns:
 `qname  qlen  status  nCar  carriers  ref  strand  cL  cR  span  ins`.
 
+> Real-data **sensitivity + speed** at maize-pangenome scale:
+> [`results-maize.md`](results-maize.md) (protocol in
+> [`benchmark-maize.md`](benchmark-maize.md)).
+
 Ground truth: insertion breakpoint at reference coordinate **200** (the `A|B`
 junction), with incidental microhomology spanning ~198–201.
 

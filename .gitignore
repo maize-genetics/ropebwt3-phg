@@ -11,3 +11,18 @@ docs/examples/*.fmd
 docs/examples/*.fmd.ssa
 docs/examples/*.fmd.len.gz
 .DS_Store
+
+# ref-sensitivity experiment data (genomes, index, queries) — too large to commit
+experiments/ref-sensitivity/data/
+/ropebwt3-omp
+
+# ref-sensitivity E4 prototype data (anchors, mem outputs) — keep only .py/.md
+experiments/ref-sensitivity/e4/*.fa
+experiments/ref-sensitivity/e4/*.mem
+experiments/ref-sensitivity/e4/*.time
+experiments/ref-sensitivity/e4/*.tsv
+experiments/ref-sensitivity/e4/__pycache__/
+experiments/ref-sensitivity/e4/param_log.txt
+docs/examples/*.lift
+experiments/ref-sensitivity/e4/*.out
+experiments/ref-sensitivity/e4/*.log

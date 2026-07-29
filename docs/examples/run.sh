@@ -18,5 +18,16 @@ $RB ssa -s8 -o "$IDX.ssa" "$IDX"
 awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
      END{if(n)print n"\t"l}' "$DIR/pangenome.fa" | gzip > "$IDX.len.gz"
 
-# 4. Place the queries on the reference (sequences whose name starts with "B73").
+# 4. RECOMMENDED: build the lift "second SSA" (carrier->reference coordinate map)
+#    once, then place queries by projecting carrier hits. Tiny data needs a small
+#    k/stride; on real genomes the defaults (-k 100 -s 2000) and the reference
+#    FASTA (e.g. B73.fa) are appropriate. See docs/lift-second-ssa.md.
+$RB lift --ref-prefix=B73 -k 31 -s 10 -o "$DIR/pangenome.lift" "$IDX" "$DIR/pangenome.fa"
+echo "# refmap --lift (project; fast, recommended):"
+$RB refmap --ref-prefix=B73 --max-occ=-1 --lift "$DIR/pangenome.lift" "$IDX" "$DIR/queries.fa"
+
+# 5. Fallback (no lift build): the outward walk. It brackets the insertion
+#    breakpoint (cL/cR at the A|B junction) and reports the inserted size, where
+#    the projection instead returns one approximate coordinate.
+echo "# refmap walk (bracket the breakpoint; no setup):"
 $RB refmap --ref-prefix=B73 "$IDX" "$DIR/queries.fa"

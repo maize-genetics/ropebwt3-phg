@@ -4,6 +4,10 @@ No multi-genome pangenome data is available locally, so testing uses a small
 **synthetic insertion locus** where the ground truth is known exactly. Results
 are in `docs/results.md`.
 
+> For the real maize-pangenome **sensitivity + speed** benchmark (4 NAM founders,
+> 100k reads), see [`benchmark-maize.md`](benchmark-maize.md) and
+> [`results-maize.md`](results-maize.md).
+
 ## Synthetic design
 
 Seven sequences sharing two flanks `A` (200 bp) and `B` (200 bp):
