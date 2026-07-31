@@ -171,6 +171,10 @@ span `cR-cL`, and 11) the implied inserted size. `EXACT` means the query occurs 
 the reference itself; `MULTI` means it occurs more than `--max-occ` times (a
 repeat/retro) and is deliberately not placed.
 
+With `--report-occ`, one more column is appended: 12) `occ`, the pangenome-wide
+FM-index occurrence count (a copy-number signal), off by default — passing no
+flag reproduces today's output byte-for-byte.
+
 With `--kmer`, four confidence columns are appended: 12) `nVote` informative
 k-mers, 13) `agree` k-mers supporting the placement, 14) `second` k-mers at the
 runner-up locus (competition), and 15) a calibrated `MAPQ`. The agreeing-k-mer
@@ -207,6 +211,8 @@ Options:
 * `--target-hits=NUM` stops once `NUM` `PLACED`/`EXACT` records have been
   written, bounding a PS4G/npy training sample without processing the
   whole read set.
+* `--report-occ` appends a pangenome-wide occurrence-count ("copy number")
+  column, off by default (opt-in).
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
