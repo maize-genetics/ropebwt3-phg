@@ -197,12 +197,23 @@ Options:
   `--walk-mode=consensus|strict|per-carrier` handles divergent carriers;
   `--two-flank` requires both flanks to anchor concordantly (drops the
   low-precision `ONE_SIDE` case).
+* `--ps4g=FILE` / `--npy=FILE` / `--label-bed=FILE` write PS4G v2.0
+  gamete-support counts / a dense numpy training array / diploid training
+  labels, feeding the PHG ML-imputation pipeline directly from `refmap`
+  output instead of going through `mem` → BED → `phg convert-bed-to-ps4g`
+  (only `EXACT`/`PLACED` reads contribute); `--bin-size=NUM` sets the
+  reference-position bin size [256], `--npy-binary` writes presence (1)
+  instead of read counts.
+* `--target-hits=NUM` stops once `NUM` `PLACED`/`EXACT` records have been
+  written, bounding a PS4G/npy training sample without processing the
+  whole read set.
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
 
-See [docs/usage.md](docs/usage.md) for a full guide and a runnable example
-([docs/examples/](docs/examples/), `sh docs/examples/run.sh`).
+See [docs/usage.md](docs/usage.md) for a full guide (§7 PS4G/numpy output,
+§8 `--target-hits`) and a runnable example ([docs/examples/](docs/examples/),
+`sh docs/examples/run.sh`).
 
 ### <a name="build"></a>Indexing
 
