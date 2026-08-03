@@ -85,7 +85,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, " %s", argv[i]);
 		fprintf(stderr, "\n[M::%s] Real time: %.3f sec; CPU: %.3f sec; Peak RSS: %.3f GB\n", __func__, rb3_realtime(), rb3_cputime(), rb3_peakrss() / 1024.0 / 1024.0 / 1024.0);
 	}
-	return 0;
+	return ret;   // every subcommand's status was computed and then discarded: errors exited 0
 }
 
 int main_merge(int argc, char *argv[])
