@@ -124,9 +124,11 @@ def build_reference(rng, a):
     return "".join(seq), genes, regions
 
 
-def derive_genotype(rng, refseq, regions, genes, gt, a):
+def derive_genotype(rng, refseq, regions, genes, gt, a, big_ins=()):
     """Build one non-reference genotype from the reference. Returns
-    (geno_seq, blocks, absent_gene_ids)."""
+    (geno_seq, blocks, absent_gene_ids). big_ins: large structural insertions this
+    genotype carries, as {"locus": ref_coord, "seq": str} -- emitted at the locus so
+    the true breakpoint is exactly that reference coordinate."""
     # decide PAV: never drop gene0 (keep a fully-conserved anchor gene).
     absent = set()
     for g in genes[1:]:
@@ -160,7 +162,13 @@ def derive_genotype(rng, refseq, regions, genes, gt, a):
         blocks.append(("I", gpos, gpos + len(s), r_locus, r_locus))
         gpos += len(s)
 
+    big_at = {}
+    for ins in big_ins:
+        big_at.setdefault(ins["locus"], []).append(ins["seq"])
+
     for (r0, r1, kind) in regions:
+        for s in big_at.get(r0, ()):      # structural insertion anchored at this boundary
+            emit_insert(r0, s)
         if kind == "exon":
             if (r0, r1) in exon_of_absent:
                 continue  # PAV deletion: no genotype bases, ref gap
@@ -222,6 +230,19 @@ def main():
     ap.add_argument("--intergenic-snp", type=float, default=0.01)
     ap.add_argument("--pav-rate", type=float, default=0.12,
                     help="prob a gene (not gene0) is absent in a non-ref genotype")
+    # Large structural insertions: sequence present in some genotypes and ABSENT from the
+    # reference, big enough that a whole read lands inside one. The churn's insertions are
+    # --churn-max (70bp) at most, below the read length, so without these no read is ever
+    # assembly-only and the PAV breakpoint path is never exercised. Each insertion is anchored
+    # at an intergenic region boundary, so its true reference breakpoint is exactly that
+    # coordinate, and carriers share the IDENTICAL sequence so assembly sets and cross-assembly
+    # breakpoint consistency are both testable. Default 0 = off (existing output unchanged).
+    ap.add_argument("--pav-insert-n", type=int, default=0,
+                    help="number of large structural insertions absent from the reference")
+    ap.add_argument("--pav-insert-bp", type=int, default=2000,
+                    help="size of each large structural insertion [2000]")
+    ap.add_argument("--pav-insert-share", type=float, default=0.5,
+                    help="prob a given non-reference genotype carries a given insertion")
     # adversarial fixtures (default off; turn on to stress chaining ties / gap cost)
     ap.add_argument("--tandem-dup", type=int, default=0,
                     help="duplicate the first N genes in tandem (identical adjacent "
@@ -246,6 +267,22 @@ def main():
     refseq, genes, regions = build_reference(rng, a)
     reflen = len(refseq)
 
+    # large structural insertions: one shared sequence per locus, carried by a subset
+    nonref = [g for g in genotypes if g != a.ref_name]
+    big_ins = []
+    if a.pav_insert_n > 0:
+        cand = [r0 for (r0, r1, kind) in regions
+                if kind == "intergenic" and r1 - r0 > a.read_len * 4]
+        rng.shuffle(cand)
+        for locus in cand[:a.pav_insert_n]:
+            carriers = [g for g in nonref if rng.random() < a.pav_insert_share]
+            if not carriers:                      # never emit an insertion nobody carries
+                carriers = [rng.choice(nonref)]
+            big_ins.append({"locus": locus,
+                            "seq": rand_seq(rng, a.pav_insert_bp).lower(),
+                            "carriers": carriers})
+        big_ins.sort(key=lambda d: d["locus"])
+
     seqs = {}          # gt -> genotype sequence
     per_gt = {}        # gt -> {blocks, absent_genes}
     for gt in genotypes:
@@ -253,7 +290,8 @@ def main():
             seqs[gt] = refseq
             per_gt[gt] = {"blocks": [("M", 0, reflen, 0, reflen)], "absent_genes": []}
         else:
-            gseq, blocks, absent = derive_genotype(rng, refseq, regions, genes, gt, a)
+            mine = [d for d in big_ins if gt in d["carriers"]]
+            gseq, blocks, absent = derive_genotype(rng, refseq, regions, genes, gt, a, mine)
             seqs[gt] = gseq
             per_gt[gt] = {"blocks": blocks, "absent_genes": absent}
 
@@ -305,6 +343,11 @@ def main():
                    "exons": g["exons"], "introns": g["introns"]} for g in genes],
         "regions": regions,
         "per_gt": per_gt,
+        # large structural insertions: truth for PAV breakpoint anchoring. "locus" is the
+        # exact reference coordinate the insertion sits at (its true breakpoint), "carriers"
+        # the genotypes carrying it. Empty unless --pav-insert-n was given.
+        "pav_inserts": [{"locus": d["locus"], "len": len(d["seq"]),
+                         "carriers": d["carriers"]} for d in big_ins],
     }
     with open(os.path.join(a.outdir, "sim.json"), "w") as out:
         json.dump(sim, out)
@@ -312,6 +355,11 @@ def main():
     # ---- brief report
     sys.stderr.write("reference %s: %d bp, %d genes, %d regions\n"
                      % (a.ref_name, reflen, len(genes), len(regions)))
+    if big_ins:
+        sys.stderr.write("  %d structural insertion(s) of %d bp absent from the reference\n"
+                         % (len(big_ins), a.pav_insert_bp))
+        for d in big_ins:
+            sys.stderr.write("    locus %8d  carriers=%s\n" % (d["locus"], ",".join(d["carriers"])))
     for gt in genotypes:
         sys.stderr.write("  %-8s len=%7d  PAV-absent=%s\n"
                          % (gt, len(seqs[gt]), per_gt[gt]["absent_genes"] or "-"))
