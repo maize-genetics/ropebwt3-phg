@@ -1,7 +1,9 @@
 > **Note:** This is a fork of [lh3/ropebwt3](https://github.com/lh3/ropebwt3) by
-> Heng Li (MIT licensed). It adds the [`refmap`](#refmap) subcommand for placing
-> pangenome queries on a designated reference genome. The original code and
-> license are unchanged — see [`LICENSE.txt`](LICENSE.txt) and [`NOTICE`](NOTICE).
+> Heng Li (MIT licensed). It adds [`refmap`](#refmap) for placing pangenome queries
+> on a designated reference genome, [`chain`](#chain) for uniting an RNAseq read's
+> SMEMs across splice junctions, and [`lift`](#refmap) for building the
+> assembly→reference coordinate map both rely on. The original code and license are
+> unchanged — see [`LICENSE.txt`](LICENSE.txt) and [`NOTICE`](NOTICE).
 
 ## <a name="start"></a>Getting Started
 ```sh
@@ -43,6 +45,8 @@ echo CCAGGACCCCTGTCCAGTGTTAGACAGGAGCATGCAG | ./ropebwt3 sw -eN200 -Lm10 human579
   - [Local alignment](#bwasw)
   - [Haplotype diversity with end-to-end alignment](#e2e)
   - [Placing a query on a reference genome](#refmap)
+  - [RNAseq: chaining and PAV placement](#chain)
+  - [Deprecated](#deprecated)
   - [Indexing](#build)
   - [Binary BWT formats](#format)
 - [Citation](#cite)
@@ -135,31 +139,26 @@ reference because it falls inside an insertion (i.e. a deletion in the
 reference). Plain `mem`/`sw` cannot do this: every exact match of such a query
 lives only in the other genomes, never in the reference.
 
-`refmap` locates the query in the genomes that carry it, then places it on the
-reference in one of two ways:
+`refmap` locates the query in the assemblies that carry it, then projects it onto
+the reference through a precomputed assembly→reference coordinate map built by
+`ropebwt3 lift` (the "second SSA"). On a 4-genome maize benchmark this reached
+**95.5% precision, 77.9% recall, and ~15× faster** placement than the older
+flank-walking approach. See [docs/lift-second-ssa.md](docs/lift-second-ssa.md)
+and [docs/results-maize.md](docs/results-maize.md).
 
-* **Lift / "second SSA" (recommended).** A precomputed carrier→reference
-  coordinate map (`ropebwt3 lift`) lets `refmap --lift` **project** a carrier hit
-  straight to a reference coordinate. On a 4-genome maize benchmark this reached
-  **95.5% precision, 77.9% recall, and ~15× faster** placement than the walk. See
-  [docs/lift-second-ssa.md](docs/lift-second-ssa.md) and
-  [docs/results-maize.md](docs/results-maize.md).
-* **Walk (default fallback, no extra build).** When no `--lift` map is given,
-  `refmap` walks outward along the carriers (BWT backward extension) until each
-  flank crosses the insertion breakpoint into reference-shared sequence, and
-  re-anchors the flanks; the two anchors bracket the query's reference position.
+`--lift` is required. `refmap` will not run without it unless you explicitly opt
+into the deprecated walk with `--walk` (see [Deprecated](#deprecated)).
 
 ```sh
 # 0. the index needs the sampled suffix array (.ssa) and sequence names (.len.gz)
 ropebwt3 ssa -t 20 -s8 -o pan.fmd.ssa pan.fmd
 cat *.fa | seqtk comp | cut -f1,2 | gzip > pan.fmd.len.gz
 
-# --- recommended: build the lift map once, then project ---
-ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa      # the "second SSA"
-ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
+# 1. build the assembly->reference coordinate map once (the "second SSA")
+ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 
-# --- or the no-setup fallback (walk) ---
-ropebwt3 refmap --ref-prefix=B73 pan.fmd query.fa
+# 2. place queries through it
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
 ```
 
 Output is one tab-separated line per query with columns: 1) query name, 2) query
@@ -175,32 +174,14 @@ With `--report-occ`, one more column is appended: 12) `occ`, the pangenome-wide
 FM-index occurrence count (a copy-number signal), off by default — passing no
 flag reproduces today's output byte-for-byte.
 
-With `--kmer`, four confidence columns are appended: 12) `nVote` informative
-k-mers, 13) `agree` k-mers supporting the placement, 14) `second` k-mers at the
-runner-up locus (competition), and 15) a calibrated `MAPQ`. The agreeing-k-mer
-count is a well-calibrated, error-robust precision predictor (e.g. `agree≥4` ≈
-95% precision); `second≈agree` flags an ambiguous tie. Cumulative precision on
-100k reads at 1% error: MAPQ≥9 → 92%, ≥13 → 97%.
-
 Options:
 
 * `--ref-prefix=STR` (required) marks reference sequences by name prefix.
-* `--lift=FILE` project carrier hits through a `ropebwt3 lift` map instead of
-  walking (recommended); `--lift-win`/`--lift-mad` tune the projection.
+* `--lift=FILE` (required) project assembly hits through a `ropebwt3 lift` map;
+  `--lift-win`/`--lift-mad` tune the projection.
 * `--max-occ=N` drop queries/anchors occurring > N times (status `MULTI`); `N<0`
   = auto (= number of taxa). An informative read maps at most once per taxon, so
   this removes repeats/retros; it is the single most effective precision knob.
-* `--kmer=INT` place a read from its INT-bp k-mers by agreement instead of as a
-  whole (with `--lift`): each k-mer is projected and the read is placed only where
-  `--min-agree` distinct k-mers concur (`--kmer-step`, `--kmer-cluster`). This
-  tolerates sequencing error (an error-free k-mer still votes when the 150 bp read
-  no longer matches exactly) and raises precision as error rises — e.g. at 2%
-  substitution, precision 75.7% (whole-read) → 88.1% (75-bp k-mers, agree≥2), at a
-  recall cost.
-* Walk-only: `--max-walk=NUM` caps how far each flank walks [5000];
-  `--walk-mode=consensus|strict|per-carrier` handles divergent carriers;
-  `--two-flank` requires both flanks to anchor concordantly (drops the
-  low-precision `ONE_SIDE` case).
 * `--ps4g=FILE` / `--npy=FILE` / `--label-bed=FILE` write PS4G v2.0
   gamete-support counts / a dense numpy training array / diploid training
   labels, feeding the PHG ML-imputation pipeline directly from `refmap`
@@ -220,6 +201,87 @@ its longest exact core; in that case the reported inserted size is approximate.
 See [docs/usage.md](docs/usage.md) for a full guide (§7 PS4G/numpy output,
 §8 `--target-hits`) and a runnable example ([docs/examples/](docs/examples/),
 `sh docs/examples/run.sh`).
+
+### <a name="chain"></a>RNAseq: chaining and PAV placement
+
+`refmap` places a read as a whole, which suits DNA. An RNAseq read is different:
+splicing and sequencing error both **fragment** it into several exact matches, so
+`chain` collects a read's SMEMs, keeps those that are colinear on the reference,
+intersects their assembly sets over the winning chain, and emits one row per exon
+segment at that segment's own start base.
+
+```sh
+# RNAseq reads -> per-read PS4G rows (reference-anchored)
+ropebwt3 chain --ref-prefix=B73 -l 31 -t 20 pan.fmd reads.fq > reads.ps4g
+
+# optional: reject non-canonical introns using the reference sequence
+ropebwt3 chain --ref-prefix=B73 --ref-fasta B73.fa -l 31 -t 20 pan.fmd reads.fq
+```
+
+Output columns: 1) read name, 2) reference contig, 3) reference position, 4) the
+assembly set the read is consistent with (comma-separated indices).
+
+#### PAV breakpoint anchoring
+
+`chain` alone is reference-anchored: a read lying entirely in sequence the
+reference lacks has no reference-hitting SMEM and is dropped. Given a `lift` map,
+those reads are instead placed at the nearest reference **breakpoint**:
+
+```sh
+ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
+ropebwt3 chain --ref-prefix=B73 --lift pan.lift -l 31 -t 20 pan.fmd reads.fq
+```
+
+This adds a fifth column naming the row class:
+
+* **`1` = insertion** — absent from the reference. The contig is prefixed `pav:`
+  and the position is the nearest breakpoint, snapped to `--pav-grid` (default
+  5000). This is **presence/absence evidence only**: the coordinate is deliberately
+  coarse, because a breakpoint is not a base-level position.
+* **`0` = diverged** — present in the reference but too divergent to share an exact
+  match. The coordinate is colinear and exact, so by default these are emitted as
+  **ordinary rows** (no `pav:` prefix, no snapping) and need no special handling
+  downstream. `--diverged-rows=ordinary|pav|drop` changes that.
+
+Options:
+
+* `--ref-prefix=STR` (required) marks reference sequences by name prefix.
+* `-l INT` min SMEM length [31]. 19 is too short to be specific on a plant
+  pangenome.
+* `--ref-fasta=FILE` enable the canonical GT-AG intron check on spliced links;
+  `--splice-min` sets the gap above which it applies.
+* `--max-intron=NUM` reject a chain link whose unexplained reference jump exceeds
+  this; `--gap-intron=INT` is the gap that starts a new exon segment.
+* `--chain-max-occ=INT` skip SMEMs whose FM interval exceeds this
+  [auto: `min(2 × #samples, 256)`].
+* `--lift=FILE` enable PAV breakpoint anchoring (above).
+* `--pav-grid=NUM` snap the emitted breakpoint to this grid and require the seed's
+  assembly projections to agree within it [5000].
+* `--pav-min-len=INT` minimum longest assembly-only SMEM required to emit a `pav:`
+  row [60]. The assembly-only path has no colinear reference confirmation, so it
+  needs a longer floor than `-l`.
+* `--diverged-rows=STR` routing for diverged rows [ordinary].
+* `--trim-polya=INT` trim a terminal poly-A/poly-T run before searching [0 = off].
+  Measured as a no-op here — SMEM search already isolates the informative core —
+  and kept only because it may matter for other read types.
+
+### <a name="deprecated"></a>Deprecated
+
+These paths are superseded and will be removed. They are documented here only so
+existing scripts can be migrated; **no examples are given, and new work should not
+use them.**
+
+* **Flank walking** (`--walk`, `--max-walk`, `--walk-mode`, `--two-flank`). The
+  original way `refmap` reached the reference when a query was absent from it:
+  walk outward along the assemblies until each flank crosses into shared sequence.
+  It is slow and was superseded by `--lift`, which is ~15× faster and more precise.
+  It used to be the silent default; `refmap` now requires an explicit `--lift` or
+  `--walk` so nobody gets it by accident. **Use `--lift`.**
+* **K-mer voting** (`--kmer`, `--kmer-step`, `--min-agree`, `--kmer-cluster`). A
+  separate positional placement path that emitted confidence columns but no
+  PS4G/npy output. Colinear chaining supersedes its purpose — multi-seed agreement
+  for specificity — and additionally produces refined assembly sets. **Use
+  `chain`.**
 
 ### <a name="build"></a>Indexing
 
