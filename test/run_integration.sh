@@ -44,7 +44,11 @@ awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
      END{if(n)print n"\t"l}' "$DIR/pangenome.fa" | gzip > "$IDX.len.gz"
 
 # --- 1. baseline TSV output is unchanged by the new code ---
-"$RB" refmap --ref-prefix=B73 -t1 "$IDX" "$DIR/queries.fa" > "$TMP/baseline.tsv" 2>"$TMP/baseline.log"
+# These sections exercise the DEPRECATED flank-walking path and are pinned to golden output
+# captured from it, so they pass --walk explicitly (refmap now requires --lift or --walk rather
+# than silently defaulting to walking). Section 6 covers the supported --lift path; the two do
+# not agree on insertion placement, which is documented there.
+"$RB" refmap --ref-prefix=B73 --walk -t1 "$IDX" "$DIR/queries.fa" > "$TMP/baseline.tsv" 2>"$TMP/baseline.log"
 check_eq "refmap exits 0 (baseline)" "$?" "0"
 check_line_in "baseline: ins_query PLACED, 6 carriers" "$TMP/baseline.tsv" \
 	"$(printf 'ins_query\t150\tPLACED\t6\tOh43_chr1:+,B97_chr1:+,CML247_chr1:+,Mo17_chr1:+,Ki3_chr1:+,Tx303_chr1:+\tB73_chr1\t+\t300\t300\t0\t500')"
@@ -54,7 +58,7 @@ check_line_in "baseline: unrelated UNPLACED" "$TMP/baseline.tsv" \
 	"$(printf 'unrelated\t120\tUNPLACED\t0\t.\t.\t.\t.\t.\t.\t.')"
 
 # --- 2. --ps4g / --npy, no labels ---
-"$RB" refmap --ref-prefix=B73 --ps4g "$TMP/out.ps4g" --npy "$TMP/out.npy" -t1 "$IDX" "$DIR/queries.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --ps4g "$TMP/out.ps4g" --npy "$TMP/out.npy" -t1 "$IDX" "$DIR/queries.fa" \
 	> "$TMP/out.tsv" 2>"$TMP/out.log"
 rc=$?
 check_eq "refmap exits 0 (--ps4g --npy)" "$rc" "0"
@@ -105,7 +109,7 @@ check_line_in "npy: gametes.tsv lists all 7 samples, B73 first" "$TMP/out.npy.ga
 check_line_in "npy: bins.tsv row for the insertion locus (bin 1, contig stripped)" "$TMP/out.npy.bins.tsv" "$(printf '1\tchr1\t1')"
 
 # --- 2b. --npy-binary: same locations, but presence (1) instead of the read count ---
-"$RB" refmap --ref-prefix=B73 --npy "$TMP/binary.npy" --npy-binary -t1 "$IDX" "$DIR/queries.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --npy "$TMP/binary.npy" --npy-binary -t1 "$IDX" "$DIR/queries.fa" \
 	> /dev/null 2>"$TMP/binary.log"
 check_eq "refmap exits 0 (--npy-binary)" "$?" "0"
 hdr_len_bin=$(python3 - "$TMP/binary.npy" <<'EOF' 2>/dev/null
@@ -134,7 +138,7 @@ cat > "$TMP/labels.bed" <<'EOF'
 chr1	0	100	B73
 chr1	200	400	Ki3	Mo17
 EOF
-"$RB" refmap --ref-prefix=B73 --npy "$TMP/labeled.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --npy "$TMP/labeled.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
 	> /dev/null 2>"$TMP/labeled.log"
 check_eq "refmap exits 0 (--label-bed)" "$?" "0"
 
@@ -212,7 +216,7 @@ fi
 
 # 4a. PLACED counts toward the target too, not just EXACT (existing fixture:
 # ins_query=PLACED, ins_query_rc=PLACED, ref_query=EXACT, in that file order).
-"$RB" refmap --ref-prefix=B73 --target-hits=2 -K 1 -t1 "$IDX" "$DIR/queries.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --target-hits=2 -K 1 -t1 "$IDX" "$DIR/queries.fa" \
 	> "$TMP/target2.tsv" 2>"$TMP/target2.log"
 check_eq "refmap exits 0 (--target-hits=2)" "$?" "0"
 check_eq "target-hits=2: exactly 3 rows (2 PLACED to hit the target + 1 deterministic overshoot record)" \
@@ -231,7 +235,7 @@ for i in $(seq 1 15); do
 	printf '>u%d\n%s\n' "$i" "$JUNK_SEQ" >> "$TMP/target_hits.fa"
 done
 
-"$RB" refmap --ref-prefix=B73 --target-hits=5 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
 	> "$TMP/target5.tsv" 2>"$TMP/target5.log"
 check_eq "refmap exits 0 (--target-hits=5, new fixture)" "$?" "0"
 check_eq "target-hits=5: exactly 10 rows (5th EXACT is record 9; +1 deterministic overshoot = record 10)" \
@@ -245,7 +249,7 @@ check_eq "target-hits=5: all 5 junk rows are actually status UNPLACED (not filte
 
 # 4c. Shortfall: requesting more PLACED/EXACT than exist must not error, must
 # still process the whole input, and must warn with the actual count found.
-"$RB" refmap --ref-prefix=B73 --target-hits=100 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
+"$RB" refmap --ref-prefix=B73 --walk --target-hits=100 -K 10 -t1 "$IDX" "$TMP/target_hits.fa" \
 	> "$TMP/target100.tsv" 2>"$TMP/target100.log"
 check_eq "refmap exits 0 even when the target is never reached (not an error)" "$?" "0"
 check_eq "target-hits=100 (unreachable, only 15 EXACT exist): all 30 input records still processed" \
@@ -253,17 +257,104 @@ check_eq "target-hits=100 (unreachable, only 15 EXACT exist): all 30 input recor
 check_line_in "target-hits=100: WARNING reports the requested target and the actual count found" "$TMP/target100.log" \
 	"WARNING: --target-hits=100 requested but the input was exhausted after only 15 PLACED/EXACT records"
 
+# --- 5. the lift path, chaining, and PAV breakpoint anchoring ---
+# --lift is the supported resolution path (walking is deprecated); `chain` unites a read's SMEMs
+# for RNAseq; and `chain --lift` adds the PAV fallback for reads with no reference-hitting SMEM.
+# The fixture is ideal for this: ins_query is 150 bp from the middle of a 500 bp insertion that
+# every non-B73 assembly carries and the reference lacks.
+LIFT="$TMP/pangenome.lift"
+# -k/-s must be far below the defaults (100/2000): the whole fixture reference is 600 bp.
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$LIFT" "$IDX" "$DIR/pangenome.fa" \
+	>/dev/null 2>"$TMP/lift.log"
+check_eq "lift builds on the fixture" "$?" "0"
+check_eq "lift file is non-empty" "$([ -s "$LIFT" ] && echo yes || echo no)" "yes"
+
+# refmap must now be told which resolution path to use rather than silently walking.
+"$RB" refmap --ref-prefix=B73 -t1 "$IDX" "$DIR/queries.fa" >/dev/null 2>"$TMP/nopath.log"
+check_eq "refmap without --lift/--walk exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+if grep -q -- "--lift=FILE" "$TMP/nopath.log"; then pass; else fail "refmap error names --lift as the standard path"; fi
+
+# refmap --lift agrees with the walk golden on STATUS and CARRIERS.
+"$RB" refmap --ref-prefix=B73 --lift="$LIFT" -t1 "$IDX" "$DIR/queries.fa" \
+	> "$TMP/lift.tsv" 2>"$TMP/liftrun.log"
+check_eq "refmap --lift exits 0" "$?" "0"
+check_eq "refmap --lift: ins_query PLACED with 6 carriers" \
+	"$(awk -F'\t' '$1=="ins_query"{print $3"/"$4}' "$TMP/lift.tsv")" "PLACED/6"
+check_line_in "refmap --lift: ref_query EXACT, unchanged from walk" "$TMP/lift.tsv" \
+	"$(printf 'ref_query\t150\tEXACT\t0\t.\tB73_chr1\t+\t250\t400\t150\t0')"
+check_eq "refmap --lift: unrelated still UNPLACED" \
+	"$(awk -F'\t' '$1=="unrelated"{print $3}' "$TMP/lift.tsv")" "UNPLACED"
+# NOTE: walk and lift do NOT agree on where insertion content lands. Walk reports the insertion
+# point and size (300 / ins_size 500); lift reports a projected colinear coordinate with no size,
+# because --lift-mad defaults to 200 kb and nothing in a 1.1 kb fixture exceeds it. Recorded, not
+# asserted as equal -- `chain --lift` below is the path that resolves insertions properly.
+
+# `chain` alone is reference-anchored: a read living entirely in the insertion has no reference
+# SMEM and is dropped. Only the read that spans reference sequence survives.
+"$RB" chain --ref-prefix=B73 -t1 "$IDX" "$DIR/queries.fa" > "$TMP/chain.tsv" 2>"$TMP/chain.log"
+check_eq "chain exits 0" "$?" "0"
+check_line_in "chain: ref_query placed at the exact reference base, B73 only" "$TMP/chain.tsv" \
+	"$(printf 'ref_query\tchr1\t250\t0')"
+check_eq "chain without --lift emits no pav: rows" \
+	"$(grep -c 'pav:' "$TMP/chain.tsv")" "0"
+check_eq "chain without --lift drops the insertion reads" \
+	"$(grep -cE '^ins_query' "$TMP/chain.tsv")" "0"
+
+# `chain --lift` rescues them via PAV breakpoint anchoring. --pav-grid=0 disables the 5 kb
+# presence/absence grid, which is wider than this entire 600 bp fixture contig.
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 -t1 "$IDX" "$DIR/queries.fa" \
+	> "$TMP/pav.tsv" 2>"$TMP/pav.log"
+check_eq "chain --lift exits 0" "$?" "0"
+# class column: 1 = INSERTION (absent from the reference, placed at the nearest breakpoint),
+# 0 = DIVERGED (present in the reference but too divergent to share a SMEM).
+check_line_in "chain --lift: ins_query -> pav row, all 6 non-reference assemblies, class insertion" \
+	"$TMP/pav.tsv" "$(printf 'ins_query\tpav:chr1\t250\t1,2,3,4,5,6\t1')"
+check_line_in "chain --lift: reverse complement placed identically" \
+	"$TMP/pav.tsv" "$(printf 'ins_query_rc\tpav:chr1\t250\t1,2,3,4,5,6\t1')"
+check_line_in "chain --lift: one SNP inside the insertion still places" \
+	"$TMP/pav.tsv" "$(printf 'ins_query_1snp\tpav:chr1\t250\t1,2,3,4,5,6\t1')"
+check_line_in "chain --lift: ref_query is an ordinary row, not pav:" "$TMP/pav.tsv" \
+	"$(printf 'ref_query\tchr1\t250\t0')"
+check_eq "chain --lift: pav rows never contain the reference assembly (index 0)" \
+	"$(awk -F'\t' '$2 ~ /^pav:/ {n=split($4,g,","); for(i=1;i<=n;i++) if(g[i]=="0") bad++} END{print bad+0}' "$TMP/pav.tsv")" "0"
+check_eq "chain --lift: unrelated read produces no row" \
+	"$(grep -c '^unrelated' "$TMP/pav.tsv")" "0"
+
+# the specificity floor: no assembly-only match reaches 200 bp in 150 bp reads, so all pav rows go
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --pav-min-len=200 -t1 "$IDX" "$DIR/queries.fa" \
+	> "$TMP/pavmin.tsv" 2>/dev/null
+check_eq "--pav-min-len above the read length suppresses every pav row" \
+	"$(grep -c 'pav:' "$TMP/pavmin.tsv")" "0"
+check_line_in "--pav-min-len does not affect reference-anchored rows" "$TMP/pavmin.tsv" \
+	"$(printf 'ref_query\tchr1\t250\t0')"
+
+# the 5 kb default grid snaps the breakpoint; on this fixture that collapses it to 0
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" -t1 "$IDX" "$DIR/queries.fa" > "$TMP/pavgrid.tsv" 2>/dev/null
+check_eq "default --pav-grid snaps the breakpoint (250 -> 0 at 5 kb)" \
+	"$(awk -F'\t' '$1=="ins_query"{print $3}' "$TMP/pavgrid.tsv")" "0"
+
+# --diverged-rows policy switch is accepted; this fixture yields only insertions, so dropping
+# diverged rows must not change the output
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --diverged-rows=drop -t1 "$IDX" \
+	"$DIR/queries.fa" > "$TMP/pavdrop.tsv" 2>/dev/null
+check_eq "--diverged-rows=drop accepted" "$?" "0"
+check_eq "--diverged-rows=drop leaves the all-insertion output unchanged" \
+	"$(cmp -s "$TMP/pav.tsv" "$TMP/pavdrop.tsv" && echo same || echo differ)" "same"
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --diverged-rows=bogus -t1 "$IDX" "$DIR/queries.fa" \
+	>/dev/null 2>"$TMP/badarg.log"
+check_eq "--diverged-rows rejects an invalid value" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
-		"$RB" refmap --ref-prefix=B73 --ps4g "$TMP/vg.ps4g" --npy "$TMP/vg.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
+		"$RB" refmap --ref-prefix=B73 --walk --ps4g "$TMP/vg.ps4g" --npy "$TMP/vg.npy" --label-bed "$TMP/labels.bed" -t1 "$IDX" "$DIR/queries.fa" \
 		> /dev/null 2>"$TMP/valgrind.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks; see $TMP/valgrind.log"; cat "$TMP/valgrind.log" >&2; fi
 
 	# --target-hits with real multi-threaded compute (-t4), exercising the
 	# atomic hit counter under actual concurrent access.
 	valgrind --error-exitcode=99 --leak-check=full -q \
-		"$RB" refmap --ref-prefix=B73 --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
+		"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
 		> /dev/null 2>"$TMP/valgrind_target.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
 else
