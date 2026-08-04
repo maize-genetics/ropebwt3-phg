@@ -1,0 +1,66 @@
+name: CI
+
+# Nothing ran automatically before this: a PR could break the test suite and go green.
+# It did -- 27 of 37 integration checks were failing on a pushed branch, unnoticed.
+on:
+  push:
+    branches: [develop, master, rnaseq-imp, pav-breakpoint-anchoring]
+  pull_request:
+    branches: [develop, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: build + test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc]
+        include:
+          # clang is portability coverage only. It has NOT been verified locally (no clang
+          # on the box this was authored on), so it must not be able to block a PR until
+          # someone has seen it pass. Promote it to a required leg once it is green.
+          - cc: clang
+            optional: true
+    continue-on-error: ${{ matrix.optional == true }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update -qq
+          # zlib: -lz. valgrind: run_integration.sh's memory-safety pass, which SKIPS
+          # silently if valgrind is absent, so it has to be installed to be enforced.
+          sudo apt-get install -y -qq zlib1g-dev valgrind
+          if [ "${{ matrix.cc }}" = "clang" ]; then sudo apt-get install -y -qq libomp-dev; fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        # numpy is not optional in practice: without it the integration suite's npy
+        # deep-check and the PS4G<->npy correspondence check SKIP rather than fail.
+        run: python -m pip install --quiet --upgrade pip numpy pytest
+
+      - name: Build
+        run: make -j"$(nproc)" CC=${{ matrix.cc }}
+
+      - name: C unit tests + end-to-end integration
+        # test_ps4g, test_hitcount, then run_integration.sh (refmap, lift, chain,
+        # chain --lift PAV anchoring, and the valgrind pass)
+        run: make test CC=${{ matrix.cc }}
+
+      - name: Python tests
+        # simulator, chaining core, and the end-to-end PAV breakpoint tests, which
+        # drive the binary built above
+        run: python -m pytest rnaseq_ps4g/tests -q
+
+      - name: Show test artifacts on failure
+        if: failure()
+        run: |
+          for f in test/tmp/*.log; do
+            [ -s "$f" ] || continue
+            echo "===== $f ====="; tail -40 "$f"
+          done
