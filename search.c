@@ -67,6 +67,7 @@ typedef struct {
 	int32_t pav_min_len;   // chain --lift: min LONGEST assembly-only SMEM to emit a pav: row
 	int32_t trim_polya;    // trim a terminal poly-A/poly-T run of >= this many bp (0 = off)
 	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
+	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
 	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
@@ -86,6 +87,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_min_len = 60;  // chain --lift: assembly-only specificity floor; see chain_emit_pav
 	opt->trim_polya = 0;    // off by default; see m_trim_polya
 	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
+	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
 	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
@@ -1227,7 +1229,11 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		// SUPPRESS when the occurrences do not agree on WHERE this is: require a majority of
 		// projections on one reference sequence, and their spread within one grid cell. A read
 		// whose own assemblies disagree by more than the emitted resolution cannot be placed.
-		if (nmaj > 0 && bestn == np && disp <= (p->opt->pav_grid > 0? p->opt->pav_grid : p->opt->gap_intron)) {
+		// Agreement and resolution are separate concerns and now separate knobs. They used
+		// to share --pav-grid, which made --pav-grid=0 read as "no constraint" while actually
+		// being the STRICTEST setting: with no grid the tolerance fell back to --gap-intron
+		// (30bp), so insertions carried by several assemblies were silently suppressed.
+		if (nmaj > 0 && bestn == np && disp <= p->opt->pav_agree) {
 			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
 			const char *contig = us? us + 1 : nm;
 			int is_insertion = n_insertion * 2 >= nmaj;   // majority of projections were true breakpoints
@@ -1619,6 +1625,7 @@ static ko_longopt_t long_options[] = {
 	{ "walk",            ko_no_argument,       336 },
 	{ "trim-polya",      ko_required_argument, 337 },
 	{ "pav-grid",        ko_required_argument, 338 },
+	{ "pav-agree",       ko_required_argument, 340 },
 	{ "diverged-rows",       ko_required_argument, 339 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
@@ -1703,6 +1710,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
 		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
+		else if (c == 340) opt.pav_agree = rb3_parse_num(o.arg);     // chain --lift: projection agreement
 		else if (c == 339) {                                         // chain --lift: colinear-row policy
 			if (strcmp(o.arg, "ordinary") == 0) opt.diverged_rows = 0;
 			else if (strcmp(o.arg, "pav") == 0) opt.diverged_rows = 1;
@@ -1792,8 +1800,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    divergent to share a SMEM, so the coordinate is colinear and exact\n");
 			fprintf(stderr, "                    rather than a breakpoint: ordinary|pav|drop\n");
 			fprintf(stderr, "                    [ordinary = emit as a normal row at its exact position]\n");
-			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid, and require the\n");
-			fprintf(stderr, "                    seed's assembly projections to agree within it (0 = off) [%d]\n", opt.pav_grid);
+			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid; a breakpoint is\n");
+			fprintf(stderr, "                    approximate, so this is the resolution actually claimed\n");
+			fprintf(stderr, "                    (0 = emit the exact projected position) [%d]\n", opt.pav_grid);
+			fprintf(stderr, "  --pav-agree=NUM   max spread among the assemblies' projections of the seed before\n");
+			fprintf(stderr, "                    the read is suppressed as unplaceable [%d]\n", opt.pav_agree);
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);

@@ -255,8 +255,12 @@ Options:
 * `--chain-max-occ=INT` skip SMEMs whose FM interval exceeds this
   [auto: `min(2 × #samples, 256)`].
 * `--lift=FILE` enable PAV breakpoint anchoring (above).
-* `--pav-grid=NUM` snap the emitted breakpoint to this grid and require the seed's
-  assembly projections to agree within it [5000].
+* `--pav-grid=NUM` snap the emitted breakpoint to this grid. A breakpoint is
+  approximate, so this is the resolution actually being claimed; `0` emits the exact
+  projected position [5000].
+* `--pav-agree=NUM` maximum spread among the carrying assemblies' projections of the
+  anchor before the read is suppressed as unplaceable [5000]. Separate from
+  `--pav-grid`: one sets resolution, the other decides what is emitted at all.
 * `--pav-min-len=INT` minimum longest assembly-only SMEM required to emit a `pav:`
   row [60]. The assembly-only path has no colinear reference confirmation, so it
   needs a longer floor than `-l`.

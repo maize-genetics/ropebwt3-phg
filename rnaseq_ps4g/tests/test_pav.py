@@ -31,7 +31,7 @@ RB = os.path.abspath(os.path.join(HERE, "..", "..", "ropebwt3"))
 
 READ_LEN = 150
 STEP = 75
-GRID = 500          # --pav-grid; must be > 0. See test_grid_zero_is_stricter below.
+GRID = 500          # --pav-grid: reported-position resolution (independent of --pav-agree)
 TILED_GT = "CML247"  # the assembly reads are tiled from
 
 
@@ -183,13 +183,28 @@ def test_min_len_floor_suppresses_pav_rows(env):
         "reference-anchored rows were suppressed too"
 
 
-def test_grid_zero_is_stricter_not_looser(env):
-    """--pav-grid=0 does not mean "no constraint": with no grid the assembly
-    projections must instead agree within --gap-intron (30bp), which is far
-    tighter, so it emits FEWER rows. Pinned because the opposite is the natural
-    reading of the flag."""
-    assert len([r for r in run_chain(env, grid=0) if r["contig"].startswith("pav:")]) \
-        <= len([r for r in run_chain(env) if r["contig"].startswith("pav:")])
+def test_grid_changes_resolution_not_membership(env):
+    """--pav-grid sets the resolution of the reported position and nothing else.
+    It must not change WHICH reads are emitted, their assembly sets, or their
+    class -- only where they are reported. (It used to also set the agreement
+    threshold, which made --pav-grid=0 the strictest setting rather than the
+    loosest; the two are now separate knobs.)"""
+    snapped = run_chain(env, grid=GRID)
+    exact = run_chain(env, grid=0)
+    key = lambda rows: [(r["read"], r["set"], r["cls"]) for r in rows]
+    assert key(snapped) == key(exact), "grid changed which reads/sets were emitted"
+    assert [r["pos"] for r in snapped] != [r["pos"] for r in exact], \
+        "grid did not change the reported positions at all"
+
+
+def test_agree_suppresses_when_tightened(env):
+    """--pav-agree is the suppression knob: an assembly's projections of the seed
+    must fall within it. Tightening it can only remove rows, never add them."""
+    loose = [r for r in run_chain(env, extra=["--pav-agree=50000"])
+             if r["contig"].startswith("pav:")]
+    tight = [r for r in run_chain(env, extra=["--pav-agree=30"])
+             if r["contig"].startswith("pav:")]
+    assert len(tight) <= len(loose)
 
 
 # --------------------------------------------------------------------------- #
