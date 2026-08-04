@@ -272,7 +272,8 @@ def main():
     big_ins = []
     if a.pav_insert_n > 0:
         cand = [r0 for (r0, r1, kind) in regions
-                if kind == "intergenic" and r1 - r0 > a.read_len * 4]
+                if kind == "intergenic" and r1 - r0 > a.read_len * 4
+                and r0 > a.read_len]     # need reference sequence flanking the breakpoint
         rng.shuffle(cand)
         for locus in cand[:a.pav_insert_n]:
             carriers = [g for g in nonref if rng.random() < a.pav_insert_share]
