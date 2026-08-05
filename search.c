@@ -69,6 +69,7 @@ typedef struct {
 	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
 	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
 	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
+	int8_t asm_anchors;    // chain --lift: admit assembly-only SMEMs as anchors; see chain_emit
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -89,6 +90,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
 	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
 	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
+	opt->asm_anchors = 0;       // off: changes which gametes an ordinary chain row reports
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -1322,6 +1324,72 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
 	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }
 	if (n == 0) { free(cs); for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos); return; }
+	// Second pass: admit assembly-only SMEMs as anchors by projecting them through the liftover,
+	// the way refmap --lift places a read that never touches the reference.
+	//
+	// Why this exists. The first pass drops every SMEM with no reference occurrence, so each
+	// surviving anchor contains the reference gamete by construction -- and so does their
+	// intersection. Measured on a Ki3 x Mo18W RNAseq hybrid, where B73 contributes no reads at
+	// all: B73 appears in 100% of ordinary chain rows, above both true parents, which makes any
+	// founder-set or affinity estimate built from these rows name the reference first. refmap
+	// --lift has never had this bias because it places by lifting whichever assembly hit exists
+	// rather than requiring a reference one. The dropped SMEMs are also the founder-specific
+	// ones: on 3'-tag RNAseq the reference-hitting SMEMs sit in conserved exons and name 18 of 25
+	// assemblies on average, while the assembly-only ones name ~6.
+	//
+	// Same consensus + dispersion test as chain_emit_pav: project every occurrence, require a
+	// majority on one reference sequence and agreement within --pav-agree, and take the median.
+	// A SMEM whose own occurrences disagree about where it is cannot anchor anything. The
+	// --pav-min-len floor and the low-complexity screen apply for the same reason they do there.
+	if (p->opt->asm_anchors && p->lift) {
+		for (i = 0; i < s->n_mem && n < s->n_mem; ++i) {
+			m_sai_pos_t *r = &s->mem[i];
+			int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, k, ng = 0, is_ref_mem = 0;
+			int64_t prs[RB3_CHAIN_PAV_NPROJ], prp[RB3_CHAIN_PAV_NPROJ], v[RB3_CHAIN_PAV_NPROJ];
+			int32_t np = 0, nmaj = 0, bestn = 0;
+			int64_t best_rsid = -1, med = 0, disp = 0;
+			int32_t *g;
+			if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+			for (k = 0; k < r->n_pos; ++k)
+				if (p->is_ref[r->pos[k].sid>>1]) { is_ref_mem = 1; break; }
+			if (is_ref_mem) continue;                              // already anchored in pass 1
+			// -l, NOT --pav-min-len. That 60bp floor exists because a pav: breakpoint has no
+			// colinear reference confirmation; an anchor here is confirmed by the projection
+			// consensus below and by having to fit the chain's colinear DP, so it does not need
+			// the same floor. Measured on 200k 3'-tag reads of a Ki3 x Mo18W hybrid, where B73
+			// contributes no reads: at the 60bp floor B73 sits 1.85 pts ABOVE the mean of the two
+			// true parents, at -l (31) it sits 0.90 pts below, and 4.4% more rows are emitted.
+			if (en - st < p->opt->min_len) continue;               // specificity floor
+			if (pav_low_complexity(s, st, en)) continue;
+			for (k = 0; k < r->n_pos && np < RB3_CHAIN_PAV_NPROJ; ++k) {
+				int64_t rsid, rpos;
+				if (!rb3_lift_project(p->lift, km, (int32_t)(r->pos[k].sid>>1),
+									  pav_fwd_pos(f, &r->pos[k], en - st),
+									  RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos)) continue;
+				prs[np] = rsid, prp[np] = rpos, ++np;
+			}
+			for (k = 0; k < np; ++k) {                             // majority reference sequence
+				int32_t c = 0;
+				for (j = 0; j < np; ++j) if (prs[j] == prs[k]) ++c;
+				if (c > bestn) bestn = c, best_rsid = prs[k];
+			}
+			for (k = 0; k < np; ++k) if (prs[k] == best_rsid) v[nmaj++] = prp[k];
+			for (k = 1; k < nmaj; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
+			if (nmaj == 0 || bestn != np) continue;                // occurrences disagree on the locus
+			med = v[nmaj >> 1];
+			for (k = 0; k < nmaj; ++k) { int64_t d = llabs(v[k] - med); if (d > disp) disp = d; }
+			if (disp > p->opt->pav_agree) continue;
+			g = RB3_MALLOC(int32_t, r->n_pos);
+			for (k = 0; k < r->n_pos; ++k) g[ng++] = gt->sid2g[r->pos[k].sid>>1];
+			qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
+			{ int32_t m = 0; for (k = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k]; ng = m; }
+			cs[n].qs = st, cs[n].qe = en, cs[n].rpos = med, cs[n].rsid = (int32_t)best_rsid;
+			cs[n].rstrand = strand;      // colinear with the read's own dominant strand
+			cs[n].n_ref = 1;             // one consensus locus, so not ambiguous by the n_ref test
+			cs[n].gam = g, cs[n].n_gam = ng;
+			++n;
+		}
+	}
 	qsort(cs, n, sizeof(chain_sm_t), chain_cmp_sm);
 	for (i = 0; i < n; ++i) cs[i].anch = 1, cs[i].sc = (int64_t)(cs[i].qe - cs[i].qs) * 100, cs[i].prev = -1;
 	for (i = 0; i < n; ++i) { // colinear in-order DP: maximize (#anchors, bases - gap_penalty)
@@ -1622,6 +1690,7 @@ static ko_longopt_t long_options[] = {
 	{ "ref-fasta",       ko_required_argument, 333 },
 	{ "splice-min",      ko_required_argument, 334 },
 	{ "pav-min-len",     ko_required_argument, 335 },
+	{ "asm-anchors",     ko_no_argument,       341 },
 	{ "walk",            ko_no_argument,       336 },
 	{ "trim-polya",      ko_required_argument, 337 },
 	{ "pav-grid",        ko_required_argument, 338 },
@@ -1707,6 +1776,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 333) opt.ref_fasta = o.arg;                    // chain: reference FASTA -> GT-AG splice check
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
 		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: assembly-only specificity floor
+		else if (c == 341) opt.asm_anchors = 1;                      // chain --lift: assembly-only SMEMs may anchor
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
 		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
@@ -1808,6 +1878,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --asm-anchors     let assembly-only SMEMs anchor a chain, placed via --lift.\n");
+			fprintf(stderr, "                    Without it only reference-hitting SMEMs anchor, so the reference\n");
+			fprintf(stderr, "                    gamete is in every ordinary row by construction [off]\n");
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
