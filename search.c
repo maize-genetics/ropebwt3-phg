@@ -70,6 +70,7 @@ typedef struct {
 	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
 	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
 	int8_t asm_anchors;    // chain --lift: admit assembly-only SMEMs as anchors; see chain_emit
+	int8_t asm_constrain;  // chain --lift: intersect assembly-only SMEM gamete sets in (no coords)
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -91,6 +92,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
 	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
 	opt->asm_anchors = 0;       // off: changes which gametes an ordinary chain row reports
+	opt->asm_constrain = 0;     // off: same reason, and it is the stronger of the two
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -1022,6 +1024,12 @@ static int chain_canonical_splice(const char *refseq, int64_t reflen, int8_t str
 	return 0;
 }
 
+// --asm-anchors diagnostics: where assembly-only SMEMs are lost between "exists" and "anchors".
+// Reported once at the end of the run so the filters can be tuned against data rather than guessed.
+enum { RB3_ASM_READS, RB3_ASM_CAND, RB3_ASM_OCC, RB3_ASM_SHORT, RB3_ASM_LOWC,
+       RB3_ASM_NOPROJ, RB3_ASM_DISAGREE, RB3_ASM_OK, RB3_ASM_NSTAT };
+int64_t rb3_asm_stat[RB3_ASM_NSTAT];
+
 typedef struct {
 	int32_t qs, qe;       // query span
 	int64_t rpos;         // reference forward position of the chosen occurrence
@@ -1342,6 +1350,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	// A SMEM whose own occurrences disagree about where it is cannot anchor anything. The
 	// --pav-min-len floor and the low-complexity screen apply for the same reason they do there.
 	if (p->opt->asm_anchors && p->lift) {
+		__sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_READS], 1);
 		for (i = 0; i < s->n_mem && n < s->n_mem; ++i) {
 			m_sai_pos_t *r = &s->mem[i];
 			int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, k, ng = 0, is_ref_mem = 0;
@@ -1349,18 +1358,20 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int32_t np = 0, nmaj = 0, bestn = 0;
 			int64_t best_rsid = -1, med = 0, disp = 0;
 			int32_t *g;
-			if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+			if (r->n_pos == 0) continue;
 			for (k = 0; k < r->n_pos; ++k)
 				if (p->is_ref[r->pos[k].sid>>1]) { is_ref_mem = 1; break; }
 			if (is_ref_mem) continue;                              // already anchored in pass 1
+			__sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_CAND], 1);
+			if ((int64_t)r->mem.size > p->opt->chain_max_occ) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_OCC], 1); continue; }
 			// -l, NOT --pav-min-len. That 60bp floor exists because a pav: breakpoint has no
 			// colinear reference confirmation; an anchor here is confirmed by the projection
 			// consensus below and by having to fit the chain's colinear DP, so it does not need
 			// the same floor. Measured on 200k 3'-tag reads of a Ki3 x Mo18W hybrid, where B73
 			// contributes no reads: at the 60bp floor B73 sits 1.85 pts ABOVE the mean of the two
 			// true parents, at -l (31) it sits 0.90 pts below, and 4.4% more rows are emitted.
-			if (en - st < p->opt->min_len) continue;               // specificity floor
-			if (pav_low_complexity(s, st, en)) continue;
+			if (en - st < p->opt->min_len) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_SHORT], 1); continue; }
+			if (pav_low_complexity(s, st, en)) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_LOWC], 1); continue; }
 			for (k = 0; k < r->n_pos && np < RB3_CHAIN_PAV_NPROJ; ++k) {
 				int64_t rsid, rpos;
 				if (!rb3_lift_project(p->lift, km, (int32_t)(r->pos[k].sid>>1),
@@ -1375,10 +1386,12 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			}
 			for (k = 0; k < np; ++k) if (prs[k] == best_rsid) v[nmaj++] = prp[k];
 			for (k = 1; k < nmaj; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
-			if (nmaj == 0 || bestn != np) continue;                // occurrences disagree on the locus
+			if (np == 0) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_NOPROJ], 1); continue; }
+			if (nmaj == 0 || bestn != np) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_DISAGREE], 1); continue; }
 			med = v[nmaj >> 1];
 			for (k = 0; k < nmaj; ++k) { int64_t d = llabs(v[k] - med); if (d > disp) disp = d; }
-			if (disp > p->opt->pav_agree) continue;
+			if (disp > p->opt->pav_agree) { __sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_DISAGREE], 1); continue; }
+			__sync_fetch_and_add(&rb3_asm_stat[RB3_ASM_OK], 1);
 			g = RB3_MALLOC(int32_t, r->n_pos);
 			for (k = 0; k < r->n_pos; ++k) g[ng++] = gt->sid2g[r->pos[k].sid>>1];
 			qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
@@ -1430,6 +1443,37 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t *ivlo = RB3_MALLOC(int64_t, nc), *ivhi = RB3_MALLOC(int64_t, nc);
 			memcpy(acc, cs[chain[0]].gam, na * sizeof(int32_t));
 			for (i = 1; i < nc; ++i) na = chain_isect(acc, na, cs[chain[i]].gam, cs[chain[i]].n_gam);
+			// A SMEM does not need a COORDINATE to be evidence about which assemblies a read is
+			// consistent with. --asm-anchors can only use an assembly-only SMEM that projects to a
+			// colinear position and survives the DP -- measured, 1,957 of 13,031. The rest still
+			// say something: if part of the read exactly matches {Ki3,...} and not the reference,
+			// the reference is not consistent with the whole read wherever that part sits.
+			// --asm-constrain intersects their gamete sets in without making them anchors.
+			// Guarded: an intersection that would empty the set is discarded rather than applied,
+			// because an empty result means the SMEMs disagree (chimera, paralog, spurious short
+			// match) and the reference-anchored set is then the more defensible answer.
+			if (p->opt->asm_constrain && p->lift) {
+				for (i = 0; i < s->n_mem; ++i) {
+					m_sai_pos_t *r = &s->mem[i];
+					int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, k, ng = 0, isref = 0, na2;
+					int32_t *g, *tmp;
+					if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+					for (k = 0; k < r->n_pos; ++k)
+						if (p->is_ref[r->pos[k].sid>>1]) { isref = 1; break; }
+					if (isref) continue;
+					if (en - st < p->opt->min_len) continue;
+					if (pav_low_complexity(s, st, en)) continue;   // 0.0% source recall; see pav_low_complexity
+					g = RB3_MALLOC(int32_t, r->n_pos);
+					for (k = 0; k < r->n_pos; ++k) g[ng++] = gt->sid2g[r->pos[k].sid>>1];
+					qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
+					{ int32_t m = 0; for (k = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k]; ng = m; }
+					tmp = RB3_MALLOC(int32_t, na);
+					memcpy(tmp, acc, na * sizeof(int32_t));
+					na2 = chain_isect(tmp, na, g, ng);
+					if (na2 > 0) { memcpy(acc, tmp, na2 * sizeof(int32_t)); na = na2; }
+					free(tmp); free(g);
+				}
+			}
 			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
 				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
 				const char *contig = us? us + 1 : nm;
@@ -1691,6 +1735,7 @@ static ko_longopt_t long_options[] = {
 	{ "splice-min",      ko_required_argument, 334 },
 	{ "pav-min-len",     ko_required_argument, 335 },
 	{ "asm-anchors",     ko_no_argument,       341 },
+	{ "asm-constrain",   ko_no_argument,       342 },
 	{ "walk",            ko_no_argument,       336 },
 	{ "trim-polya",      ko_required_argument, 337 },
 	{ "pav-grid",        ko_required_argument, 338 },
@@ -1777,6 +1822,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
 		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: assembly-only specificity floor
 		else if (c == 341) opt.asm_anchors = 1;                      // chain --lift: assembly-only SMEMs may anchor
+		else if (c == 342) opt.asm_constrain = 1;                    // chain --lift: assembly-only SMEMs constrain the set
 		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
 		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
 		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
@@ -1881,6 +1927,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --asm-anchors     let assembly-only SMEMs anchor a chain, placed via --lift.\n");
 			fprintf(stderr, "                    Without it only reference-hitting SMEMs anchor, so the reference\n");
 			fprintf(stderr, "                    gamete is in every ordinary row by construction [off]\n");
+			fprintf(stderr, "  --asm-constrain   intersect assembly-only SMEM gamete sets into an ordinary row\n");
+			fprintf(stderr, "                    without requiring them to anchor. Stronger than --asm-anchors:\n");
+			fprintf(stderr, "                    needs no coordinate, only exact-match evidence [off]\n");
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
@@ -2063,6 +2112,12 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			break;
 		}
 		kt_pipeline(2, worker_pipeline, &p, 3);
+		if (opt.asm_anchors)
+			fprintf(stderr, "[M::main_search] --asm-anchors: %ld reads with a ref anchor; %ld assembly-only SMEMs "
+					"(too many occ %ld, too short %ld, low-complexity %ld, no projection %ld, disagreed %ld, ANCHORED %ld)\n",
+					(long)rb3_asm_stat[RB3_ASM_READS], (long)rb3_asm_stat[RB3_ASM_CAND], (long)rb3_asm_stat[RB3_ASM_OCC],
+					(long)rb3_asm_stat[RB3_ASM_SHORT], (long)rb3_asm_stat[RB3_ASM_LOWC], (long)rb3_asm_stat[RB3_ASM_NOPROJ],
+					(long)rb3_asm_stat[RB3_ASM_DISAGREE], (long)rb3_asm_stat[RB3_ASM_OK]);
 		rb3_seq_close(p.fp);
 	}
 	{
