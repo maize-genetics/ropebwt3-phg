@@ -75,6 +75,12 @@ typedef struct {
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
 	                    // extra output column (0 = off, opt-in -- see --report-occ)
+	int8_t anchor_dist_npy; // refmap --npy: also write a per-founder ternary read-sharing block
+	                    // (match/diverged/deletion) and a per-founder distance-to-nearest-lift-anchor
+	                    // block, widening --npy from (bin x gamete+2) to (bin x 3*gamete+2)
+	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
+	int64_t anchor_dist_thresh; // refmap --anchor-dist-npy: distance (bp) at/under which a
+	                    // non-matching founder reads as diverged rather than deletion
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -110,6 +116,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
 	opt->target_hits = 0; // off by default (read the whole input)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
+	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
+	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -144,6 +152,7 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
+	rb3_lift_ridx_t *lift_ridx; // refmap --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
@@ -1658,6 +1667,8 @@ static ko_longopt_t long_options[] = {
 	{ "pav-agree",       ko_required_argument, 340 },
 	{ "diverged-rows",       ko_required_argument, 339 },
 	{ "insertion-rows",      ko_required_argument, 342 },
+	{ "anchor-dist-npy",     ko_no_argument,       343 },
+	{ "anchor-dist-thresh",  ko_required_argument, 344 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1668,7 +1679,7 @@ static ko_longopt_t long_options[] = {
 
 int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 {
-	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0;
+	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0, ref_gamete = -1; // --anchor-dist-npy: gamete index of the reference genome, -1 if unknown
 	rb3_mopt_t opt;
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
@@ -1754,6 +1765,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			else if (strcmp(o.arg, "drop") == 0) opt.insertion_rows = 2;
 			else { fprintf(stderr, "ERROR: --insertion-rows must be ordinary|pav|drop\n"); return 1; }
 		}
+		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
+		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1821,6 +1834,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
+			fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
+			fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
+			fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
+			fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
+			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
+			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
+			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1910,7 +1930,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.ref_seq = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.lift_ridx = 0, p.ref_seq = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
@@ -1989,6 +2009,19 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.algo == RB3_SA_CHAIN || opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
 			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, the per-read PS4G file, and chain
+			if (opt.npy_fn && opt.anchor_dist_npy) {
+				int64_t k;
+				if (p.lift == 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --anchor-dist-npy requires --lift=FILE\n");
+					free(p.is_ref);
+					return 1;
+				}
+				for (k = 0; k < p.fmi.sid->n_seq; ++k) // any reference sequence's gamete is THE reference gamete
+					if (p.is_ref[k]) { ref_gamete = p.gtab->sid2g[k]; break; }
+				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
+			}
 			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
 				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);
 				if (n_load < 0) {
@@ -2051,7 +2084,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int32_t k;
 		rb3_sprintf_lite(&cmd, "ropebwt3");
 		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
-		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary,
+							  p.lift_ridx, opt.anchor_dist_thresh, ref_gamete, opt.ps4g_fn, opt.npy_fn, cmd.s);
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}
@@ -2065,6 +2099,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
+	rb3_lift_ridx_destroy(p.lift_ridx);
 	rb3_lift_destroy(p.lift);
 	return 0;
 }

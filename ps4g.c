@@ -306,6 +306,7 @@ static void write_npy_header(FILE *fp, int64_t rows, int64_t cols)
 
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
 							const rb3_bed_t *bed, int npy_binary,
+							const rb3_lift_ridx_t *ridx, int64_t anchor_thresh, int32_t ref_gamete,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command)
 {
 	ev_t *ev;
@@ -379,7 +380,14 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		// gameteSets sharing a bin. Aggregating different gameteSets into one row
 		// would discard exactly the co-occurrence information (which gametes were
 		// jointly supported by the same reads) that the imputation model needs.
-		int64_t cols = gtab->n_gamete + 2;
+		//
+		// With ridx: three n_gamete-wide blocks instead of one -- read-count/presence
+		// (unchanged), ternary read-sharing, distance-to-nearest-lift-anchor -- then
+		// the same trailing gA/gB label pair. See rb3_ps4g_npy_finalize's header
+		// comment (ps4g.h) for the exact per-column semantics.
+		int64_t n_g = gtab->n_gamete;
+		int64_t cols = ridx? 3 * n_g + 2 : n_g + 2;
+		int64_t label_off = ridx? 3 * n_g : n_g;
 		int32_t *mat = RB3_CALLOC(int32_t, n_row * cols);
 		FILE *fp;
 		char *aux_fn;
@@ -388,11 +396,26 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			int32_t k, val = npy_binary? 1 : (int32_t)row[i].count;
 			int32_t gA = -1, gB = -1;
 			int64_t pos = row[i].bin * acc->bin_size;
-			for (k = 0; k < row[i].glen; ++k)
-				mat[i * cols + acc->garena[row[i].goff + k]] = val;
+			const int32_t *gset = acc->garena + row[i].goff; // sorted ascending (rb3_ps4g_acc_add)
+			int32_t m = row[i].glen;
+			for (k = 0; k < m; ++k)
+				mat[i * cols + gset[k]] = val;
+			if (ridx) {
+				int32_t g;
+				for (g = 0; g < n_g; ++g) {
+					int in_set, lo = 0, hi = m;
+					int64_t dist; int8_t state;
+					while (lo < hi) { int32_t mid = (lo + hi) >> 1; if (gset[mid] < g) lo = mid + 1; else hi = mid; } // gset is sorted; binary search g
+					in_set = (lo < m && gset[lo] == g);
+					if (g == ref_gamete) { state = 1, dist = 0; } // reference has no liftover anchors by construction; not a real deletion
+					else { dist = rb3_lift_nearest_ref(ridx, g, row[i].ref_sid, pos); state = rb3_lift_ternary_state(in_set, dist, anchor_thresh); }
+					mat[i * cols + n_g + g] = state;
+					mat[i * cols + 2 * n_g + g] = (int32_t)dist;
+				}
+			}
 			if (bed) bed_lookup(bed, row[i].ref_sid, pos, &gA, &gB); // diploid training labels, -1 if unlabeled
-			mat[i * cols + gtab->n_gamete] = gA;
-			mat[i * cols + gtab->n_gamete + 1] = gB;
+			mat[i * cols + label_off] = gA;
+			mat[i * cols + label_off + 1] = gB;
 		}
 
 		fp = fopen(npy_fn, "wb");
@@ -421,6 +444,18 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			for (g = 0; g < gtab->n_gamete; ++g)
 				fprintf(fp, "%d\t%s\n", g, gtab->name[g]);
 			fclose(fp);
+		}
+		if (ridx) { // record the widened column layout for downstream readers -- only meaningful when ridx was used
+			sprintf(aux_fn, "%s.layout.tsv", npy_fn);
+			fp = fopen(aux_fn, "w");
+			if (fp) {
+				fprintf(fp, "block\tstart_col\tend_col\tmeaning\n");
+				fprintf(fp, "count\t0\t%ld\tread count (or presence if npy_binary), per founder\n", (long)n_g);
+				fprintf(fp, "ternary\t%ld\t%ld\tmatch(1)/diverged(0)/deletion(-1) per founder\n", (long)n_g, (long)(2 * n_g));
+				fprintf(fp, "distance\t%ld\t%ld\tbp to nearest lift anchor per founder (-1 = no anchor)\n", (long)(2 * n_g), (long)(3 * n_g));
+				fprintf(fp, "labels\t%ld\t%ld\tgA, gB diploid training labels (-1 = unlabeled)\n", (long)(3 * n_g), (long)(3 * n_g + 2));
+				fclose(fp);
+			}
 		}
 		free(aux_fn);
 		free(mat);

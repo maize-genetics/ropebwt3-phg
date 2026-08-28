@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "io.h" // for rb3_sid_t
+#include "lift.h" // for rb3_lift_ridx_t (--anchor-dist-npy)
 
 #ifdef __cplusplus
 extern "C" {
@@ -58,8 +59,22 @@ void rb3_bed_destroy(rb3_bed_t *b);
 // Contig names (PS4G refContig / npy bins.tsv) are always the bare contig part
 // of the reference sequence's own name (e.g. "B73_chr1" -> "chr1"), independent
 // of --ref-prefix -- row[].ref_sid is always a reference sequence already.
+//
+// ridx (may be NULL): when given, the npy matrix widens from (n_gamete+2) to
+// (3*n_gamete+2) columns -- the existing read-count/presence block, then a
+// per-founder ternary read-sharing block (match=1/diverged=0/deletion=-1, from
+// rb3_lift_ternary_state against a distance-thresh cutoff of anchor_thresh bp),
+// then a per-founder distance-to-nearest-lift-anchor block (-1 = no anchor on this
+// reference sequence), before the existing gA/gB label columns. ref_gamete (the
+// gamete index of the reference genome itself, or -1 if unknown/not applicable) is
+// always forced to ternary=match/distance=0 rather than run through the liftover
+// lookup, since the reference has zero liftover anchors by construction (it never
+// appears as an assembly/csid) and would otherwise read as spurious deletions. A
+// companion "<npy>.layout.tsv" sidecar recording the column layout is written
+// alongside the usual .bins.tsv/.gametes.tsv only when ridx is non-NULL.
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
 							const rb3_bed_t *bed, int npy_binary,
+							const rb3_lift_ridx_t *ridx, int64_t anchor_thresh, int32_t ref_gamete,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command);
 
 #ifdef __cplusplus
