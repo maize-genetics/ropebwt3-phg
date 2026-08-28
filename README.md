@@ -159,6 +159,12 @@ ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 
 # 2. place queries through it
 ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
+
+# 3. optional: also export a per-founder ternary read-sharing matrix and a
+#    per-founder distance-to-lift-anchor matrix, packed into the same --npy
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift \
+  --npy=pan.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  pan.fmd query.fa
 ```
 
 Output is one tab-separated line per query with columns: 1) query name, 2) query
@@ -173,6 +179,19 @@ repeat/retro) and is deliberately not placed.
 With `--report-occ`, one more column is appended: 12) `occ`, the pangenome-wide
 FM-index occurrence count (a copy-number signal), off by default — passing no
 flag reproduces today's output byte-for-byte.
+
+With `--npy=FILE --anchor-dist-npy` (step 3 above), the numpy array widens from
+`(n_gametes+2)` to `(3*n_gametes+2)` columns: the usual read-count/presence
+block, then a per-founder **ternary read-sharing** state (`1`=match,
+`0`=diverged, `-1`=deletion relative to reference), then a per-founder
+**distance to that founder's nearest `ropebwt3 lift` anchor**, in bp
+(`-1`=no anchor at all on this reference sequence), before the usual `gA`/`gB`
+diploid training labels. `--anchor-dist-thresh=NUM` sets the bp cutoff between
+diverged and deletion [2000, matching `ropebwt3 lift`'s default anchor stride
+`-s`]. The reference genome's own gamete always reads back as match/distance 0
+(it has zero liftover anchors by construction). A `<npy>.layout.tsv` sidecar
+records the exact column ranges; `--npy` without `--anchor-dist-npy` is
+unchanged.
 
 Options:
 
@@ -194,6 +213,11 @@ Options:
   whole read set.
 * `--report-occ` appends a pangenome-wide occurrence-count ("copy number")
   column, off by default (opt-in).
+* `--anchor-dist-npy` (with `--npy` and `--lift`) widens the numpy array with
+  a per-founder ternary read-sharing block and a per-founder
+  distance-to-nearest-lift-anchor block, off by default (opt-in; see above).
+  `--anchor-dist-thresh=NUM` sets the diverged/deletion distance cutoff in bp
+  [2000].
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
