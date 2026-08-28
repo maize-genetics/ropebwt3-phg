@@ -69,10 +69,18 @@ typedef struct {
 	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
 	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
 	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
+	int8_t insertion_rows; // chain --lift: insertion rows: 0 = ordinary row (exact median, no snap),
+	                       // 1 = pav: row (grid-snapped, DEFAULT -- unchanged existing behavior), 2 = drop
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
 	                    // extra output column (0 = off, opt-in -- see --report-occ)
+	int8_t anchor_dist_npy; // refmap --npy: also write a per-founder ternary read-sharing block
+	                    // (match/diverged/deletion) and a per-founder distance-to-nearest-lift-anchor
+	                    // block, widening --npy from (bin x gamete+2) to (bin x 3*gamete+2)
+	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
+	int64_t anchor_dist_thresh; // refmap --anchor-dist-npy: distance (bp) at/under which a
+	                    // non-matching founder reads as diverged rather than deletion
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -89,6 +97,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
 	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
 	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
+	opt->insertion_rows = 1;    // pav: row, grid-snapped -- matches pre-existing chain_emit_pav behavior
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -107,6 +116,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
 	opt->target_hits = 0; // off by default (read the whole input)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
+	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
+	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -141,6 +152,7 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
+	rb3_lift_ridx_t *lift_ridx; // refmap --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
@@ -1248,6 +1260,25 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			if (!is_insertion) {
 				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
 				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
+					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
+					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+					putchar('\n');
+					goto pav_done;
+				}
+			} else {
+				// --insertion-rows: same routing as --diverged-rows, but for TRUE insertions. The
+				// "ordinary" choice places the read inline on its real reference contig at the exact
+				// (unsnapped) median -- this is MORE precise than the grid-snapped pav: row below,
+				// which floors rather than centers (bp = med/grid*grid). It exists because the
+				// downstream windower groups PS4G/npy rows by contig (ropebwt_npy_to_matrix.py), so a
+				// `pav:chr1` row is a separate pseudo-chromosome disconnected from `chr1` -- "ordinary"
+				// keeps insertion evidence positionally inline with everything else on the real contig.
+				// DEFAULT stays `pav` (grid-snapped, prefixed): this branch changes nothing unless
+				// explicitly requested.
+				if (p->opt->insertion_rows == 2) goto pav_done;          // drop
+				if (p->opt->insertion_rows == 0) {                       // ordinary row, exact median, no snap
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
 					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
 					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 					putchar('\n');
@@ -1261,6 +1292,12 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// showed source recall is 100% in every spread bucket, i.e. the assembly sets are
 			// right and only the aggregation key moved. 5 kb -> 72% of insertions in one bin.
 			int64_t bp = p->opt->pav_grid > 0? med / p->opt->pav_grid * p->opt->pav_grid : med;
+			// PS4G/npy accumulate under the REAL ref_sid + snapped bp -- the accumulator has no
+			// concept of the `pav:` contig prefix (it is stdout-only, added at
+			// rb3_ps4g_npy_finalize/ps4g.c time from sid->name), so this shares bins with ordinary
+			// rows on the same contig at the same coarse position. Known gap, not resolved here --
+			// see the design note on --insertion-rows above; --insertion-rows=ordinary avoids it.
+			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, bp, acc, na);
 			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
 			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
@@ -1373,12 +1410,14 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 				lo = ivlo[0], hi = ivhi[0];
 				for (i = 1; i < nc; ++i) {
 					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
+						if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
 						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 						putchar('\n');
 						lo = ivlo[i], hi = ivhi[i];
 					} else if (ivhi[i] > hi) hi = ivhi[i];
 				}
+				if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
 				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 				putchar('\n');
@@ -1615,7 +1654,7 @@ static ko_longopt_t long_options[] = {
 	{ "bin-size",        ko_required_argument, 323 },
 	{ "npy-binary",      ko_no_argument,       324 },
 	{ "target-hits",     ko_required_argument, 325 },
-	{ "report-occ",      ko_no_argument,       326 },
+	{ "report-occ",      ko_no_argument,       341 },
 	{ "max-intron",      ko_required_argument, 330 },
 	{ "gap-intron",      ko_required_argument, 331 },
 	{ "chain-max-occ",   ko_required_argument, 332 },
@@ -1627,6 +1666,9 @@ static ko_longopt_t long_options[] = {
 	{ "pav-grid",        ko_required_argument, 338 },
 	{ "pav-agree",       ko_required_argument, 340 },
 	{ "diverged-rows",       ko_required_argument, 339 },
+	{ "insertion-rows",      ko_required_argument, 342 },
+	{ "anchor-dist-npy",     ko_no_argument,       343 },
+	{ "anchor-dist-thresh",  ko_required_argument, 344 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1637,7 +1679,7 @@ static ko_longopt_t long_options[] = {
 
 int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 {
-	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0;
+	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0, ref_gamete = -1; // --anchor-dist-npy: gamete index of the reference genome, -1 if unknown
 	rb3_mopt_t opt;
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
@@ -1700,7 +1742,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
 		else if (c == 324) opt.npy_binary = 1; // npy: write presence (1) instead of read counts
 		else if (c == 325) opt.target_hits = rb3_parse_num(o.arg); // stop once this many PLACED+EXACT records are written
-		else if (c == 326) opt.report_occ = 1; // append raw FM-index interval size (occurrence count) as an extra column
+		else if (c == 341) opt.report_occ = 1; // append raw FM-index interval size (occurrence count) as an extra column
 		else if (c == 330) opt.max_intron = rb3_parse_num(o.arg);    // chain: max unexplained ref jump per link
 		else if (c == 331) opt.gap_intron = atoi(o.arg);             // chain: ref gap that starts a new exon segment
 		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
@@ -1717,6 +1759,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			else if (strcmp(o.arg, "drop") == 0) opt.diverged_rows = 2;
 			else { fprintf(stderr, "ERROR: --diverged-rows must be ordinary|pav|drop\n"); return 1; }
 		}
+		else if (c == 342) {                                         // chain --lift: insertion-row policy
+			if (strcmp(o.arg, "ordinary") == 0) opt.insertion_rows = 0;
+			else if (strcmp(o.arg, "pav") == 0) opt.insertion_rows = 1;
+			else if (strcmp(o.arg, "drop") == 0) opt.insertion_rows = 2;
+			else { fprintf(stderr, "ERROR: --insertion-rows must be ordinary|pav|drop\n"); return 1; }
+		}
+		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
+		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1784,6 +1834,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
+			fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
+			fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
+			fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
+			fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
+			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
+			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
+			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1800,6 +1857,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    divergent to share a SMEM, so the coordinate is colinear and exact\n");
 			fprintf(stderr, "                    rather than a breakpoint: ordinary|pav|drop\n");
 			fprintf(stderr, "                    [ordinary = emit as a normal row at its exact position]\n");
+			fprintf(stderr, "  --insertion-rows=STR  TRUE INSERTION rows -- same routing as --diverged-rows, but\n");
+			fprintf(stderr, "                    for reads absent from the reference: ordinary|pav|drop\n");
+			fprintf(stderr, "                    [pav = grid-snapped, prefixed `pav:<contig>` (default, unchanged)]\n");
+			fprintf(stderr, "                    ordinary emits the read inline on its real contig at the exact\n");
+			fprintf(stderr, "                    (unsnapped) median -- more precise than pav-grid snapping (which\n");
+			fprintf(stderr, "                    floors, not centers) and keeps evidence positionally inline with\n");
+			fprintf(stderr, "                    ordinary rows for windowing, at the cost of the `pav:` marker\n");
 			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid; a breakpoint is\n");
 			fprintf(stderr, "                    approximate, so this is the resolution actually claimed\n");
 			fprintf(stderr, "                    (0 = emit the exact projected position) [%d]\n", opt.pav_grid);
@@ -1812,6 +1876,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
+			fprintf(stderr, "  --ps4g=FILE       write PS4G v2.0 gamete-support counts, aggregated over all rows\n");
+			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
+			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
+			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
+			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -1861,7 +1930,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.ref_seq = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.lift_ridx = 0, p.ref_seq = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
@@ -1940,6 +2009,19 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.algo == RB3_SA_CHAIN || opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
 			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, the per-read PS4G file, and chain
+			if (opt.npy_fn && opt.anchor_dist_npy) {
+				int64_t k;
+				if (p.lift == 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --anchor-dist-npy requires --lift=FILE\n");
+					free(p.is_ref);
+					return 1;
+				}
+				for (k = 0; k < p.fmi.sid->n_seq; ++k) // any reference sequence's gamete is THE reference gamete
+					if (p.is_ref[k]) { ref_gamete = p.gtab->sid2g[k]; break; }
+				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
+			}
 			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
 				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);
 				if (n_load < 0) {
@@ -1972,7 +2054,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 	} else if (opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn || opt.label_bed_fn || opt.target_hits > 0) {
-		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap\n");
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap/chain\n");
 		return 1;
 	}
 	if (opt.algo == RB3_SA_CHAIN) puts("readName\trefContig\trefPos\tgameteSet");
@@ -2002,7 +2084,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int32_t k;
 		rb3_sprintf_lite(&cmd, "ropebwt3");
 		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
-		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary,
+							  p.lift_ridx, opt.anchor_dist_thresh, ref_gamete, opt.ps4g_fn, opt.npy_fn, cmd.s);
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}
@@ -2016,6 +2099,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
+	rb3_lift_ridx_destroy(p.lift_ridx);
 	rb3_lift_destroy(p.lift);
 	return 0;
 }

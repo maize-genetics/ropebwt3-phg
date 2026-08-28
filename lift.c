@@ -331,6 +331,102 @@ int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cp
 	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode);
 }
 
+/* ---- reference-position index (nearest-anchor queries) ----------------- */
+
+// rb3_lift_t.pt[] is sorted by (csid,cpos) -- fine for the carrier-side projection
+// in lift_project_core, but useless for "nearest anchor to reference position X for
+// founder G", which is what a per-founder read-sharing/distance feature needs. This
+// builds a second index over the SAME points: perm[] is a permutation of point
+// indices into lf->pt, bucketed by (gamete,rsid) and sorted by rpos within each
+// bucket, via a two-pass counting sort (same off[]-then-place idiom as
+// lift_builder_finalize's own (csid)-keyed off[] above) followed by one qsort per
+// bucket. off[] has n_gamete*n_seq+1 entries; most (gamete,rsid) combinations are
+// empty (a founder only ever has anchors on its own chromosomes) but at real panel
+// sizes (~25 gametes x ~24000 sequences) that's a few MB, not worth compacting.
+struct rb3_lift_ridx_s {
+	int32_t n_gamete;
+	int64_t n_seq;   // == lf->n_seq; also the per-gamete bucket count (indexed by rsid)
+	int64_t *off;    // off[g*n_seq+rsid]..off[g*n_seq+rsid+1] = range in perm[]
+	int32_t *perm;   // n_pt entries: index into lf->pt, bucketed by (g,rsid), sorted by rpos
+	const rb3_lift_t *lf; // NOT owned; caller must keep lf alive at least as long as this index
+};
+
+static const rb3_liftpt_t *ridx_sort_pt; // scratch for ridx_perm_cmp during the single-threaded per-bucket sort below
+
+static int ridx_perm_cmp(const void *a, const void *b)
+{
+	int64_t xa = ridx_sort_pt[*(const int32_t*)a].rpos;
+	int64_t xb = ridx_sort_pt[*(const int32_t*)b].rpos;
+	return xa < xb? -1 : xa > xb? 1 : 0;
+}
+
+rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g, int32_t n_gamete)
+{
+	rb3_lift_ridx_t *ridx;
+	int64_t i, n_buckets, *cursor;
+	if (lf == 0 || sid2g == 0 || n_gamete <= 0) return 0;
+	ridx = RB3_CALLOC(rb3_lift_ridx_t, 1);
+	ridx->n_gamete = n_gamete;
+	ridx->n_seq = lf->n_seq;
+	ridx->lf = lf;
+	n_buckets = (int64_t)n_gamete * lf->n_seq;
+	ridx->off = RB3_CALLOC(int64_t, n_buckets + 1);
+	ridx->perm = RB3_MALLOC(int32_t, lf->n_pt > 0? lf->n_pt : 1);
+	for (i = 0; i < lf->n_pt; ++i) { // pass 1: bucket sizes -> off[key+1]
+		int32_t g = sid2g[lf->pt[i].csid];
+		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
+		ridx->off[key + 1]++;
+	}
+	for (i = 0; i < n_buckets; ++i) ridx->off[i+1] += ridx->off[i]; // prefix sum
+	cursor = RB3_MALLOC(int64_t, n_buckets);
+	memcpy(cursor, ridx->off, n_buckets * sizeof(int64_t));
+	for (i = 0; i < lf->n_pt; ++i) { // pass 2: place into perm[] via the cursor
+		int32_t g = sid2g[lf->pt[i].csid];
+		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
+		ridx->perm[cursor[key]++] = (int32_t)i;
+	}
+	free(cursor);
+	ridx_sort_pt = lf->pt; // pass 3: sort each bucket's slice of perm[] by rpos
+	for (i = 0; i < n_buckets; ++i) {
+		int64_t lo = ridx->off[i], hi = ridx->off[i+1];
+		if (hi - lo > 1) qsort(ridx->perm + lo, hi - lo, sizeof(int32_t), ridx_perm_cmp);
+	}
+	return ridx;
+}
+
+void rb3_lift_ridx_destroy(rb3_lift_ridx_t *ridx)
+{
+	if (ridx == 0) return;
+	free(ridx->off); free(ridx->perm); free(ridx);
+}
+
+int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_t rsid, int64_t rpos)
+{
+	int64_t key, lo, hi, l, r, best = -1;
+	if (ridx == 0 || gamete < 0 || gamete >= ridx->n_gamete || rsid < 0 || rsid >= ridx->n_seq) return -1;
+	key = (int64_t)gamete * ridx->n_seq + rsid;
+	lo = ridx->off[key], hi = ridx->off[key + 1];
+	if (hi <= lo) return -1; // this gamete has no anchor at all on this reference sequence
+	l = lo, r = hi; // first index with pt[perm[idx]].rpos >= rpos
+	while (l < r) {
+		int64_t mid = (l + r) >> 1;
+		if (ridx->lf->pt[ridx->perm[mid]].rpos < rpos) l = mid + 1; else r = mid;
+	}
+	if (l < hi) best = ridx->lf->pt[ridx->perm[l]].rpos - rpos;       // nearest anchor at/after rpos
+	if (l > lo) {                                                     // nearest anchor before rpos
+		int64_t d = rpos - ridx->lf->pt[ridx->perm[l-1]].rpos;
+		if (best < 0 || d < best) best = d;
+	}
+	return best;
+}
+
+int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh)
+{
+	if (in_gameteset) return 1;
+	if (dist >= 0 && dist <= thresh) return 0;
+	return -1;
+}
+
 /* ---- the `lift` subcommand (build + dump) ------------------------------ */
 
 int main_lift(int argc, char *argv[])

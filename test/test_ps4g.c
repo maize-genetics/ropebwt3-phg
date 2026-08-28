@@ -174,8 +174,8 @@ static void test_finalize(const char *outdir)
 	CHECK(bed != 0, "finalize: BED fixture parsed");
 	CHECK(bed && bed->n_r == 2, "finalize: BED has 2 regions");
 
-	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/0, ps4g_fn, npy_fn, "unit-test-cmd");
-	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/1, 0, npy_bin_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/0, /*ridx=*/0, /*anchor_thresh=*/0, /*ref_gamete=*/-1, ps4g_fn, npy_fn, "unit-test-cmd");
+	rb3_ps4g_npy_finalize(acc, g, sid, bed, /*npy_binary=*/1, /*ridx=*/0, /*anchor_thresh=*/0, /*ref_gamete=*/-1, 0, npy_bin_fn, "unit-test-cmd");
 
 	// ---- PS4G file ----
 	fp = fopen(ps4g_fn, "r");

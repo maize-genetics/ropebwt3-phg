@@ -159,6 +159,12 @@ ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 
 # 2. place queries through it
 ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
+
+# 3. optional: also export a per-founder ternary read-sharing matrix and a
+#    per-founder distance-to-lift-anchor matrix, packed into the same --npy
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift \
+  --npy=pan.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  pan.fmd query.fa
 ```
 
 Output is one tab-separated line per query with columns: 1) query name, 2) query
@@ -173,6 +179,19 @@ repeat/retro) and is deliberately not placed.
 With `--report-occ`, one more column is appended: 12) `occ`, the pangenome-wide
 FM-index occurrence count (a copy-number signal), off by default — passing no
 flag reproduces today's output byte-for-byte.
+
+With `--npy=FILE --anchor-dist-npy` (step 3 above), the numpy array widens from
+`(n_gametes+2)` to `(3*n_gametes+2)` columns: the usual read-count/presence
+block, then a per-founder **ternary read-sharing** state (`1`=match,
+`0`=diverged, `-1`=deletion relative to reference), then a per-founder
+**distance to that founder's nearest `ropebwt3 lift` anchor**, in bp
+(`-1`=no anchor at all on this reference sequence), before the usual `gA`/`gB`
+diploid training labels. `--anchor-dist-thresh=NUM` sets the bp cutoff between
+diverged and deletion [2000, matching `ropebwt3 lift`'s default anchor stride
+`-s`]. The reference genome's own gamete always reads back as match/distance 0
+(it has zero liftover anchors by construction). A `<npy>.layout.tsv` sidecar
+records the exact column ranges; `--npy` without `--anchor-dist-npy` is
+unchanged.
 
 Options:
 
@@ -194,6 +213,11 @@ Options:
   whole read set.
 * `--report-occ` appends a pangenome-wide occurrence-count ("copy number")
   column, off by default (opt-in).
+* `--anchor-dist-npy` (with `--npy` and `--lift`) widens the numpy array with
+  a per-founder ternary read-sharing block and a per-founder
+  distance-to-nearest-lift-anchor block, off by default (opt-in; see above).
+  `--anchor-dist-thresh=NUM` sets the diverged/deletion distance cutoff in bp
+  [2000].
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
@@ -232,16 +256,28 @@ ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 ropebwt3 chain --ref-prefix=B73 --lift pan.lift -l 31 -t 20 pan.fmd reads.fq
 ```
 
-This adds a fifth column naming the row class:
+This adds a fifth column naming the row class, when the row is emitted with the
+`pav:` schema (see `--insertion-rows` below):
 
-* **`1` = insertion** — absent from the reference. The contig is prefixed `pav:`
-  and the position is the nearest breakpoint, snapped to `--pav-grid` (default
-  5000). This is **presence/absence evidence only**: the coordinate is deliberately
-  coarse, because a breakpoint is not a base-level position.
+* **`1` = insertion** — absent from the reference. By default the contig is
+  prefixed `pav:` and the position is the nearest breakpoint, snapped to
+  `--pav-grid` (default 5000). This is **presence/absence evidence only**: the
+  coordinate is deliberately coarse, because a breakpoint is not a base-level
+  position. `--insertion-rows=ordinary` instead emits it as an ordinary row at
+  the exact (unsnapped) median projected position — see below.
 * **`0` = diverged** — present in the reference but too divergent to share an exact
   match. The coordinate is colinear and exact, so by default these are emitted as
   **ordinary rows** (no `pav:` prefix, no snapping) and need no special handling
   downstream. `--diverged-rows=ordinary|pav|drop` changes that.
+
+`--ps4g`, `--npy`, `--label-bed`, `--bin-size`, and `--npy-binary` (documented
+under [`refmap`](#refmap) above) apply to `chain` too: every row shown on stdout,
+`pav:`-prefixed or not, folds into the same PS4G/npy accumulator. The
+accumulator itself has no concept of the `pav:` prefix — it always keys on the
+row's real reference sequence and (possibly grid-snapped) position, so a `pav:`
+row and an ordinary row landing on the same contig/bin/gameteSet are
+indistinguishable once aggregated. `--insertion-rows=ordinary` avoids the
+ambiguity by construction, since it never emits a coarse, prefix-only row.
 
 Options:
 
@@ -265,6 +301,13 @@ Options:
   row [60]. The assembly-only path has no colinear reference confirmation, so it
   needs a longer floor than `-l`.
 * `--diverged-rows=STR` routing for diverged rows [ordinary].
+* `--insertion-rows=STR` routing for true-insertion rows: `ordinary` emits the
+  read inline on its real contig at the exact (unsnapped) median — more precise
+  than the grid-snapped `pav:` row, since `--pav-grid` floors rather than
+  centers, and it keeps the evidence positionally inline with ordinary rows for
+  downstream per-contig windowing; `pav` is the grid-snapped, `pav:`-prefixed
+  row (**default**, unchanged from prior behavior); `drop` discards the row
+  entirely [pav].
 * `--trim-polya=INT` trim a terminal poly-A/poly-T run before searching [0 = off].
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
