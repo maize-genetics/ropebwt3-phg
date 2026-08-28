@@ -36,7 +36,7 @@ static int usage(FILE *fp)
 	fprintf(fp, "    merge      merge BWTs\n");
 	fprintf(fp, "    plain2fmd  convert BWT in plain text to FMD\n");
 	fprintf(fp, "    ssa        generate sampled suffix array\n");
-	fprintf(fp, "    lift       build carrier->reference liftover for refmap --lift\n");
+	fprintf(fp, "    lift       build assembly->reference liftover for refmap --lift\n");
 	fprintf(fp, "  Miscellaneous:\n");
 	fprintf(fp, "    get        retrieve the i-th sequence from BWT\n");
 	fprintf(fp, "    stat       basic statistics of BWT\n");
@@ -85,7 +85,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, " %s", argv[i]);
 		fprintf(stderr, "\n[M::%s] Real time: %.3f sec; CPU: %.3f sec; Peak RSS: %.3f GB\n", __func__, rb3_realtime(), rb3_cputime(), rb3_peakrss() / 1024.0 / 1024.0 / 1024.0);
 	}
-	return 0;
+	return ret;   // every subcommand's status was computed and then discarded: errors exited 0
 }
 
 int main_merge(int argc, char *argv[])

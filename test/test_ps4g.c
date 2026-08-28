@@ -274,7 +274,7 @@ static void test_finalize(const char *outdir)
 // stray leading '_' ("_chr1") whenever --ref-prefix didn't itself include the
 // separator -- exactly the convention this project's own scripts use
 // (--ref-prefix=B73, not "B73_"). Two sequences share the bare contig name
-// "chr1" here (a reference and a carrier) to also confirm the fix doesn't
+// "chr1" here (a reference and a assembly) to also confirm the fix doesn't
 // accidentally resolve a BED region to the wrong (non-reference) sequence.
 static void test_bed_contig_resolution(const char *outdir)
 {
@@ -287,7 +287,7 @@ static void test_bed_contig_resolution(const char *outdir)
 	sid->name = RB3_MALLOC(char*, 2);
 	sid->len = RB3_CALLOC(int32_t, 2);
 	sid->name[0] = rb3_strdup("B73_chr1");  // reference
-	sid->name[1] = rb3_strdup("Oh43_chr1"); // carrier; same bare contig name "chr1"
+	sid->name[1] = rb3_strdup("Oh43_chr1"); // assembly; same bare contig name "chr1"
 
 	g = rb3_gtab_build(sid);
 	snprintf(bed_fn, sizeof(bed_fn), "%s/bed_contig_resolution.bed", outdir);
@@ -299,7 +299,7 @@ static void test_bed_contig_resolution(const char *outdir)
 	CHECK(bed != 0, "bed_resolve_contig: fixture parsed");
 	CHECK(bed && bed->n_r == 1, "bed_resolve_contig: one region parsed");
 	CHECK(bed && bed->n_r == 1 && bed->r[0].ref_sid == 0,
-		  "bed_resolve_contig: 'chr1' with --ref-prefix=B73 (no '_') resolves to the reference sequence (0), not the carrier (1) sharing the same bare contig name, and not -1 (unresolved)");
+		  "bed_resolve_contig: 'chr1' with --ref-prefix=B73 (no '_') resolves to the reference sequence (0), not the assembly (1) sharing the same bare contig name, and not -1 (unresolved)");
 
 	rb3_bed_destroy(bed);
 	rb3_gtab_destroy(g);

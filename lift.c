@@ -1,20 +1,20 @@
-/* lift.c -- the "second SSA": a carrier->reference coordinate liftover for refmap.
+/* lift.c -- the "second SSA": a assembly->reference coordinate liftover for refmap.
  *
  * Motivation (see docs/results-maize.md, experiment E4): placing a query that is
- * absent from the reference by WALKING outward through carriers is slow and its
+ * absent from the reference by WALKING outward through assemblies is slow and its
  * single-anchor fallback is inaccurate. Instead, precompute a coordinate map from
- * every carrier genome to the reference, built from unique shared anchors, and at
- * query time PROJECT a carrier hit to an approximate reference coordinate. Where
+ * every assembly genome to the reference, built from unique shared anchors, and at
+ * query time PROJECT a assembly hit to an approximate reference coordinate. Where
  * no confident projection exists we return "no position" (NULL) rather than guess,
  * which keeps precision.
  *
  * Build: slide a k-mer along the reference sequences; for every k-mer that occurs
  * few enough times (<= max_occ, i.e. single-copy-per-taxon) locate all its hits.
- * A hit in the reference paired with each hit in a carrier is a liftover point
- * (carrier_seq, carrier_pos) -> (ref_seq, ref_pos), stored in forward-strand
- * coordinates and sorted per carrier sequence.
+ * A hit in the reference paired with each hit in a assembly is a liftover point
+ * (assembly_seq, assembly_pos) -> (ref_seq, ref_pos), stored in forward-strand
+ * coordinates and sorted per assembly sequence.
  *
- * Project: given a carrier hit, gather liftover points within +-win bp, take the
+ * Project: given a assembly hit, gather liftover points within +-win bp, take the
  * majority reference sequence, pick orientation (+1/-1) by the tighter residual,
  * and return the median-intercept projection -- unless support is thin or the
  * residual MAD is large, in which case the locus is not collinear -> NULL.
@@ -31,15 +31,15 @@
 #include "lift.h"
 
 typedef struct {          // one liftover point (flat build array + per-seq arrays)
-	int64_t cpos;         // carrier forward-strand start
+	int64_t cpos;         // assembly forward-strand start
 	int64_t rpos;         // reference forward-strand start
-	int32_t csid;         // carrier sequence index (in [0,n_seq))
+	int32_t csid;         // assembly sequence index (in [0,n_seq))
 	int32_t rsid;         // reference sequence index
 } rb3_liftpt_t;
 
 struct rb3_lift_s {
-	int64_t n_seq;        // number of sequences (carrier keys)
-	int64_t *off;         // off[sid]..off[sid+1] is the point range for carrier sid
+	int64_t n_seq;        // number of sequences (assembly keys)
+	int64_t *off;         // off[sid]..off[sid+1] is the point range for assembly sid
 	rb3_liftpt_t *pt;     // all points, sorted by (csid, cpos)
 	int64_t n_pt;
 };
@@ -119,7 +119,7 @@ static void lift_worker(void *data, long i, int tid)
 		if (b->is_ref[sx]) ref_sid = sx, ref_pos = lift_fwd(f->sid, sid, pos[r].pos, k), ++nref;
 	}
 	if (nref != 1) return;
-	for (r = 0; r < np; ++r) {           // pair each carrier hit with the reference hit
+	for (r = 0; r < np; ++r) {           // pair each assembly hit with the reference hit
 		int64_t sid = pos[r].sid, sx = sid >> 1;
 		if (b->is_ref[sx]) continue;
 		Kgrow(0, rb3_liftpt_t, b->buf[tid], b->bn[tid], b->bm[tid]);
@@ -223,12 +223,15 @@ static int64_t i64_median(int64_t *a, int64_t n)
 	return a[n>>1];
 }
 
-// Project a carrier hit (csid, cpos) to a reference coordinate. Returns 1 and sets
-// *out_rsid,*out_rpos on success; returns 0 (NULL slot) when not confidently
-// collinear. win/max_mad in bp, min_support minimum anchors in window.
-int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
-					 int64_t win, int64_t max_mad, int32_t min_support,
-					 int64_t *out_rsid, int64_t *out_rpos)
+// Core projector. Finds the reference coordinate for a assembly hit by fitting a
+// colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
+// colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
+// falls back to the nearest reference anchor = the closest reference BREAKPOINT and
+// sets *out_mode=1; a colinear projection sets *out_mode=0. Returns 0 when there is
+// no confident reference nearby at all. win/max_mad in bp, min_support min anchors.
+static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+							 int64_t win, int64_t max_mad, int32_t min_support, int allow_bp,
+							 int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
 {
 	int64_t lo = lf->off[csid], hi = lf->off[csid + 1];
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
@@ -247,14 +250,21 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 	}
 	n = b - a;
 	if (n < min_support) return 0;
-	// majority reference sequence in the window
+	// majority reference sequence in the window. O(n) via a small first-seen tally
+	// (a window touches only a handful of reference sids); tie-break = earliest first
+	// occurrence, identical to the previous O(n^2) scan so refmap output is unchanged.
 	best_rsid = -1, best_n = 0;
-	for (i = a; i < b; ++i) {
-		int64_t rs = pt[i].rsid; cnt = 0;
-		int64_t j;
-		for (j = a; j < b; ++j) if (pt[j].rsid == rs) ++cnt;
-		if (cnt > best_n) best_n = cnt, best_rsid = rs;
+	{
+		int64_t vals[256], cnts[256]; int nv = 0, u;
+		for (i = a; i < b; ++i) {
+			int64_t rs = pt[i].rsid, f = -1;
+			for (u = 0; u < nv; ++u) if (vals[u] == rs) { f = u; break; }
+			if (f < 0) { if (nv < 256) { vals[nv] = rs; cnts[nv] = 1; ++nv; } } // >256 distinct: degenerate, drop
+			else ++cnts[f];
+		}
+		for (u = 0; u < nv; ++u) if (cnts[u] > best_n) best_n = cnts[u], best_rsid = vals[u];
 	}
+	(void)cnt;
 	if (best_n < min_support) return 0;
 	// residuals for slope +1 (rpos-cpos) and -1 (rpos+cpos) over majority-chr points
 	resP = Kmalloc(km, int64_t, best_n);
@@ -276,13 +286,49 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 		kfree(km, cpP); kfree(km, cpM);
 		if (madP <= madM) sign = 1, med = mP;
 		else sign = -1, med = mM;
-		if ((madP <= madM? madP : madM) > max_mad) { kfree(km, resP); kfree(km, resM); return 0; }
+		if ((madP <= madM? madP : madM) > max_mad) { // not colinear: an insertion between flanks
+			kfree(km, resP); kfree(km, resM);
+			if (!allow_bp) return 0;
+			{ // breakpoint: nearest reference anchor (by assembly distance) on the majority chr
+				int64_t best_d = -1, bp = -1;
+				for (i = a; i < b; ++i) if (pt[i].rsid == best_rsid) {
+					int64_t d = llabs(pt[i].cpos - cpos);
+					if (best_d < 0 || d < best_d) best_d = d, bp = pt[i].rpos;
+				}
+				if (bp < 0) return 0;
+				*out_rsid = best_rsid, *out_rpos = bp;
+				if (out_mode) *out_mode = 1;
+				return 1;
+			}
+		}
 	}
 	*out_rsid = best_rsid;
 	*out_rpos = sign * cpos + med;
 	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
+	if (out_mode) *out_mode = 0;
 	kfree(km, resP); kfree(km, resM);
 	return 1;
+}
+
+// Project a assembly hit (csid, cpos) to a reference coordinate. Returns 1 and sets
+// *out_rsid,*out_rpos on success; returns 0 (NULL slot) when not confidently
+// collinear. win/max_mad in bp, min_support minimum anchors in window.
+int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+					 int64_t win, int64_t max_mad, int32_t min_support,
+					 int64_t *out_rsid, int64_t *out_rpos)
+{
+	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 0, out_rsid, out_rpos, 0);
+}
+
+// Like rb3_lift_project, but when the locus is NOT colinear (a PAV/insertion between
+// the flanking anchors) it returns the nearest reference anchor = the closest
+// reference breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0). Used
+// by `chain` to place assembly-only (PAV) reads at the flanking reference breakpoint.
+int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+						int64_t win, int64_t max_mad, int32_t min_support,
+						int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
+{
+	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode);
 }
 
 /* ---- the `lift` subcommand (build + dump) ------------------------------ */
@@ -311,7 +357,7 @@ int main_lift(int argc, char *argv[])
 	}
 	if (argc - o.ind < 2 || ref_prefix == 0) {
 		fprintf(stderr, "Usage: ropebwt3 lift --ref-prefix=STR [-k %d -s %d -t %d -m auto] <idx.fmd> <ref.fa> [...]\n", k, stride, n_threads);
-		fprintf(stderr, "Builds the carrier->reference coordinate liftover (the \"second SSA\") used by\n");
+		fprintf(stderr, "Builds the assembly->reference coordinate liftover (the \"second SSA\") used by\n");
 		fprintf(stderr, "`refmap --lift`. Feed the reference genome FASTA(s); anchors are shared k-mers.\n");
 		return 1;
 	}

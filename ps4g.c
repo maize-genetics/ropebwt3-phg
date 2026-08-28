@@ -155,7 +155,7 @@ static int64_t bed_resolve_contig(const rb3_sid_t *sid, const char *ref_prefix, 
 	int64_t k;
 	size_t plen = ref_prefix? strlen(ref_prefix) : 0;
 	for (k = 0; k < sid->n_seq; ++k) { // try the stripped (PS4G-style) contig name, reference sequences only
-		if (ref_prefix == 0 || strncmp(sid->name[k], ref_prefix, plen) != 0) continue; // must be a reference sequence, else e.g. "chr1" could match a carrier's own "Oh43_chr1"
+		if (ref_prefix == 0 || strncmp(sid->name[k], ref_prefix, plen) != 0) continue; // must be a reference sequence, else e.g. "chr1" could match a assembly's own "Oh43_chr1"
 		if (strcmp(contig_suffix(sid->name[k]), chrom) == 0) return k;
 	}
 	for (k = 0; k < sid->n_seq; ++k) // fall back to a literal sequence-name match

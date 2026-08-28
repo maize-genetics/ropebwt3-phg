@@ -15,9 +15,9 @@ KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_h
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
-#define RB3_WALK_CONSENSUS  0 // follow the base shared by the most carriers
-#define RB3_WALK_STRICT     1 // stop walking at the first carrier disagreement
-#define RB3_WALK_PERCARRIER 2 // one outward walk (and one result) per carrier genome
+#define RB3_WALK_CONSENSUS  0 // follow the base shared by the most assemblies
+#define RB3_WALK_STRICT     1 // stop walking at the first assembly disagreement
+#define RB3_WALK_PERASSEMBLY 2 // one outward walk (and one result) per assembly genome
 
 #define RB3_MF_NO_KALLOC   0x1
 #define RB3_MF_WRITE_UNMAP 0x2
@@ -25,16 +25,16 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_R
 #define RB3_MF_WRITE_ALL   0x8
 #define RB3_MF_BOTH_DIR    0x10
 
-// Max distinct carrier (founder) sequences kept per PLACED read, for both the
+// Max distinct assembly (assembly) sequences kept per PLACED read, for both the
 // refmap_place_lift() liftover projection and the PS4G/npy gamete set. Was
 // hardcoded to 8 (an arbitrary suffix-array-traversal-order subset once a
-// locus is shared by more founders than that -- see the Oh43 real-data eval,
-// where it silently dropped the read's own true founder from ~11% of sites).
+// locus is shared by more assemblies than that -- see the Oh43 real-data eval,
+// where it silently dropped the read's own true assembly from ~11% of sites).
 // Sized to the rb3_ssa_multi() locate cap so it never truncates below the locate.
 // This should scale with the #samples in the index (a locus can be shared by up to
-// N founders); capped at 256 to keep counts byte-sized (Ed). For N>256 the extra
-// carriers are truncated (accepted). See docs/sample-relative-thresholds.md (#3).
-#define RB3_RM_MAX_CARRIER 256
+// N assemblies); capped at 256 to keep counts byte-sized (Ed). For N>256 the extra
+// assemblies are truncated (accepted). See docs/sample-relative-thresholds.md (#3).
+#define RB3_RM_MAX_ASSEMBLY 256
 
 typedef struct {
 	uint32_t flag;
@@ -44,12 +44,13 @@ typedef struct {
 	int64_t min_occ, min_len, max_all_out;
 	int64_t batch_size;
 	char *ref_prefix;  // refmap: reference sequences are those whose name starts with this
-	int32_t max_walk;  // refmap: max bases to walk outward along carriers, per flank
+	int32_t max_walk;  // refmap: max bases to walk outward along assemblies, per flank
 	int8_t walk_mode;  // refmap: RB3_WALK_*
 	int64_t max_occ;   // refmap: reject reads/anchors occurring > max_occ times (0 = off; <0 = auto = #taxa)
 	int64_t max_bracket; // refmap: reject a PLACED if |cR-cL| > max_bracket (0 = off)
 	int8_t two_flank;  // refmap: require both flanks to anchor concordantly (1 = on)
-	char *lift_fn;     // refmap: liftover file -> project carrier hits instead of walking
+	int8_t allow_walk; // refmap: opt in to the DEPRECATED flank-walking path (no --lift)
+	char *lift_fn;     // refmap: liftover file -> project assembly hits instead of walking
 	int64_t lift_win, lift_mad; // refmap: liftover projection window / max residual MAD (bp)
 	int32_t kmer_len, kmer_step, min_agree; // refmap: k-mer-agreement placement (0 = off)
 	int64_t kmer_cluster;                   // refmap: cluster tolerance for agreeing k-mers (bp)
@@ -63,6 +64,11 @@ typedef struct {
 	int32_t chain_max_occ; // chain: SMEMs with FM-interval size > this are uninformative (skipped)
 	char *ref_fasta;       // chain: reference (or pangenome) FASTA -> GT-AG splice-site check (NULL = off)
 	int32_t splice_min;    // chain: reference gap size (bp) above which the GT-AG check applies
+	int32_t pav_min_len;   // chain --lift: min LONGEST assembly-only SMEM to emit a pav: row
+	int32_t trim_polya;    // trim a terminal poly-A/poly-T run of >= this many bp (0 = off)
+	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
+	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
+	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
@@ -75,9 +81,14 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	memset(opt, 0, sizeof(rb3_mopt_t));
 	opt->n_threads = 4;
 	opt->min_occ = 1;
-	opt->min_len = 19;
+	opt->min_len = 31;    // plant pangenomes: 19 is too short to be specific (Ed, 2026-07-26)
 	opt->max_intron = 500, opt->gap_intron = 30, opt->chain_max_occ = -1; // chain: chain_max_occ<0 = auto (2*#samples, cap 256)
 	opt->ref_fasta = 0, opt->splice_min = 10; // chain: GT-AG splice check off unless --ref-fasta given
+	opt->pav_min_len = 60;  // chain --lift: assembly-only specificity floor; see chain_emit_pav
+	opt->trim_polya = 0;    // off by default; see m_trim_polya
+	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
+	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
+	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -129,7 +140,7 @@ typedef struct {
 	uint8_t *is_ref; // refmap: is_ref[k]!=0 iff sequence k (in [0,n_seq)) belongs to the reference
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
-	rb3_lift_t *lift; // refmap: carrier->reference liftover (NULL = walk)
+	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
 	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
 	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
@@ -153,21 +164,21 @@ typedef struct refmap_rst_s {
 	int8_t status;       // RB3_RM_*
 	int8_t strand;       // reference strand (0 forward, 1 reverse); valid when placed/exact
 	int32_t qlen;
-	int32_t n_carrier;   // distinct carrier sequences seen (capped)
+	int32_t n_assembly;   // distinct assembly sequences seen (capped)
 	int64_t ref_sid;     // reference sequence index (in [0,n_seq)); -1 if none
 	int64_t cL, cR;      // reference coordinates bracketing the query; -1 if unknown
-	int64_t ins_size;    // implied size inserted into the carrier relative to the reference
-	int32_t n_car_list;  // number of carriers stored below
-	rb3_pos_t *carriers; // a few carrier (sid,pos); allocated with RB3_MALLOC
-	int32_t n_sub;       // per-carrier mode: number of sub-results (one per carrier)
-	struct refmap_rst_s *sub; // per-carrier mode: one placement per carrier
+	int64_t ins_size;    // implied size inserted into the assembly relative to the reference
+	int32_t n_asm_list;  // number of assemblies stored below
+	rb3_pos_t *assemblies; // a few assembly (sid,pos); allocated with RB3_MALLOC
+	int32_t n_sub;       // per-assembly mode: number of sub-results (one per assembly)
+	struct refmap_rst_s *sub; // per-assembly mode: one placement per assembly
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
 	int64_t occ; // --report-occ: raw FM-index interval size for the matched query (whole read, or the
 	             // matched SMEM core if there was no end-to-end match) -- 0 for UNPLACED and for
 	             // --kmer-mode results (no single whole-query interval exists there). Pangenome-wide:
 	             // counts exact matches to the read's given orientation anywhere across the reference
-	             // + all founders (both strands are indexed, so a genuine inverted/palindromic repeat
+	             // + all assemblies (both strands are indexed, so a genuine inverted/palindromic repeat
 	             // is correctly counted more than once -- this is real signal, not an artifact to
 	             // divide away; empirically, a single-copy locus present in only one assembly reports
 	             // occ=1, not 2 -- verified directly against known unique loci, see --report-occ help).
@@ -187,6 +198,52 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
 							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen);
 
+// Length of a terminal homopolymer run of `base`, scanning inward from one end. Scored scan:
+// +1 per matching base, -RB3_TRIM_MM per mismatch, cut at the highest-scoring prefix. This
+// absorbs sequencing error inside the tail without letting the scan run past the tail boundary
+// and latch onto incidental A/T bases in genuine sequence -- a plain mismatch budget over-trims
+// real sequence by several bp (verified: a 40 bp poly-T head cut 45 bases).
+#define RB3_TRIM_MM   3   // mismatch penalty
+#define RB3_TRIM_DROP 12  // stop once the score falls this far below the best (≈4 mismatches)
+static int32_t trim_run(const uint8_t *seq, int32_t len, int32_t step, uint8_t base, int32_t min_run)
+{
+	int32_t i, k, sc = 0, best = 0, bestk = 0;
+	for (k = 0; k < len; ++k) {
+		i = step > 0? k : len - 1 - k;
+		sc += (seq[i] == base)? 1 : -RB3_TRIM_MM;
+		if (sc > best) best = sc, bestk = k + 1;
+		else if (sc < best - RB3_TRIM_DROP) break;
+	}
+	return bestk >= min_run? bestk : 0;
+}
+
+// Trim a homopolymer tail: poly-A at the 3' end, or poly-T at the 5' end (the same tail on a
+// reverse-complemented read). 3'-tag protocols prime on polyA and misprime on internal A-runs
+// >=4 bp, so many reads carry a homopolymer tail with only a short informative remainder. The
+// PAV specificity floor discards those reads (3'-tag: 2,363 rows at 20.5% source recall, mean
+// longest A/T run 13.6 bp vs 4.0 bp for the high-recall population). A read that is entirely
+// homopolymer trims to length 0 and yields no SMEMs, which is the correct outcome.
+//
+// MEASURED: this is a NO-OP for the chain/PAV pipeline, which is why it is off by default.
+// Trimming cannot lengthen the informative core -- SMEM search already isolates it, since a
+// polyA tail does not extend a genomic exact match unless the reference also carries A's there.
+// On those same 2,363 reads: mean longest SMEM 42.6 bp untrimmed vs 42.7 bp trimmed, and 56
+// reads lost outright. Whole-pipeline effect at --trim-polya=8 (3'-tag): reference rows
+// 80,521 -> 80,287, pav source recall 76.2% -> 76.3%, ref source recall 96.5% -> 96.8%.
+// The harmful polyA case is entirely covered by pav_low_complexity() instead. Kept because it
+// is correct and cheap, and may matter for other read types or consumers.
+// See pav_e1_findings_2026-07-26.md.
+static void m_trim_polya(m_seq_t *s, int32_t min_run)
+{
+	int32_t cut;
+	if (s->len <= 0) return;
+	cut = trim_run(s->seq, s->len, -1, 1, min_run);          // poly-A at the 3' end
+	if (cut > 0) s->len -= cut;
+	if (s->len <= 0) { s->len = 0; return; }
+	cut = trim_run(s->seq, s->len, 1, 4, min_run);           // poly-T at the 5' end
+	if (cut > 0) { memmove(s->seq, s->seq + cut, s->len - cut); s->len -= cut; }
+}
+
 static void worker_for_seq(void *data, long i, int tid)
 {
 	step_t *t = (step_t*)data;
@@ -196,6 +253,7 @@ static void worker_for_seq(void *data, long i, int tid)
 	if (rb3_dbg_flag & RB3_DBG_QNAME)
 		fprintf(stderr, "Q\t%s\t%d\n", s->name, tid);
 	rb3_char2nt6(s->len, s->seq);
+	if (p->opt->trim_polya > 0) m_trim_polya(s, p->opt->trim_polya);
 	if (p->opt->algo == RB3_SA_SW) { // BWA-SW
 		rb3_sw(b->km, &p->opt->swo, &p->fmi, s->len, s->seq, &t->rst[i]);
 		if (t->rst_rev) {
@@ -283,7 +341,7 @@ static void pos_stranded(const rb3_sid_t *sid, const rb3_pos_t *pos, int32_t rle
 
 /********************************************************************
  * refmap: place a query on a designated reference genome by
- * walking outward through the carrier genomes to the breakpoints.
+ * walking outward through the assembly genomes to the breakpoints.
  ********************************************************************/
 
 // Backward-search the whole query; on success *out holds its SA interval. Returns 1 on a full match.
@@ -304,12 +362,12 @@ static int refmap_query_interval(const rb3_fmi_t *f, int64_t len, const uint8_t 
 	return 1;
 }
 
-// Walk outward from interval Iq through the carriers, recording one base per step.
+// Walk outward from interval Iq through the assemblies, recording one base per step.
 // side 0 = left (backward) flank, side 1 = right (forward) flank. On return, buf holds the flank
 // in forward (5'->3') orientation; the breakpoint-proximal end (adjacent to the query) is the 3'
 // end for the left flank and the 5' end (index 0) for the right flank. Returns the flank length.
 // walk_mode picks the path: consensus follows the most-supported base; strict stops at the first
-// carrier disagreement; per-carrier (mask != NULL) follows the single carrier marked in mask.
+// assembly disagreement; per-assembly (mask != NULL) follows the single assembly marked in mask.
 static int32_t refmap_extract_flank(void *km, const pipeline_t *p, const rb3_sai_t *Iq, int side, int32_t max_walk, int walk_mode, const uint8_t *mask, uint8_t *buf)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -319,7 +377,7 @@ static int32_t refmap_extract_flank(void *km, const pipeline_t *p, const rb3_sai
 		int c, best = -1;
 		int64_t bestsz = 0;
 		rb3_fmd_extend(f, &I, ok, is_back);
-		if (mask) { // per-carrier: follow the base whose child still contains this carrier
+		if (mask) { // per-assembly: follow the base whose child still contains this assembly
 			rb3_pos_t pos[1];
 			for (c = 1; c <= 4; ++c) {
 				rb3_sai_t *iv = is_back? &ok[c] : &ok[rb3_comp(c)];
@@ -334,8 +392,8 @@ static int32_t refmap_extract_flank(void *km, const pipeline_t *p, const rb3_sai
 				if (sz > bestsz) bestsz = sz, best = c;
 			}
 		}
-		if (best < 0 || bestsz == 0) break;                         // no carrier continues
-		if (walk_mode == RB3_WALK_STRICT && bestsz != I.size) break; // carriers disagree
+		if (best < 0 || bestsz == 0) break;                         // no assembly continues
+		if (walk_mode == RB3_WALK_STRICT && bestsz != I.size) break; // assemblies disagree
 		buf[n++] = best;
 		I = is_back? ok[best] : ok[rb3_comp(best)];
 	}
@@ -348,7 +406,7 @@ static int32_t refmap_extract_flank(void *km, const pipeline_t *p, const rb3_sai
 	return n;
 }
 
-// Given the query interval and (optionally) a carrier mask, extract both flanks, re-anchor them in
+// Given the query interval and (optionally) a assembly mask, extract both flanks, re-anchor them in
 // the reference and fill the placement result r (status/strand/ref_sid/cL/cR/ins_size).
 static void refmap_place(void *km, const pipeline_t *p, const m_seq_t *s, const rb3_sai_t *Iq, const uint8_t *mask, refmap_rst_t *r)
 {
@@ -382,8 +440,8 @@ static void refmap_place(void *km, const pipeline_t *p, const m_seq_t *s, const 
 }
 
 // Re-anchor a flank in the reference. The reference-shared part of a flank lies at the end FAR
-// from the query (it is contiguous with the query only in the carriers), so a plain SMEM would be
-// swallowed by the longer carrier match that crosses the breakpoint. Instead we grow the match
+// from the query (it is contiguous with the query only in the assemblies), so a plain SMEM would be
+// swallowed by the longer assembly match that crosses the breakpoint. Instead we grow the match
 // from the far end and keep the longest stretch still present in the reference:
 //   side 0 = left flank  : longest reference-matching PREFIX  (forward extension from the 5' end)
 //   side 1 = right flank : longest reference-matching SUFFIX  (backward extension from the 3' end)
@@ -453,19 +511,19 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 	return 1;
 }
 
-// Place a carrier-only query by PROJECTING its carrier hits to the reference via
+// Place a assembly-only query by PROJECTING its assembly hits to the reference via
 // the liftover (the E4 "second SSA"), instead of walking outward. The majority
-// reference sequence among the per-carrier projections wins; NULL projections
+// reference sequence among the per-assembly projections wins; NULL projections
 // (no confident collinear support) are dropped, and if none survive -> UNPLACED.
 static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
-	int64_t rsids[RB3_RM_MAX_CARRIER], rposs[RB3_RM_MAX_CARRIER], best_rsid = -1, med, v[RB3_RM_MAX_CARRIER];
+	int64_t rsids[RB3_RM_MAX_ASSEMBLY], rposs[RB3_RM_MAX_ASSEMBLY], best_rsid = -1, med, v[RB3_RM_MAX_ASSEMBLY];
 	int32_t n = 0, k, j, bestn, m;
-	for (k = 0; k < r->n_car_list && n < RB3_RM_MAX_CARRIER; ++k) {
+	for (k = 0; k < r->n_asm_list && n < RB3_RM_MAX_ASSEMBLY; ++k) {
 		int64_t clen, st, en, rsid, rpos;
-		pos_stranded(f->sid, &r->carriers[k], s->len, &clen, &st, &en);
-		if (rb3_lift_project(p->lift, km, (int32_t)(r->carriers[k].sid >> 1), st,
+		pos_stranded(f->sid, &r->assemblies[k], s->len, &clen, &st, &en);
+		if (rb3_lift_project(p->lift, km, (int32_t)(r->assemblies[k].sid >> 1), st,
 							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
 			rsids[n] = rsid, rposs[n] = rpos, ++n;
 	}
@@ -483,8 +541,8 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 }
 
 // One reference-coordinate vote from a k-mer. sx = the physical source sequence
-// (founder/reference) this occurrence came from, before any liftover projection
-// remaps the locus to rsid/rpos -- kept so the winning cluster's founders can be
+// (assembly/reference) this occurrence came from, before any liftover projection
+// remaps the locus to rsid/rpos -- kept so the winning cluster's assemblies can be
 // recovered for the PS4G/npy gameteSet (see refmap_query_kmer()).
 typedef struct { int64_t rsid, rpos; int32_t kmer; int32_t sx; } refmap_vote_t;
 
@@ -512,7 +570,7 @@ static inline int refmap_kmer_mapq(int agree, int second)
 }
 
 // Collect the reference-coordinate votes of one k-mer (only if it is a full-length
-// exact, single-copy-per-taxon match): a reference hit votes directly; a carrier
+// exact, single-copy-per-taxon match): a reference hit votes directly; a assembly
 // hit votes via the liftover projection. An error-containing k-mer has no
 // full-length match and contributes nothing.
 static void refmap_kmer_votes(void *km, const pipeline_t *p, const uint8_t *q, int32_t K, int32_t ki,
@@ -587,9 +645,9 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
 	r->agree = (int32_t)best_support, r->second = (int32_t)second_support;
 	if (best_support >= o->min_agree) {
 		r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
-		r->cL = r->cR = best_pos, r->ins_size = 0, r->n_carrier = (int32_t)best_support;
+		r->cL = r->cR = best_pos, r->ins_size = 0, r->n_assembly = (int32_t)best_support;
 		r->mapq = refmap_kmer_mapq((int32_t)best_support, (int32_t)second_support);
-		// PS4G/npy: founders backing any vote in the winning cluster. Looser than
+		// PS4G/npy: assemblies backing any vote in the winning cluster. Looser than
 		// whole-read mode's gameteSet (one single longest-match unit) -- this is a
 		// union across the read's several independent k-mer tiles -- but built the
 		// same way whole-read mode's EXACT path does: no dedup here, rb3_ps4g_acc_add
@@ -611,7 +669,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	if (p->opt->kmer_len > 0) { refmap_query_kmer(km, p, s, r); return; }
 	rb3_pos_t *pos;
 	int64_t np, i;
-	int car_seen[RB3_RM_MAX_CARRIER], n_car = 0;
+	int asm_seen[RB3_RM_MAX_ASSEMBLY], n_asm = 0;
 
 	memset(r, 0, sizeof(*r));
 	r->status = RB3_RM_UNPLACED, r->strand = 0, r->qlen = s->len;
@@ -630,7 +688,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		kfree(km, mem.a);
 		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
 	}
-	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/carrier-cap truncation
+	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/assembly-cap truncation
 	                  // below, so MULTI/EXACT/PLACED rows all carry the true occurrence count
 
 	// E2: an informative read maps at most once per taxon; a read occurring > max_occ times is a
@@ -640,9 +698,9 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		return;
 	}
 
-	// locate a sample of occurrences; separate reference hits (exact) from carriers
-	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_CARRIER);
-	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_CARRIER, pos);
+	// locate a sample of occurrences; separate reference hits (exact) from assemblies
+	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_ASSEMBLY, pos);
 	{
 		int ref_found = 0;
 		for (i = 0; i < np; ++i) {
@@ -656,7 +714,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		if (ref_found) {
 			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
-				int32_t tmp[RB3_RM_MAX_CARRIER], m;
+				int32_t tmp[RB3_RM_MAX_ASSEMBLY], m;
 				for (i = 0, m = 0; i < np; ++i) tmp[m++] = p->gtab->sid2g[pos[i].sid>>1];
 				r->gametes = RB3_MALLOC(int32_t, m);
 				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
@@ -666,42 +724,42 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 			return;
 		}
 	}
-	r->carriers = RB3_CALLOC(rb3_pos_t, RB3_RM_MAX_CARRIER);
-	for (i = 0; i < np && n_car < RB3_RM_MAX_CARRIER; ++i) { // keep distinct carrier sequences for reporting
+	r->assemblies = RB3_CALLOC(rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
+	for (i = 0; i < np && n_asm < RB3_RM_MAX_ASSEMBLY; ++i) { // keep distinct assembly sequences for reporting
 		int32_t j, dup = 0;
-		for (j = 0; j < n_car; ++j)
-			if (car_seen[j] == (int)(pos[i].sid>>1)) { dup = 1; break; }
+		for (j = 0; j < n_asm; ++j)
+			if (asm_seen[j] == (int)(pos[i].sid>>1)) { dup = 1; break; }
 		if (dup) continue;
-		car_seen[n_car] = pos[i].sid>>1;
-		r->carriers[n_car++] = pos[i];
+		asm_seen[n_asm] = pos[i].sid>>1;
+		r->assemblies[n_asm++] = pos[i];
 	}
-	r->n_car_list = n_car, r->n_carrier = n_car;
+	r->n_asm_list = n_asm, r->n_assembly = n_asm;
 	kfree(km, pos);
-	if (p->gtab && n_car > 0) { // PS4G/npy: carrier samples backing a (possible) PLACED call below
+	if (p->gtab && n_asm > 0) { // PS4G/npy: assembly samples backing a (possible) PLACED call below
 		int32_t k;
-		r->gametes = RB3_MALLOC(int32_t, n_car);
-		for (k = 0; k < n_car; ++k) r->gametes[k] = p->gtab->sid2g[r->carriers[k].sid>>1];
-		r->n_gametes = n_car;
+		r->gametes = RB3_MALLOC(int32_t, n_asm);
+		for (k = 0; k < n_asm; ++k) r->gametes[k] = p->gtab->sid2g[r->assemblies[k].sid>>1];
+		r->n_gametes = n_asm;
 	}
 
-	if (p->lift) { // E4: project carrier hits to the reference instead of walking
+	if (p->lift) { // E4: project assembly hits to the reference instead of walking
 		refmap_place_lift(km, p, s, r);
 		return;
 	}
 
-	if (p->opt->walk_mode == RB3_WALK_PERCARRIER && n_car > 0) {
-		// place each carrier separately, following that one carrier through divergences
+	if (p->opt->walk_mode == RB3_WALK_PERASSEMBLY && n_asm > 0) {
+		// place each assembly separately, following that one assembly through divergences
 		uint8_t *mask = RB3_CALLOC(uint8_t, f->sid->n_seq);
 		int32_t k;
-		r->sub = RB3_CALLOC(refmap_rst_t, n_car);
-		r->n_sub = n_car;
-		for (k = 0; k < n_car; ++k) {
+		r->sub = RB3_CALLOC(refmap_rst_t, n_asm);
+		r->n_sub = n_asm;
+		for (k = 0; k < n_asm; ++k) {
 			refmap_rst_t *sub = &r->sub[k];
-			int64_t csid = r->carriers[k].sid >> 1;
+			int64_t csid = r->assemblies[k].sid >> 1;
 			memset(sub, 0, sizeof(*sub));
 			sub->status = RB3_RM_UNPLACED, sub->qlen = s->len, sub->ref_sid = -1, sub->cL = sub->cR = -1;
-			sub->occ = r->occ; // same overall query interval; each sub just reports a different carrier
-			sub->carriers = &r->carriers[k], sub->n_car_list = 1, sub->n_carrier = 1; // borrowed pointer
+			sub->occ = r->occ; // same overall query interval; each sub just reports a different assembly
+			sub->assemblies = &r->assemblies[k], sub->n_asm_list = 1, sub->n_assembly = 1; // borrowed pointer
 			if (p->gtab) {
 				sub->gametes = RB3_MALLOC(int32_t, 1);
 				sub->gametes[0] = p->gtab->sid2g[csid];
@@ -714,7 +772,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		free(mask);
 		return;
 	}
-	// consensus / strict: a single placement from the shared carrier path
+	// consensus / strict: a single placement from the shared assembly path
 	refmap_place(km, p, s, &Iq, 0, r);
 }
 
@@ -789,10 +847,10 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 	int32_t k;
 	out->l = 0;
 	write_name(out, s);
-	rb3_sprintf_lite(out, "\t%d\t%s\t%d\t", r->qlen, status_str[(int)r->status], r->n_carrier);
-	if (r->n_car_list > 0) { // carrier sequences (name:strand)
-		for (k = 0; k < r->n_car_list; ++k) {
-			int64_t sid = r->carriers[k].sid;
+	rb3_sprintf_lite(out, "\t%d\t%s\t%d\t", r->qlen, status_str[(int)r->status], r->n_assembly);
+	if (r->n_asm_list > 0) { // assembly sequences (name:strand)
+		for (k = 0; k < r->n_asm_list; ++k) {
+			int64_t sid = r->assemblies[k].sid;
 			rb3_sprintf_lite(out, "%s%s:%c", k? "," : "", f->sid->name[sid>>1], "+-"[sid&1]);
 		}
 	} else rb3_sprintf_lite(out, ".");
@@ -858,7 +916,7 @@ static void write_refmap(step_t *t)
 		m_seq_t *s = &t->seq[j];
 		refmap_rst_t *r = &t->refmap[j];
 		int kmer = p->opt->kmer_len > 0;
-		if (r->n_sub > 0) { // per-carrier mode: one line per carrier (sub->carriers borrows r->carriers)
+		if (r->n_sub > 0) { // per-assembly mode: one line per assembly (sub->assemblies borrows r->assemblies)
 			for (k = 0; k < r->n_sub; ++k) {
 				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ);
 				fputs(out.s, stdout);
@@ -875,7 +933,7 @@ static void write_refmap(step_t *t)
 			write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
 			refmap_count_hit(p, r->status);
 		}
-		free(r->carriers);
+		free(r->assemblies);
 		free(r->gametes);
 		free(s->seq);
 		free(s->name);
@@ -898,7 +956,7 @@ static void write_refmap(step_t *t)
 /* Load reference contig sequences for the GT-AG splice check. Reads every record
  * of a reference (or whole-pangenome) FASTA and keeps, keyed by index sequence id,
  * an uppercase copy of the sequence for each contig marked in is_ref[]. Non-reference
- * records (other founders) and names absent from the index are ignored. Returns the
+ * records (other assemblies) and names absent from the index are ignored. Returns the
  * number of reference contigs filled; p->ref_seq[k] stays NULL for any not found. */
 static int64_t chain_load_ref(pipeline_t *p, const char *fn)
 {
@@ -994,7 +1052,231 @@ static int32_t chain_isect(int32_t *a, int32_t na, const int32_t *b, int32_t nb)
 	return k;
 }
 
-static void chain_emit(const pipeline_t *p, const m_seq_t *s)
+// Tight colinearity tolerance (bp) for the PAV path: a assembly position whose flanking
+// reference anchors disagree by more than this is inside an insertion -> use the nearest
+// reference anchor (breakpoint) rather than a projected-through-the-insertion coordinate.
+#define RB3_CHAIN_PAV_MAD 64
+// Projection window (bp) for the PAV path: the breakpoint is the nearest anchor, so a
+// modest window suffices and keeps the O(anchors^2) projection cheap (vs lift_win 500kb).
+#define RB3_CHAIN_PAV_WIN 50000
+#define RB3_CHAIN_PAV_NPROJ 16  // occurrences of the seed SMEM to project (majority + median consensus)
+#define RB3_CHAIN_PAV_NSEED 8   // seed occurrences of the longest SMEM tried as a cluster anchor
+// Carrier-space bound (bp) on a cluster's unexplained gap: two assembly-only SMEMs are
+// "the same locus" only if their assembly offsets track their query offsets to within this.
+#define RB3_CHAIN_PAV_CLUSTER 100000
+
+typedef struct {
+	int32_t qs, qe;        // query span
+	int32_t *gam, n_gam;   // sorted, deduped gamete indices over all occurrences
+	int32_t mi;            // index into s->mem
+} pav_sm_t;
+
+// Forward-strand assembly position of occurrence `t` of a SMEM of length `len`.
+static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_t len)
+{
+	int32_t sidx = t->sid>>1;
+	return (t->sid&1)? f->sid->len[sidx] - (t->pos + len) : t->pos;
+}
+
+// Max share (%) one base may occupy in the anchor before it is called low-complexity.
+#define RB3_CHAIN_PAV_MAXBASE 80
+
+// Is the query span [qs,qe) dominated by a single base? LENGTH IS NOT SPECIFICITY for a
+// homopolymer: a 76 bp pure poly-A read has a 76 bp exact match, clears any length floor,
+// and lands wherever some assembly happens to carry a long enough A-run. Measured: 772 such
+// rows (741 full-length, 31 3'-tag) at **0.0%** source recall -- every one named the wrong
+// assembly. 3'-tag libraries generate these by design (polyA priming), so gate on
+// composition, not length. See pav_e1_findings_2026-07-26.md.
+static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
+{
+	int32_t cnt[7], i, c, best = 0, n = qe - qs;
+	if (n <= 0) return 0;
+	for (i = 0; i < 7; ++i) cnt[i] = 0;
+	for (i = qs; i < qe; ++i) { c = s->seq[i]; if (c < 0 || c > 6) c = 6; ++cnt[c]; }
+	for (i = 0; i < 7; ++i) if (cnt[i] > best) best = cnt[i];
+	return best * 100 >= RB3_CHAIN_PAV_MAXBASE * n;
+}
+
+// Carrier-only (PAV) fallback for reads with NO reference-hitting SMEM: place the read
+// at the nearest B73 breakpoint via the liftover, emitting one row `pav:<contig>` with
+// the intersected assembly gamete set. Requires --lift. Presence/absence only (no
+// internal resolution) -- see design/pav-assembly-coordinates-scope.md.
+//
+// The gamete sets are intersected only over SMEMs that are COLINEAR IN CARRIER SPACE.
+// A read originates from one assembly, so its assembly-only SMEMs must be colinear in that
+// assembly's coordinates; intersecting across unrelated loci (a PAV fragment plus an
+// unrelated repeat fragment) silently drops the true source assembly. Measured before this
+// clustering existed: 33% source dropout on 3'-tag RNAseq, concentrated in confidently-
+// wrong singletons -- see RopeBWTGrits-eval/experiments/pav_e1_findings_2026-07-26.md.
+// This mirrors what chain_emit does in reference space (colinear DP, then intersect over
+// the winning chain only).
+static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t i, j, k, n = 0, na = 0, *acc = 0, sd = -1, sd_len = 0;
+	int32_t *clu = 0, n_clu = 0, *cand = 0, best_o = -1;
+	int64_t best_sc = -1;
+	pav_sm_t *cs;
+	cs = RB3_CALLOC(pav_sm_t, s->n_mem);
+	for (i = 0; i < s->n_mem; ++i) { // collect assembly-only informative SMEMs
+		m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, ng = 0, nref = 0, *g, m;
+		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+		g = RB3_MALLOC(int32_t, r->n_pos);
+		for (k = 0; k < r->n_pos; ++k) {
+			int32_t sidx = r->pos[k].sid>>1;
+			g[ng++] = gt->sid2g[sidx];
+			if (p->is_ref[sidx]) nref++;
+		}
+		if (nref > 0) { free(g); continue; } // has a reference hit -> not a PAV SMEM
+		qsort(g, ng, sizeof(int32_t), chain_cmp_i32);
+		for (k = 0, m = 0; k < ng; ++k) if (m == 0 || g[k] != g[m-1]) g[m++] = g[k];
+		cs[n].qs = st, cs[n].qe = en, cs[n].gam = g, cs[n].n_gam = m, cs[n].mi = i;
+		if (en - st > sd_len) sd_len = en - st, sd = n;
+		++n;
+	}
+	if (n == 0) { free(cs); return; } // no assembly-only SMEM
+	// Cluster in assembly space: seed on the longest SMEM and, for each of its assembly
+	// occurrences, keep the SMEMs whose assembly offset tracks their query offset. The
+	// highest-scoring cluster (bases covered) wins; its seed occurrence is the anchor.
+	clu = RB3_MALLOC(int32_t, n);
+	cand = RB3_MALLOC(int32_t, n);
+	{
+		m_sai_pos_t *rs = &s->mem[cs[sd].mi];
+		for (k = 0; k < rs->n_pos && k < RB3_CHAIN_PAV_NSEED; ++k) {
+			int32_t sid_o = rs->pos[k].sid>>1, str_o = rs->pos[k].sid&1, nc = 0;
+			int64_t cp_o = pav_fwd_pos(f, &rs->pos[k], sd_len), sc = sd_len;
+			cand[nc++] = sd;
+			for (j = 0; j < n; ++j) {
+				m_sai_pos_t *rj;
+				int32_t len_j, u, hit = 0;
+				if (j == sd) continue;
+				rj = &s->mem[cs[j].mi];
+				len_j = cs[j].qe - cs[j].qs;
+				for (u = 0; u < rj->n_pos && !hit; ++u) {
+					int64_t dq, dc;
+					if ((rj->pos[u].sid>>1) != sid_o || (rj->pos[u].sid&1) != str_o) continue;
+					dq = cs[j].qs - cs[sd].qs;
+					dc = pav_fwd_pos(f, &rj->pos[u], len_j) - cp_o;
+					if (str_o) dc = -dc;                     // reverse: query fwd -> assembly fwd back
+					if ((dq > 0 && dc < 0) || (dq < 0 && dc > 0)) continue;      // out of order
+					if (llabs(dc - dq) > RB3_CHAIN_PAV_CLUSTER) continue;        // implausible jump
+					hit = 1;
+				}
+				if (hit) cand[nc++] = j, sc += len_j;
+			}
+			if (sc > best_sc) {
+				best_sc = sc, best_o = k, n_clu = nc;
+				memcpy(clu, cand, nc * sizeof(int32_t));
+			}
+		}
+	}
+	// Two suppression rules, both calibrated on B97 vs the NAM PHG (pav_e1b):
+	// (1) INCOHERENT read: the winning cluster must contain EVERY assembly-only SMEM. If any
+	//     is left out, the read's SMEMs cannot be reconciled to one assembly locus (chimera,
+	//     adapter, mispriming) and the emitted set is near-worthless -- source recall by
+	//     cluster/total was 1/1 68%, 2/2 94%, but 1/2 17%, 1/3 16%, 1/4 8%, 1/5 1.5%.
+	//     Before clustering existed, the strict all-SMEM intersection collapsed these to
+	//     na==0 and dropped them by accident; that accident was doing real work.
+	// (2) SPECIFICITY FLOOR: a short assembly-only match is not specific enough to name the
+	//     assemblies it came from. Source recall vs cluster bases (3'-tag, single-SMEM):
+	//     31-39bp 20%, 40-49 37%, 50-59 56%, 60-79 71%, 80-119 78%. `min_len` (31) is the
+	//     floor for anchoring to the REFERENCE, where a colinear chain adds confirmation;
+	//     the assembly-only path has no such confirmation and needs its own, longer floor.
+	//     The floor is on the LONGEST single match (sd_len), not the cluster total: summing
+	//     several short SMEMs clears any total-bases floor while no individual match is
+	//     specific (a 7-SMEM class of 728 full-length rows did exactly that, at 0% recall).
+	// (3) LOW COMPLEXITY: reject a homopolymer-dominated anchor -- long but not specific.
+	if (best_o >= 0 && n_clu == n && sd_len >= p->opt->pav_min_len
+		&& !pav_low_complexity(s, cs[sd].qs, cs[sd].qe)) {
+		acc = RB3_MALLOC(int32_t, cs[clu[0]].n_gam);
+		na = cs[clu[0]].n_gam;
+		memcpy(acc, cs[clu[0]].gam, na * sizeof(int32_t));
+		for (i = 1; i < n_clu; ++i) na = chain_isect(acc, na, cs[clu[i]].gam, cs[clu[i]].n_gam);
+	}
+	// CONSENSUS projection. Previously the breakpoint came from ONE occurrence of the seed
+	// (best_o), with a 30 bp agreement check over the first 4. refmap_place_lift has always
+	// done better: project EVERY assembly, take the majority reference sequence, then the MEDIAN
+	// position among that majority. That asymmetry let reads at one locus anchor via different
+	// assemblies and jump: E3 found 16% of loci whose breakpoints spread >5x the region's true
+	// extent (median true span 4.9 kb, median spread 40.6 kb). Consensus + a dispersion test is
+	// both the fix and the per-read form of "suppress the scattered ones".
+	if (na > 0) {
+		m_sai_pos_t *r = &s->mem[cs[sd].mi];
+		int64_t prs[RB3_CHAIN_PAV_NPROJ], prp[RB3_CHAIN_PAV_NPROJ], v[RB3_CHAIN_PAV_NPROJ];
+		int pmd[RB3_CHAIN_PAV_NPROJ];
+		int32_t np = 0, nmaj = 0, bestn = 0, n_insertion = 0;
+		int64_t best_rsid = -1, med = 0, disp = 0;
+		for (k = 0; k < r->n_pos && np < RB3_CHAIN_PAV_NPROJ; ++k) {
+			int64_t rsid, rpos; int mode;
+			if (!rb3_lift_project_bp(p->lift, km, (int32_t)(r->pos[k].sid>>1),
+									 pav_fwd_pos(f, &r->pos[k], sd_len),
+									 RB3_CHAIN_PAV_WIN, RB3_CHAIN_PAV_MAD, 4, &rsid, &rpos, &mode)) continue;
+			prs[np] = rsid, prp[np] = rpos, pmd[np] = mode, ++np;
+		}
+		for (k = 0; k < np; ++k) { // majority reference sequence
+			int32_t c = 0;
+			for (j = 0; j < np; ++j) if (prs[j] == prs[k]) ++c;
+			if (c > bestn) bestn = c, best_rsid = prs[k];
+		}
+		for (k = 0; k < np; ++k) if (prs[k] == best_rsid) { v[nmaj++] = prp[k]; if (pmd[k] == 1) ++n_insertion; }
+		for (k = 1; k < nmaj; ++k) { int64_t x = v[k]; for (j = k - 1; j >= 0 && v[j] > x; --j) v[j+1] = v[j]; v[j+1] = x; }
+		if (nmaj > 0) {
+			med = v[nmaj >> 1];
+			for (k = 0; k < nmaj; ++k) { int64_t d = llabs(v[k] - med); if (d > disp) disp = d; }
+		}
+		// SUPPRESS when the occurrences do not agree on WHERE this is: require a majority of
+		// projections on one reference sequence, and their spread within one grid cell. A read
+		// whose own assemblies disagree by more than the emitted resolution cannot be placed.
+		// Agreement and resolution are separate concerns and now separate knobs. They used
+		// to share --pav-grid, which made --pav-grid=0 read as "no constraint" while actually
+		// being the STRICTEST setting: with no grid the tolerance fell back to --gap-intron
+		// (30bp), so insertions carried by several assemblies were silently suppressed.
+		if (nmaj > 0 && bestn == np && disp <= p->opt->pav_agree) {
+			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
+			const char *contig = us? us + 1 : nm;
+			int is_insertion = n_insertion * 2 >= nmaj;   // majority of projections were true breakpoints
+			// A DIVERGED row is not a PAV: the sequence is in the reference, just too divergent
+			// to share a SMEM, and the projection is a real colinear coordinate rather than a
+			// flanking breakpoint. It therefore deserves the ordinary schema and its exact
+			// position (no grid snapping, which exists only because a breakpoint is approximate).
+			// Caveat measured on B97: colinear rows match mode1 on genomic (100.0%) and
+			// full-length (97.7% vs 98.4%) source recall, but are 9.4 pts worse on 3'-tag
+			// (75.0% vs 84.4%) -- those reads still have no reference SMEM, so the coordinate is
+			// lifted from a assembly and is one step less direct. Hence the policy switch.
+			if (!is_insertion) {
+				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
+				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
+					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
+					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+					putchar('\n');
+					goto pav_done;
+				}
+			}
+			// Snap to --pav-grid. The design calls PAV "presence/absence only (no internal
+			// resolution)", but emission never enforced that, so single-base coordinates
+			// promised a precision the method does not have and fragmented one insertion's
+			// evidence across many bins (mean 6.3). Snapping collapses it -- safe because E3
+			// showed source recall is 100% in every spread bucket, i.e. the assembly sets are
+			// right and only the aggregation key moved. 5 kb -> 72% of insertions in one bin.
+			int64_t bp = p->opt->pav_grid > 0? med / p->opt->pav_grid * p->opt->pav_grid : med;
+			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
+			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
+			// the nearest reference breakpoint, approximate (presence/absence only).
+			// 0 = DIVERGED: present in the reference but too divergent to share a SMEM,
+			// so the coordinate is colinear and exact. Only insertions reach here --
+			// diverged rows are routed by --diverged-rows (default: ordinary row).
+			printf("\t%d\n", is_insertion? 1 : 0);
+		}
+	}
+pav_done:
+	for (i = 0; i < n; ++i) free(cs[i].gam);
+	free(acc); free(clu); free(cand); free(cs);
+}
+
+static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1030,11 +1312,16 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s)
 		cs[n].n_ref = nref, cs[n].gam = g, cs[n].n_gam = ng;
 		++n;
 	}
-	if (n == 0) { free(cs); return; }
+	if (n == 0) { // no ref anchor -> try the PAV breakpoint path (which reads s->mem[].pos)
+		free(cs);
+		if (p->lift) chain_emit_pav(p, s, km);
+		for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos);
+		return;
+	}
 	for (i = 0; i < n; ++i) (cs[i].rstrand? &spanm : &spanp)[0] += cs[i].qe - cs[i].qs;
 	strand = spanp >= spanm? 0 : 1;                       // dominant strand (ties -> '+')
 	{ int32_t m = 0; for (i = 0; i < n; ++i) { if (cs[i].rstrand == strand) cs[m++] = cs[i]; else free(cs[i].gam); } n = m; }
-	if (n == 0) { free(cs); return; }
+	if (n == 0) { free(cs); for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos); return; }
 	qsort(cs, n, sizeof(chain_sm_t), chain_cmp_sm);
 	for (i = 0; i < n; ++i) cs[i].anch = 1, cs[i].sc = (int64_t)(cs[i].qe - cs[i].qs) * 100, cs[i].prev = -1;
 	for (i = 0; i < n; ++i) { // colinear in-order DP: maximize (#anchors, bases - gap_penalty)
@@ -1110,12 +1397,13 @@ static void write_per_seq(step_t *t)
 	const pipeline_t *p = t->p;
 	int32_t i, j;
 	kstring_t out = {0,0,0};
+	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
 		free(s->seq);
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
-			chain_emit(p, s);
+			chain_emit(p, s, km);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
@@ -1189,6 +1477,7 @@ static void write_per_seq(step_t *t)
 		}
 		free(s->name); free(s->mem); free(s->gap);
 	}
+	if (km) km_destroy(km);
 	free(out.s);
 	free(t->rst);
 	free(t->rst_rev);
@@ -1332,6 +1621,12 @@ static ko_longopt_t long_options[] = {
 	{ "chain-max-occ",   ko_required_argument, 332 },
 	{ "ref-fasta",       ko_required_argument, 333 },
 	{ "splice-min",      ko_required_argument, 334 },
+	{ "pav-min-len",     ko_required_argument, 335 },
+	{ "walk",            ko_no_argument,       336 },
+	{ "trim-polya",      ko_required_argument, 337 },
+	{ "pav-grid",        ko_required_argument, 338 },
+	{ "pav-agree",       ko_required_argument, 340 },
+	{ "diverged-rows",       ko_required_argument, 339 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1385,8 +1680,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 309) {
 			if (strcmp(o.arg, "consensus") == 0) opt.walk_mode = RB3_WALK_CONSENSUS;
 			else if (strcmp(o.arg, "strict") == 0) opt.walk_mode = RB3_WALK_STRICT;
-			else if (strcmp(o.arg, "per-carrier") == 0) opt.walk_mode = RB3_WALK_PERCARRIER;
-			else { fprintf(stderr, "ERROR: --walk-mode must be consensus, strict or per-carrier\n"); return 1; }
+			else if (strcmp(o.arg, "per-assembly") == 0 || strcmp(o.arg, "per-carrier") == 0) opt.walk_mode = RB3_WALK_PERASSEMBLY;
+			else { fprintf(stderr, "ERROR: --walk-mode must be consensus, strict or per-assembly\n"); return 1; }
 		}
 		else if (c == 310) opt.max_occ = atol(o.arg);     // E2: occurrence cap; <0 = auto (#taxa)
 		else if (c == 311) opt.two_flank = 1;             // E1: require both flanks to anchor
@@ -1411,6 +1706,17 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
 		else if (c == 333) opt.ref_fasta = o.arg;                    // chain: reference FASTA -> GT-AG splice check
 		else if (c == 334) opt.splice_min = atoi(o.arg);             // chain: min ref gap for the GT-AG check
+		else if (c == 335) opt.pav_min_len = atoi(o.arg);            // chain --lift: assembly-only specificity floor
+		else if (c == 336) opt.allow_walk = 1;                       // refmap: opt in to deprecated walking
+		else if (c == 337) opt.trim_polya = atoi(o.arg);             // trim terminal poly-A/T runs >= INT bp
+		else if (c == 338) opt.pav_grid = rb3_parse_num(o.arg);      // chain --lift: pav position grid
+		else if (c == 340) opt.pav_agree = rb3_parse_num(o.arg);     // chain --lift: projection agreement
+		else if (c == 339) {                                         // chain --lift: colinear-row policy
+			if (strcmp(o.arg, "ordinary") == 0) opt.diverged_rows = 0;
+			else if (strcmp(o.arg, "pav") == 0) opt.diverged_rows = 1;
+			else if (strcmp(o.arg, "drop") == 0) opt.diverged_rows = 2;
+			else { fprintf(stderr, "ERROR: --diverged-rows must be ordinary|pav|drop\n"); return 1; }
+		}
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1454,12 +1760,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (strcmp(argv[0], "refmap") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
-			fprintf(stderr, "  --max-walk=NUM    max bases to walk outward along carriers per flank [%d]\n", opt.max_walk);
-			fprintf(stderr, "  --walk-mode=STR   carrier path: consensus|strict|per-carrier [consensus]\n");
+			fprintf(stderr, "  --lift=FILE       REQUIRED (standard): project assembly hits via a `ropebwt3 lift` map\n");
+			fprintf(stderr, "  --walk            opt in to the DEPRECATED flank-walking path instead of --lift\n");
+			fprintf(stderr, "  --max-walk=NUM    DEPRECATED (--walk only) max bases to walk per flank [%d]\n", opt.max_walk);
+			fprintf(stderr, "  --walk-mode=STR   DEPRECATED (--walk only) consensus|strict|per-assembly [consensus]\n");
 			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
 			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
 			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
-			fprintf(stderr, "  --lift=FILE       project carrier hits via a `ropebwt3 lift` map instead of walking\n");
 			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
 			fprintf(stderr, "  --lift-mad=NUM    liftover max residual MAD [%ld]\n", (long)opt.lift_mad);
 			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
@@ -1476,7 +1783,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --target-hits=NUM stop once NUM PLACED/EXACT records are written (0 = off, read everything) [%ld]\n", (long)opt.target_hits);
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
-			fprintf(stderr, "                    to the reference + all founders together, not per-genome; 0 for --kmer mode)\n");
+			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1485,6 +1792,25 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --chain-max-occ=INT  skip SMEMs whose FM interval exceeds this [auto: min(2*#samples,256)]\n");
 			fprintf(stderr, "  --ref-fasta=FILE  reference/pangenome FASTA -> GT-AG splice check on intron-gap links\n");
 			fprintf(stderr, "  --splice-min=INT  ref gap size above which the GT-AG check applies [%d]\n", opt.splice_min);
+			fprintf(stderr, "  --lift=FILE       `ropebwt3 lift` map; enables PAV breakpoint anchoring: reads with\n");
+			fprintf(stderr, "                    no reference SMEM emit one `pav:<contig>` row at the nearest\n");
+			fprintf(stderr, "                    reference breakpoint, plus a 5th column (1 = true insertion,\n");
+			fprintf(stderr, "                    0 = colinear = a divergent allele, not a PAV)\n");
+			fprintf(stderr, "  --diverged-rows=STR  DIVERGED rows -- sequence that IS in the reference but too\n");
+			fprintf(stderr, "                    divergent to share a SMEM, so the coordinate is colinear and exact\n");
+			fprintf(stderr, "                    rather than a breakpoint: ordinary|pav|drop\n");
+			fprintf(stderr, "                    [ordinary = emit as a normal row at its exact position]\n");
+			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid; a breakpoint is\n");
+			fprintf(stderr, "                    approximate, so this is the resolution actually claimed\n");
+			fprintf(stderr, "                    (0 = emit the exact projected position) [%d]\n", opt.pav_grid);
+			fprintf(stderr, "  --pav-agree=NUM   max spread among the assemblies' projections of the seed before\n");
+			fprintf(stderr, "                    the read is suppressed as unplaceable [%d]\n", opt.pav_agree);
+			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
+			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
+			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
+			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
+			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
 		}
 		if (strcmp(argv[0], "search") == 0) {
@@ -1548,6 +1874,18 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: refmap needs the sampled suffix array (.ssa) and sequence names (.len.gz)\n");
 			return 1;
 		}
+		// refmap: --lift is the standard resolution path. Flank walking is deprecated (it did
+		// not work well) and used to be the SILENT default when --lift was omitted, so an
+		// invocation that simply forgot --lift got the deprecated path and plausible-looking
+		// output. Require an explicit choice instead of defaulting to the bad one.
+		if (opt.algo == RB3_SA_REFMAP && opt.lift_fn == 0 && !opt.allow_walk) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "ERROR: refmap needs --lift=FILE (the standard path; build it with `ropebwt3 lift`).\n"
+								"       Flank walking is DEPRECATED and no longer the default; pass --walk to opt in.\n");
+			return 1;
+		}
+		if (opt.algo == RB3_SA_REFMAP && opt.allow_walk && opt.lift_fn == 0 && rb3_verbose >= 1)
+			fprintf(stderr, "WARNING: --walk selects the deprecated flank-walking path; prefer --lift=FILE.\n");
 		plen = strlen(opt.ref_prefix);
 		p.is_ref = RB3_CALLOC(uint8_t, p.fmi.sid->n_seq);
 		for (k = 0; k < p.fmi.sid->n_seq; ++k)
@@ -1590,7 +1928,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 					fprintf(stderr, "[M::%s] chain: N=%ld -> --chain-max-occ=%d, max_pos=%d\n", __func__, (long)n_taxa, opt.chain_max_occ, opt.max_pos);
 			}
 		}
-		if (opt.lift_fn) { // E4: load the carrier->reference liftover
+		if (opt.lift_fn) { // E4: load the assembly->reference liftover
 			p.lift = rb3_lift_restore(opt.lift_fn);
 			if (p.lift == 0) {
 				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);
