@@ -35,8 +35,12 @@ rld0.o:rld0.c rld0.h bre.h
 test/test_ps4g.o:test/test_ps4g.c ps4g.h rb3priv.h
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
 
-test/test_ps4g:test/test_ps4g.o ps4g.o misc.o
-		$(CC) $(CFLAGS) $^ -o $@ -lz -lm
+# ps4g.o now calls rb3_lift_nearest_ref/rb3_lift_ternary_state (lift.o), even though
+# this test only ever exercises them with ridx=0 -- the linker still needs the
+# symbols. lift.o pulls in the FM-index/SSA/kalloc/kthread objects transitively
+# (see test/test_lift's own link line below).
+test/test_ps4g:test/test_ps4g.o ps4g.o misc.o lift.o fm-index.o ssa.o kalloc.o kthread.o io.o rld0.o bre.o rle.o rope.o mrope.o
+		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
 
 test/test_hitcount.o:test/test_hitcount.c hitcount.h
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
@@ -44,14 +48,21 @@ test/test_hitcount.o:test/test_hitcount.c hitcount.h
 test/test_hitcount:test/test_hitcount.o hitcount.o
 		$(CC) $(CFLAGS) $^ -o $@ -lpthread
 
-test:$(PROG) test/test_ps4g test/test_hitcount
+test/test_lift.o:test/test_lift.c lift.h ps4g.h rb3priv.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_lift:test/test_lift.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o
+		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
+
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
+		./test/test_lift
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
