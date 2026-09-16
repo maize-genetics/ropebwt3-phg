@@ -29,6 +29,37 @@ static int n_pass = 0, n_fail = 0;
 		else { ++n_fail; fprintf(stderr, "FAIL: %s (%s:%d)\n", (msg), __FILE__, __LINE__); } \
 	} while (0)
 
+// Minimal <i4 .npy reader, mirroring test_ps4g.c's own static helper of the same
+// name (separate translation unit -- can't be shared without a new header).
+static int32_t *read_npy_i4(const char *fn, int64_t *rows, int64_t *cols)
+{
+	FILE *fp = fopen(fn, "rb");
+	uint8_t magic[6], ver[2], hlen_b[2];
+	uint16_t hlen;
+	char *hdr;
+	int32_t *data;
+	int64_t n;
+	if (fp == 0) return 0;
+	if (fread(magic, 1, 6, fp) != 6 || memcmp(magic, "\x93NUMPY", 6) != 0) { fclose(fp); return 0; }
+	if (fread(ver, 1, 2, fp) != 2) { fclose(fp); return 0; }
+	if (fread(hlen_b, 1, 2, fp) != 2) { fclose(fp); return 0; }
+	hlen = (uint16_t)(hlen_b[0] | (hlen_b[1] << 8));
+	hdr = RB3_MALLOC(char, hlen + 1);
+	if (fread(hdr, 1, hlen, fp) != (size_t)hlen) { free(hdr); fclose(fp); return 0; }
+	hdr[hlen] = 0;
+	if (strstr(hdr, "'descr': '<i4'") == 0) { fprintf(stderr, "npy dtype is not <i4: %s\n", hdr); free(hdr); fclose(fp); return 0; }
+	{
+		char *p = strstr(hdr, "'shape': (");
+		if (p == 0 || sscanf(p, "'shape': (%ld, %ld)", rows, cols) != 2) { free(hdr); fclose(fp); return 0; }
+	}
+	free(hdr);
+	n = (*rows) * (*cols);
+	data = RB3_MALLOC(int32_t, n);
+	if (fread(data, sizeof(int32_t), n, fp) != (size_t)n) { free(data); fclose(fp); return 0; }
+	fclose(fp);
+	return data;
+}
+
 // Mirrors rb3_liftpt_t's private layout in lift.c (int64 cpos, int64 rpos, int32
 // csid, int32 rsid = 24 bytes, no padding). Kept local: the real struct isn't
 // exposed via lift.h. sizeof() is asserted against 24 below as a format-drift guard.
@@ -153,6 +184,50 @@ static void test_ternary_state(void)
 	CHECK(rb3_lift_ternary_state(0, -1, 2000) == -1, "ternary_state: not in gameteset, no anchor at all (dist=-1) -> deletion(-1)");
 }
 
+/*******************************************
+ * rb3_ps4g_npy_finalize: ref_gamete column *
+ *******************************************/
+
+// Regression test for the ps4g.c:409-412 fix: the reference gamete's ternary
+// column must reflect whether THIS row's read genuinely carries the reference
+// gamete (in_set) -- not be hardcoded to match(1) regardless of gameteSet
+// content. Before the fix, EVERY row read back state=1 for the reference
+// column; a PLACED read lifted onto a reference coordinate via some OTHER
+// assembly was indistinguishable from a genuine reference hit.
+static void test_finalize_ref_gamete_ternary(const rb3_sid_t *sid, const rb3_gtab_t *gtab,
+											  const rb3_lift_ridx_t *ridx, const char *outdir)
+{
+	rb3_ps4g_acc_t *acc = rb3_ps4g_acc_init(100);
+	char npy_fn[512];
+	int32_t gset_with_b73[] = { G_A, G_B73 };  // row genuinely carries the reference gamete
+	int32_t gset_without_b73[] = { G_B };      // PLACED via B only -- must NOT read back as a B73 match
+	int32_t *mat;
+	int64_t rows = 0, cols = 0, n_g = gtab->n_gamete;
+
+	snprintf(npy_fn, sizeof(npy_fn), "%s/ref_gamete_ternary.npy", outdir);
+	rb3_ps4g_acc_add(acc, /*ref_sid=*/0, /*pos=*/1000, gset_with_b73, 2);
+	rb3_ps4g_acc_add(acc, /*ref_sid=*/0, /*pos=*/2000, gset_without_b73, 1);
+	rb3_ps4g_npy_finalize(acc, gtab, sid, /*bed=*/0, /*npy_binary=*/0, ridx,
+						   /*anchor_thresh=*/0, /*ref_gamete=*/G_B73,
+						   /*ps4g_fn=*/0, npy_fn, "unit-test-cmd");
+
+	mat = read_npy_i4(npy_fn, &rows, &cols);
+	CHECK(mat != 0, "finalize(ref_gamete): npy file parsed");
+	CHECK(rows == 2, "finalize(ref_gamete): 2 rows (bin @1000, bin @2000)");
+	CHECK(cols == 3 * n_g + 2, "finalize(ref_gamete): 3*n_gamete+2 columns (ridx widened)");
+	if (mat && rows == 2 && cols == 3 * n_g + 2) {
+		int32_t tern0 = mat[0 * cols + n_g + G_B73], dist0 = mat[0 * cols + 2 * n_g + G_B73];
+		int32_t tern1 = mat[1 * cols + n_g + G_B73], dist1 = mat[1 * cols + 2 * n_g + G_B73];
+		CHECK(tern0 == 1, "finalize(ref_gamete): row WITH B73 in gameteSet -> ternary=match(1)");
+		CHECK(dist0 == 0, "finalize(ref_gamete): row WITH B73 -> distance=0 (reference has no anchors to itself)");
+		CHECK(tern1 == 0, "finalize(ref_gamete): row WITHOUT B73 in gameteSet -> ternary=diverged(0), "
+			  "NOT hardcoded match -- the actual regression this test guards");
+		CHECK(dist1 == 0, "finalize(ref_gamete): row WITHOUT B73 -> distance still 0 (never a real deletion)");
+	}
+	free(mat);
+	rb3_ps4g_acc_destroy(acc);
+}
+
 int main(int argc, char *argv[])
 {
 	const char *outdir = argc > 1? argv[1] : "test/output";
@@ -179,6 +254,7 @@ int main(int argc, char *argv[])
 	ridx = rb3_lift_ridx_build(lf, gtab->sid2g, gtab->n_gamete);
 	CHECK(ridx != 0, "ridx_build: built successfully from the fixture");
 	test_nearest_ref(ridx);
+	test_finalize_ref_gamete_ternary(sid, gtab, ridx, outdir);
 	rb3_lift_ridx_destroy(ridx); // must not crash
 
 	test_ternary_state();

@@ -407,8 +407,15 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 					int64_t dist; int8_t state;
 					while (lo < hi) { int32_t mid = (lo + hi) >> 1; if (gset[mid] < g) lo = mid + 1; else hi = mid; } // gset is sorted; binary search g
 					in_set = (lo < m && gset[lo] == g);
-					if (g == ref_gamete) { state = 1, dist = 0; } // reference has no liftover anchors by construction; not a real deletion
-					else { dist = rb3_lift_nearest_ref(ridx, g, row[i].ref_sid, pos); state = rb3_lift_ternary_state(in_set, dist, anchor_thresh); }
+					// The reference has no liftover anchors to itself, so distance is
+					// trivially 0 (never a "deletion") -- but state must still reflect
+					// whether THIS row's placement actually carries the reference gamete
+					// (in_set), not be hardcoded to match. A PLACED read lifted onto a
+					// reference coordinate via some OTHER assembly does not thereby
+					// match the reference's own sequence there; only a row that
+					// genuinely supports the reference gamete should read state=1.
+					dist = (g == ref_gamete) ? 0 : rb3_lift_nearest_ref(ridx, g, row[i].ref_sid, pos);
+					state = rb3_lift_ternary_state(in_set, dist, anchor_thresh);
 					mat[i * cols + n_g + g] = state;
 					mat[i * cols + 2 * n_g + g] = (int32_t)dist;
 				}
