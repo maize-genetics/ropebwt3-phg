@@ -223,6 +223,64 @@ static int64_t i64_median(int64_t *a, int64_t n)
 	return a[n>>1];
 }
 
+// Optional LOCAL projection, tried before the wide-window median below. The wide
+// median offset over +-win (500kb by default) is robust but coarse: maize has 10-100kb
+// replacement/indel blocks every few hundred kb, so the median offset across a 1Mb
+// window is often tens of kb off at the read itself (measured: only 33% of PLACED
+// reads from collinear sequence land within 10kb of their true reference position).
+// When enabled (lift_local_win > 0), the nearest anchors on each side within
+// lift_local_win are used directly if they are collinear with each other; otherwise
+// the wide median runs unchanged, so no read that projected before fails now.
+static int64_t lift_local_win = 0, lift_local_tol = 1000;
+
+void rb3_lift_set_local(int64_t local_win, int64_t local_tol)
+{
+	lift_local_win = local_win, lift_local_tol = local_tol;
+}
+
+// Two anchors are collinear if their reference spacing equals their assembly spacing
+// (slope +1) or its negation (slope -1) within tol. Returns the slope sign, 0 if not.
+static int lift_collinear(const rb3_liftpt_t *x, const rb3_liftpt_t *y, int64_t tol)
+{
+	int64_t dc = y->cpos - x->cpos, dr = y->rpos - x->rpos;
+	if (x->rsid != y->rsid) return 0;
+	if (llabs(dr - dc) <= tol) return 1;
+	if (llabs(dr + dc) <= tol) return -1;
+	return 0;
+}
+
+static int lift_project_local(const rb3_lift_t *lf, int32_t csid, int64_t cpos,
+							  int64_t *out_rsid, int64_t *out_rpos)
+{
+	int64_t lo = lf->off[csid], hi = lf->off[csid + 1], j, l, r;
+	const rb3_liftpt_t *pt = lf->pt, *L = 0, *R = 0;
+	int s;
+	if (hi - lo < 2) return 0;
+	l = lo, r = hi; // j = first index with pt.cpos > cpos
+	while (l < r) { int64_t mid = (l + r) >> 1; if (pt[mid].cpos <= cpos) l = mid + 1; else r = mid; }
+	j = l;
+	if (j - 1 >= lo && cpos - pt[j-1].cpos <= lift_local_win) L = &pt[j-1];
+	if (j < hi && pt[j].cpos - cpos <= lift_local_win) R = &pt[j];
+	if (L && R && (s = lift_collinear(L, R, lift_local_tol)) != 0) { // bracketed by a collinear pair
+		int64_t v = L->rpos + s * (cpos - L->cpos), a = L->rpos < R->rpos? L->rpos : R->rpos, b = L->rpos < R->rpos? R->rpos : L->rpos;
+		*out_rsid = L->rsid, *out_rpos = v < a? a : v > b? b : v;
+		return 1;
+	}
+	// one-sided: the nearer anchor, confirmed by the next anchor on the same side
+	{
+		const rb3_liftpt_t *N = 0, *N2 = 0;
+		int64_t dL = L? cpos - L->cpos : -1, dR = R? R->cpos - cpos : -1;
+		if (L && (!R || dL <= dR)) { N = L; N2 = (j - 2 >= lo && L->cpos - pt[j-2].cpos <= lift_local_win)? &pt[j-2] : 0; }
+		else if (R) { N = R; N2 = (j + 1 < hi && pt[j+1].cpos - R->cpos <= lift_local_win)? &pt[j+1] : 0; }
+		if (N && N2 && (s = lift_collinear(N, N2, lift_local_tol)) != 0) {
+			*out_rsid = N->rsid, *out_rpos = N->rpos + s * (cpos - N->cpos);
+			if (*out_rpos < 0) *out_rpos = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 // Core projector. Finds the reference coordinate for a assembly hit by fitting a
 // colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
 // colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
@@ -237,6 +295,10 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
 	int64_t *resP, *resM, madP, madM, med;
 	rb3_liftpt_t *pt = lf->pt;
+	if (lift_local_win > 0 && lift_project_local(lf, csid, cpos, out_rsid, out_rpos)) {
+		if (out_mode) *out_mode = 0;
+		return 1;
+	}
 	if (hi - lo < min_support) return 0;
 	// binary search the window [cpos-win, cpos+win] within [lo,hi)
 	{
