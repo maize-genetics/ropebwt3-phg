@@ -17,6 +17,10 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 					 int64_t win, int64_t max_mad, int32_t min_support,
 					 int64_t *out_rsid, int64_t *out_rpos);
 
+// Enable local projection (nearest collinear flanking anchors within local_win bp,
+// collinearity tolerance local_tol bp) before the wide-window median. 0 = off.
+void rb3_lift_set_local(int64_t local_win, int64_t local_tol);
+
 // Like rb3_lift_project, but when the locus is not colinear (a PAV/insertion between
 // the flanking anchors) it returns the nearest reference anchor = the closest
 // breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0).
