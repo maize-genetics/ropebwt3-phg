@@ -422,11 +422,69 @@ static int ridx_perm_cmp(const void *a, const void *b)
 	return xa < xb? -1 : xa > xb? 1 : 0;
 }
 
+// Optional syntenic-anchor filter for the nearest-anchor index. Without it, ANY anchor a
+// founder has near a reference position counts -- including anchors from a copy of the
+// sequence elsewhere in the founder (TEs, dispersed duplications), which is why founders
+// that AnchorWave calls deleted over >20kb still read as present ~44% of the time. With
+// syn_min_span > 0, an anchor is kept only if it lies in a run of consecutive anchors on
+// the same assembly sequence (sorted by cpos) that are pairwise collinear within syn_tol
+// and whose reference span is >= syn_min_span bp. Projection (lift_project_core) is
+// unaffected; only the ternary/distance lookup uses this index.
+static int64_t syn_min_span = 0, syn_tol = 1000, syn_max_skip = 0;
+
+void rb3_lift_set_syntenic(int64_t min_span, int64_t tol, int64_t max_skip)
+{
+	syn_min_span = min_span, syn_tol = tol, syn_max_skip = max_skip;
+}
+
+static uint8_t *lift_syntenic_mask(const rb3_lift_t *lf, int64_t *n_kept)
+{
+	// Greedy chaining along each assembly sequence: a run extends from its last member to
+	// the next anchor collinear with it (same slope sign), skipping up to syn_max_skip
+	// intervening non-collinear anchors (strays such as a TE copy inside a syntenic block),
+	// which are left for later runs. Runs with reference span >= syn_min_span are kept.
+	uint8_t *keep = RB3_CALLOC(uint8_t, lf->n_pt > 0? lf->n_pt : 1);
+	uint8_t *used = RB3_CALLOC(uint8_t, lf->n_pt > 0? lf->n_pt : 1);
+	int64_t *mem = RB3_MALLOC(int64_t, lf->n_pt > 0? lf->n_pt : 1);
+	int64_t i, j, n = 0;
+	for (i = 0; i < lf->n_pt; ++i) {
+		int64_t last = i, lo, hi, nm = 0, skipped = 0, k;
+		int s = 0, s1;
+		if (used[i]) continue;
+		used[i] = 1, mem[nm++] = i;
+		lo = hi = lf->pt[i].rpos;
+		for (j = i + 1; j < lf->n_pt && lf->pt[j].csid == lf->pt[i].csid; ++j) {
+			if (used[j]) continue;
+			s1 = lift_collinear(&lf->pt[last], &lf->pt[j], syn_tol);
+			if (s1 != 0 && (s == 0 || s1 == s)) {
+				if (s == 0) s = s1;
+				used[j] = 1, mem[nm++] = j, last = j, skipped = 0;
+				if (lf->pt[j].rpos < lo) lo = lf->pt[j].rpos;
+				if (lf->pt[j].rpos > hi) hi = lf->pt[j].rpos;
+			} else if (++skipped > syn_max_skip) break;
+		}
+		if (hi - lo >= syn_min_span) {
+			for (k = 0; k < nm; ++k) keep[mem[k]] = 1;
+			n += nm;
+		}
+	}
+	free(used); free(mem);
+	*n_kept = n;
+	return keep;
+}
+
 rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g, int32_t n_gamete)
 {
 	rb3_lift_ridx_t *ridx;
-	int64_t i, n_buckets, *cursor;
+	int64_t i, n_buckets, *cursor, n_kept = 0;
+	uint8_t *keep = 0;
 	if (lf == 0 || sid2g == 0 || n_gamete <= 0) return 0;
+	if (syn_min_span > 0) {
+		keep = lift_syntenic_mask(lf, &n_kept);
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] syntenic-anchor filter (span>=%ld, tol=%ld): kept %ld of %ld anchors\n",
+					__func__, (long)syn_min_span, (long)syn_tol, (long)n_kept, (long)lf->n_pt);
+	}
 	ridx = RB3_CALLOC(rb3_lift_ridx_t, 1);
 	ridx->n_gamete = n_gamete;
 	ridx->n_seq = lf->n_seq;
@@ -436,6 +494,7 @@ rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g,
 	ridx->perm = RB3_MALLOC(int32_t, lf->n_pt > 0? lf->n_pt : 1);
 	for (i = 0; i < lf->n_pt; ++i) { // pass 1: bucket sizes -> off[key+1]
 		int32_t g = sid2g[lf->pt[i].csid];
+		if (keep && !keep[i]) continue;
 		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
 		ridx->off[key + 1]++;
 	}
@@ -444,10 +503,12 @@ rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g,
 	memcpy(cursor, ridx->off, n_buckets * sizeof(int64_t));
 	for (i = 0; i < lf->n_pt; ++i) { // pass 2: place into perm[] via the cursor
 		int32_t g = sid2g[lf->pt[i].csid];
+		if (keep && !keep[i]) continue;
 		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
 		ridx->perm[cursor[key]++] = (int32_t)i;
 	}
 	free(cursor);
+	free(keep);
 	ridx_sort_pt = lf->pt; // pass 3: sort each bucket's slice of perm[] by rpos
 	for (i = 0; i < n_buckets; ++i) {
 		int64_t lo = ridx->off[i], hi = ridx->off[i+1];

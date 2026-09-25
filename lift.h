@@ -43,6 +43,11 @@ typedef struct rb3_lift_ridx_s rb3_lift_ridx_t;
 rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g, int32_t n_gamete);
 void rb3_lift_ridx_destroy(rb3_lift_ridx_t *ridx);
 
+// Syntenic-anchor filter for rb3_lift_ridx_build (0 = off): keep only anchors in collinear
+// runs spanning >= min_span reference bp (collinearity tolerance tol bp),
+// chaining past up to max_skip non-collinear strays. Call before building.
+void rb3_lift_set_syntenic(int64_t min_span, int64_t tol, int64_t max_skip);
+
 // Distance (bp) from reference position (rsid,rpos) to the nearest liftover anchor
 // belonging to `gamete` on that same reference sequence. Returns -1 if that gamete
 // has no anchor at all on rsid (e.g. the reference gamete itself, which has zero

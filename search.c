@@ -1645,6 +1645,9 @@ static ko_longopt_t long_options[] = {
 	{ "lift-mad",        ko_required_argument, 315 },
 	{ "lift-local-win",  ko_required_argument, 360 },
 	{ "lift-local-tol",  ko_required_argument, 361 },
+	{ "anchor-syntenic-span", ko_required_argument, 362 },
+	{ "anchor-syntenic-tol",  ko_required_argument, 363 },
+	{ "anchor-syntenic-skip", ko_required_argument, 364 },
 	{ "kmer",            ko_required_argument, 316 },
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
@@ -1686,6 +1689,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
 	int64_t lift_local_win_opt = 0, lift_local_tol_opt = 1000; // --lift-local-win/--lift-local-tol
+	int64_t syn_span_opt = 0, syn_tol_opt = 1000, syn_skip_opt = 0; // --anchor-syntenic-span/-tol/-skip
 
 	rb3_mopt_init(&opt);
 	p.opt = &opt, p.id = 0;
@@ -1736,6 +1740,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 315) opt.lift_mad = rb3_parse_num(o.arg);
 		else if (c == 360) lift_local_win_opt = rb3_parse_num(o.arg);
 		else if (c == 361) lift_local_tol_opt = rb3_parse_num(o.arg);
+		else if (c == 362) syn_span_opt = rb3_parse_num(o.arg);
+		else if (c == 363) syn_tol_opt = rb3_parse_num(o.arg);
+		else if (c == 364) syn_skip_opt = rb3_parse_num(o.arg);
 		else if (c == 316) opt.kmer_len = atoi(o.arg);    // k-mer-agreement placement (0 = off)
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
@@ -1849,6 +1856,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
 			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
 			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
+			fprintf(stderr, "  --anchor-syntenic-span=NUM  with --anchor-dist-npy, only count anchors in collinear runs\n");
+			fprintf(stderr, "                    spanning >= NUM reference bp (drops TE/duplicate copies) [0 = off]\n");
+			fprintf(stderr, "  --anchor-syntenic-tol=NUM  collinearity tolerance for --anchor-syntenic-span [1000]\n");
+			fprintf(stderr, "  --anchor-syntenic-skip=NUM  non-collinear stray anchors a run may skip over [0]\n");
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -2027,6 +2038,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 				}
 				for (k = 0; k < p.fmi.sid->n_seq; ++k) // any reference sequence's gamete is THE reference gamete
 					if (p.is_ref[k]) { ref_gamete = p.gtab->sid2g[k]; break; }
+				rb3_lift_set_syntenic(syn_span_opt, syn_tol_opt, syn_skip_opt);
 				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
 				if (rb3_verbose >= 3)
 					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
