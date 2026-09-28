@@ -81,6 +81,18 @@ typedef struct {
 	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
 	int64_t anchor_dist_thresh; // refmap --anchor-dist-npy: distance (bp) at/under which a
 	                    // non-matching founder reads as diverged rather than deletion
+	// refmap read filters (all 0 = off; opt-in). A read failing any enabled filter is reported
+	// as FILTERED and contributes nothing to --ps4g/--npy/--ps4g-per-read/--target-hits.
+	double placed_min_chr_agree; // PLACED: min fraction of projecting assemblies on the majority ref seq
+	int32_t placed_min_proj;     // PLACED: min number of assemblies that project through the lift
+	int64_t placed_max_spread;   // PLACED: max (max-min) of projected positions on the majority ref seq (bp)
+	int32_t exact_max_ref_hits;  // EXACT: max reference occurrences of the matched sequence
+	double exact_min_asm_agree;  // EXACT: min fraction of lift-projected assembly hits that land within
+	                             // exact_agree_dist of the reported reference hit (same ref seq)
+	int32_t exact_min_asm_proj;  // EXACT: apply exact_min_asm_agree only if >= this many assembly hits project
+	int64_t exact_agree_dist;    // EXACT: distance (bp) for an assembly projection to count as agreeing
+	int32_t min_core_len;        // EXACT/PLACED: min exact-match length (read length, or SMEM core on fallback)
+	int8_t filter_stats;         // append per-read filter features as extra TSV columns
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -118,6 +130,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
 	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
+	opt->exact_min_asm_proj = 1, opt->exact_agree_dist = 100000; // only used when --exact-min-asm-agree > 0
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -171,6 +184,7 @@ typedef struct {
 #define RB3_RM_ONE_SIDE 2
 #define RB3_RM_EXACT    3
 #define RB3_RM_MULTI    4 // query occurs > max_occ times (repeat/retro): not placed
+#define RB3_RM_FILTERED 5 // EXACT/PLACED rejected by an opt-in read filter (--placed-*/--exact-*/--min-core-len)
 
 typedef struct refmap_rst_s {
 	int8_t status;       // RB3_RM_*
@@ -194,6 +208,14 @@ typedef struct refmap_rst_s {
 	             // is correctly counted more than once -- this is real signal, not an artifact to
 	             // divide away; empirically, a single-copy locus present in only one assembly reports
 	             // occ=1, not 2 -- verified directly against known unique loci, see --report-occ help).
+	// read-filter features (whole-read + --lift mode only; -1 = not computed)
+	int32_t core_len;    // exact-match length used (s->len for an end-to-end match, else SMEM core)
+	int32_t n_proj, n_chr_agree; // PLACED: assemblies projecting / on the majority ref seq
+	int64_t spread;      // PLACED: max-min projected position on the majority ref seq
+	int32_t n_ref_hits;  // EXACT: reference occurrences
+	int32_t a_proj, a_agree; // EXACT: assembly hits projecting / agreeing with the reported ref hit
+	char filt;           // FILTERED reason: 'c' chr-agree, 'n' min-proj, 's' spread, 'r' ref-hits,
+	                     // 'a' asm-agree, 'l' core-len; 0 = kept
 } refmap_rst_t;
 
 typedef struct {
@@ -550,6 +572,46 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 	med = v[m >> 1];
 	r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
 	r->cL = r->cR = med, r->ins_size = 0;
+	r->n_proj = n, r->n_chr_agree = bestn, r->spread = v[m - 1] - v[0];
+}
+
+// EXACT read-filter features: number of reference occurrences among the located hits, and how
+// many assembly hits project (via --lift) onto the reported reference hit (same ref seq, within
+// exact_agree_dist). A read from sequence absent at its true B73 locus that matches a B73 paralog
+// elsewhere typically has assembly copies at the TRUE locus that project away from the B73 hit.
+static void refmap_exact_feats(void *km, const pipeline_t *p, const m_seq_t *s, const rb3_pos_t *pos, int64_t np, refmap_rst_t *r)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int64_t i;
+	r->n_ref_hits = 0, r->a_proj = r->a_agree = 0;
+	for (i = 0; i < np; ++i) {
+		int64_t clen, st, en, rsid, rpos;
+		if (p->is_ref[pos[i].sid>>1]) { ++r->n_ref_hits; continue; }
+		if (p->lift == 0 || (p->opt->exact_min_asm_agree <= 0.0 && !p->opt->filter_stats)) continue;
+		pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+		if (rb3_lift_project(p->lift, km, (int32_t)(pos[i].sid >> 1), st, p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos)) {
+			++r->a_proj;
+			if (rsid == r->ref_sid && (rpos > r->cL? rpos - r->cL : r->cL - rpos) <= p->opt->exact_agree_dist) ++r->a_agree;
+		}
+	}
+}
+
+// Opt-in read filters: demote an EXACT/PLACED call to FILTERED (no npy/ps4g contribution).
+static void refmap_apply_filters(const rb3_mopt_t *o, refmap_rst_t *r)
+{
+	char why = 0;
+	if (r->status != RB3_RM_EXACT && r->status != RB3_RM_PLACED) return;
+	if (o->min_core_len > 0 && r->core_len >= 0 && r->core_len < o->min_core_len) why = 'l';
+	else if (r->status == RB3_RM_PLACED && r->n_proj > 0) {
+		if (o->placed_min_proj > 0 && r->n_proj < o->placed_min_proj) why = 'n';
+		else if (o->placed_min_chr_agree > 0.0 && (double)r->n_chr_agree < o->placed_min_chr_agree * r->n_proj - 1e-9) why = 'c';
+		else if (o->placed_max_spread > 0 && r->spread > o->placed_max_spread) why = 's';
+	} else if (r->status == RB3_RM_EXACT) {
+		if (o->exact_max_ref_hits > 0 && r->n_ref_hits > o->exact_max_ref_hits) why = 'r';
+		else if (o->exact_min_asm_agree > 0.0 && r->a_proj >= o->exact_min_asm_proj && r->a_proj > 0
+				 && (double)r->a_agree < o->exact_min_asm_agree * r->a_proj - 1e-9) why = 'a';
+	}
+	if (why) r->status = RB3_RM_FILTERED, r->filt = why;
 }
 
 // One reference-coordinate vote from a k-mer. sx = the physical source sequence
@@ -686,6 +748,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	memset(r, 0, sizeof(*r));
 	r->status = RB3_RM_UNPLACED, r->strand = 0, r->qlen = s->len;
 	r->ref_sid = -1, r->cL = r->cR = -1;
+	r->core_len = s->len, r->n_proj = r->n_chr_agree = r->n_ref_hits = r->a_proj = r->a_agree = -1, r->spread = -1;
 
 	if (!refmap_query_interval(f, s->len, s->seq, &Iq) || Iq.size == 0) {
 		// no end-to-end match (e.g. a sequencing error): fall back to the longest exact core (SMEM)
@@ -699,6 +762,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		kfree(km, mem.a);
 		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
+		r->core_len = bestlen;
 	}
 	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/assembly-cap truncation
 	                  // below, so MULTI/EXACT/PLACED rows all carry the true occurrence count
@@ -732,6 +796,8 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
 				r->n_gametes = m;
 			}
+			refmap_exact_feats(km, p, s, pos, np, r);
+			refmap_apply_filters(p->opt, r);
 			kfree(km, pos);
 			return;
 		}
@@ -756,6 +822,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 
 	if (p->lift) { // E4: project assembly hits to the reference instead of walking
 		refmap_place_lift(km, p, s, r);
+		refmap_apply_filters(p->opt, r);
 		return;
 	}
 
@@ -853,9 +920,9 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 	rb3_sprintf_lite(out, "//\n");
 }
 
-static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ)
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ, int filter_stats)
 {
-	static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
+	static const char *status_str[6] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI", "FILTERED" };
 	int32_t k;
 	out->l = 0;
 	write_name(out, s);
@@ -880,6 +947,9 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%d", r->n_vote, r->agree, r->second, r->mapq);
 	if (report_occ) // --report-occ: raw FM-index interval size (pangenome-wide occurrence count; see refmap_rst_t.occ)
 		rb3_sprintf_lite(out, "\t%ld", (long)r->occ);
+	if (filter_stats) // --filter-stats: core_len n_proj n_chr_agree spread n_ref_hits a_proj a_agree filt
+		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%ld\t%d\t%d\t%d\t%c", r->core_len, r->n_proj, r->n_chr_agree, (long)r->spread,
+						 r->n_ref_hits, r->a_proj, r->a_agree, r->filt? r->filt : '.');
 	rb3_sprintf_lite(out, "\n");
 }
 
@@ -930,7 +1000,7 @@ static void write_refmap(step_t *t)
 		int kmer = p->opt->kmer_len > 0;
 		if (r->n_sub > 0) { // per-assembly mode: one line per assembly (sub->assemblies borrows r->assemblies)
 			for (k = 0; k < r->n_sub; ++k) {
-				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ);
+				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ, p->opt->filter_stats);
 				fputs(out.s, stdout);
 				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
 				write_ps4g_read(p->ps4g_per_read_fp, f, s, &r->sub[k]);
@@ -939,7 +1009,7 @@ static void write_refmap(step_t *t)
 			}
 			free(r->sub);
 		} else {
-			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ);
+			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ, p->opt->filter_stats);
 			fputs(out.s, stdout);
 			refmap_rst_accumulate(p->ps4g_acc, r);
 			write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
@@ -1671,6 +1741,15 @@ static ko_longopt_t long_options[] = {
 	{ "insertion-rows",      ko_required_argument, 342 },
 	{ "anchor-dist-npy",     ko_no_argument,       343 },
 	{ "anchor-dist-thresh",  ko_required_argument, 344 },
+	{ "placed-min-chr-agree", ko_required_argument, 345 },
+	{ "placed-min-proj",     ko_required_argument, 346 },
+	{ "placed-max-spread",   ko_required_argument, 347 },
+	{ "exact-max-ref-hits",  ko_required_argument, 348 },
+	{ "exact-min-asm-agree", ko_required_argument, 349 },
+	{ "exact-min-asm-proj",  ko_required_argument, 350 },
+	{ "exact-agree-dist",    ko_required_argument, 351 },
+	{ "min-core-len",        ko_required_argument, 352 },
+	{ "filter-stats",        ko_no_argument,       353 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1772,6 +1851,15 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
 		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
+		else if (c == 345) opt.placed_min_chr_agree = atof(o.arg);
+		else if (c == 346) opt.placed_min_proj = atoi(o.arg);
+		else if (c == 347) opt.placed_max_spread = rb3_parse_num(o.arg);
+		else if (c == 348) opt.exact_max_ref_hits = atoi(o.arg);
+		else if (c == 349) opt.exact_min_asm_agree = atof(o.arg);
+		else if (c == 350) opt.exact_min_asm_proj = atoi(o.arg);
+		else if (c == 351) opt.exact_agree_dist = rb3_parse_num(o.arg);
+		else if (c == 352) opt.min_core_len = atoi(o.arg);
+		else if (c == 353) opt.filter_stats = 1;
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1849,6 +1937,20 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
 			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
 			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
+			fprintf(stderr, "  Read filters (whole-read --lift mode; all off by default; a rejected read is\n");
+			fprintf(stderr, "  reported as FILTERED and adds nothing to --ps4g/--npy):\n");
+			fprintf(stderr, "  --placed-min-chr-agree=FRAC  PLACED: min fraction of projecting assemblies on the\n");
+			fprintf(stderr, "                    majority reference sequence (0 = off)\n");
+			fprintf(stderr, "  --placed-min-proj=INT  PLACED: min #assemblies projecting through the lift (0 = off)\n");
+			fprintf(stderr, "  --placed-max-spread=NUM  PLACED: max spread (bp) of projections on the majority seq (0 = off)\n");
+			fprintf(stderr, "  --exact-max-ref-hits=INT  EXACT: max #reference occurrences (0 = off)\n");
+			fprintf(stderr, "  --exact-min-asm-agree=FRAC  EXACT: min fraction of lift-projected assembly hits landing\n");
+			fprintf(stderr, "                    within --exact-agree-dist of the reported reference hit (0 = off)\n");
+			fprintf(stderr, "  --exact-min-asm-proj=INT  apply --exact-min-asm-agree only with >= INT projections [%d]\n", opt.exact_min_asm_proj);
+			fprintf(stderr, "  --exact-agree-dist=NUM  see --exact-min-asm-agree [%ld]\n", (long)opt.exact_agree_dist);
+			fprintf(stderr, "  --min-core-len=INT  EXACT/PLACED: min exact-match length (SMEM core on fallback) (0 = off)\n");
+			fprintf(stderr, "  --filter-stats    append core_len,n_proj,n_chr_agree,spread,n_ref_hits,a_proj,a_agree,\n");
+			fprintf(stderr, "                    filter-reason columns to each output row\n");
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
