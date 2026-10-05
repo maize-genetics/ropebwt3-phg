@@ -344,6 +344,74 @@ check_eq "--diverged-rows=drop leaves the all-insertion output unchanged" \
 	>/dev/null 2>"$TMP/badarg.log"
 check_eq "--diverged-rows rejects an invalid value" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
 
+# --- 6. chain --anchor-dist-npy: the same ternary + distance block refmap writes ---
+# chain feeds the same PS4G/npy accumulator as refmap, so --anchor-dist-npy must give the same
+# (3*n_gamete+2)-column layout and sidecars. A synthetic spliced read (B73[0,60) + B73[400,460),
+# a 340 bp "intron") checks that each exon segment becomes its own row at its own start bin,
+# carrying the read's chain-wide founder set.
+B73_SEQ=$(awk '/^>B73_chr1/{f=1;next}/^>/{f=0}f' "$DIR/pangenome.fa" | tr -d '\n')
+{ cat "$DIR/queries.fa"; printf '>spliced_query\n%s%s\n' "${B73_SEQ:0:60}" "${B73_SEQ:400:60}"; } > "$TMP/chain_q.fa"
+
+"$RB" chain --ref-prefix=B73 --npy "$TMP/cad_nolift.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>"$TMP/cad_nolift.log"
+check_eq "chain --anchor-dist-npy without --lift exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+check_line_in "chain --anchor-dist-npy without --lift names the missing option (same error as refmap)" \
+	"$TMP/cad_nolift.log" "ERROR: --anchor-dist-npy requires --lift=FILE"
+
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad_plain.ps4g" --npy "$TMP/cad_plain.npy" \
+	-t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad_plain.tsv" 2>/dev/null
+check_eq "chain --npy (plain) exits 0" "$?" "0"
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad.ps4g" --npy "$TMP/cad.npy" \
+	--anchor-dist-npy --anchor-dist-thresh=2000 -t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad.tsv" 2>/dev/null
+check_eq "chain --anchor-dist-npy exits 0" "$?" "0"
+check_eq "chain --anchor-dist-npy leaves stdout unchanged" \
+	"$(cmp -s "$TMP/cad_plain.tsv" "$TMP/cad.tsv" && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves the PS4G file unchanged (modulo #Command)" \
+	"$(cmp -s <(grep -v '^#Command' "$TMP/cad_plain.ps4g") <(grep -v '^#Command' "$TMP/cad.ps4g") && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves bins.tsv unchanged" \
+	"$(cmp -s "$TMP/cad_plain.npy.bins.tsv" "$TMP/cad.npy.bins.tsv" && echo same || echo differ)" "same"
+check_line_in "chain spliced read: exon 1 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t0\t0,1,2,3,4,5,6')"
+check_line_in "chain spliced read: exon 2 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t400\t0,1,2,3,4,5,6')"
+cad_header=$(head -c 200 "$TMP/cad.npy" | tr -d '\0')
+cad_shape=$(echo "$cad_header" | grep -oE "'shape': \([0-9]+, [0-9]+\)" | grep -oE '[0-9]+' | tr '\n' ' ')
+check_eq "chain --anchor-dist-npy: 4 rows x 23 columns (3*7 gametes + 2 labels)" "$cad_shape" "4 23 "
+check_line_in "chain --anchor-dist-npy writes the layout sidecar (ternary block)" "$TMP/cad.npy.layout.tsv" \
+	"$(printf 'ternary\t7\t14\tmatch(1)/diverged(0)/deletion(-1) per founder')"
+check_eq "plain chain --npy writes no layout sidecar" "$([ -e "$TMP/cad_plain.npy.layout.tsv" ] && echo yes || echo no)" "no"
+
+"$RB" refmap --ref-prefix=B73 --lift="$LIFT" --npy "$TMP/rad.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>/dev/null
+check_eq "refmap --anchor-dist-npy exits 0 on the same input" "$?" "0"
+check_eq "chain and refmap write the same layout sidecar" \
+	"$(cmp -s "$TMP/rad.npy.layout.tsv" "$TMP/cad.npy.layout.tsv" && echo same || echo differ)" "same"
+
+if [ -n "$NPY_PY" ]; then
+	"$NPY_PY" - "$TMP/cad_plain.npy" "$TMP/cad.npy" "$TMP/rad.npy" <<'EOF'
+import sys, numpy as np
+plain, wide, rwide = (np.load(f) for f in sys.argv[1:4])
+K = 7
+assert wide.dtype == np.int32 and wide.shape == (4, 3 * K + 2), wide.shape
+assert rwide.dtype == wide.dtype and rwide.shape[1] == wide.shape[1], (rwide.shape, wide.shape)
+# the count block and the label columns are exactly the plain --npy output
+assert (wide[:, :K] == plain[:, :K]).all() and (wide[:, -2:] == plain[:, -2:]).all()
+for a in (wide, rwide):  # refmap's definition, applied cell by cell, holds for both commands
+    cnt, tern, dist = a[:, :K], a[:, K:2*K], a[:, 2*K:3*K]
+    assert set(np.unique(tern)) <= {-1, 0, 1}
+    assert ((tern == 1) == (cnt > 0)).all(), "ternary match must be exactly the row's founder set"
+    off = tern != 1
+    assert ((tern == 0) == (off & (dist >= 0) & (dist <= 2000))).all()
+    assert ((tern == -1) == (off & ((dist < 0) | (dist > 2000)))).all()
+    assert (dist[:, 0] == 0).all(), "reference gamete distance is 0 by construction"
+# rows: bin0 {B73} (ref_query), bin0 {1..6} (insertion reads), bin0 {all} and bin1 {all} (spliced read)
+assert wide[:, K:2*K].tolist() == [[1,0,0,0,0,0,0], [0,1,1,1,1,1,1], [1]*7, [1]*7], wide[:, K:2*K].tolist()
+assert wide[2, :K].tolist() == [1]*7 and wide[3, :K].tolist() == [1]*7, "one count per exon segment"
+print("CHAIN_ANCHOR_DIST_OK")
+EOF
+	if [ $? -eq 0 ]; then pass; else fail "chain --anchor-dist-npy numpy check raised an assertion"; fi
+else
+	echo "SKIP: chain --anchor-dist-npy numpy check needs a python3 with numpy" >&2
+fi
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \

@@ -75,11 +75,11 @@ typedef struct {
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
 	                    // extra output column (0 = off, opt-in -- see --report-occ)
-	int8_t anchor_dist_npy; // refmap --npy: also write a per-founder ternary read-sharing block
+	int8_t anchor_dist_npy; // refmap/chain --npy: also write a per-founder ternary read-sharing block
 	                    // (match/diverged/deletion) and a per-founder distance-to-nearest-lift-anchor
 	                    // block, widening --npy from (bin x gamete+2) to (bin x 3*gamete+2)
 	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
-	int64_t anchor_dist_thresh; // refmap --anchor-dist-npy: distance (bp) at/under which a
+	int64_t anchor_dist_thresh; // refmap/chain --anchor-dist-npy: distance (bp) at/under which a
 	                    // non-matching founder reads as diverged rather than deletion
 	rb3_swopt_t swo;
 } rb3_mopt_t;
@@ -152,9 +152,9 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
-	rb3_lift_ridx_t *lift_ridx; // refmap --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
-	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
-	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
+	rb3_lift_ridx_t *lift_ridx; // refmap/chain --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
+	rb3_gtab_t *gtab;      // refmap/chain --ps4g/--npy: sample (gamete) table, NULL unless requested
+	rb3_ps4g_acc_t *ps4g_acc; // refmap/chain --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
@@ -1679,6 +1679,19 @@ static ko_longopt_t long_options[] = {
 	{ 0, 0, 0 }
 };
 
+// --anchor-dist-npy/--anchor-dist-thresh usage, shared verbatim by refmap and chain: both
+// commands feed the same PS4G/npy accumulator and rb3_ps4g_npy_finalize builds the block.
+static void usage_anchor_dist(const rb3_mopt_t *opt)
+{
+	fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
+	fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
+	fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
+	fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
+	fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
+	fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
+	fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt->anchor_dist_thresh);
+}
+
 int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 {
 	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0, ref_gamete = -1; // --anchor-dist-npy: gamete index of the reference genome, -1 if unknown
@@ -1842,13 +1855,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
-			fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
-			fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
-			fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
-			fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
-			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
-			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
-			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
+			usage_anchor_dist(&opt);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1889,6 +1896,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
 			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
 			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
+			fprintf(stderr, "  --lift-local-win=NUM  --lift projection: nearest collinear flanking anchors within\n"
+			                "                    NUM bp first (0 = off) [0]; --lift-local-tol=NUM tolerance [1000]\n");
+			usage_anchor_dist(&opt);
+			fprintf(stderr, "                    chain: a row's founder set is the read's chain-wide intersection;\n");
+			fprintf(stderr, "                    a spliced read gives one row per exon segment, each judged at\n");
+			fprintf(stderr, "                    its own start; use --insertion-rows=ordinary so insertion rows\n");
+			fprintf(stderr, "                    are not --pav-grid snapped before the anchor-distance lookup\n");
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -2030,6 +2044,17 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
 				if (rb3_verbose >= 3)
 					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
+				// chain shares this block unchanged: chain_emit/chain_emit_pav feed the same accumulator
+				// (one event per emitted row: reference sequence, row start, the read's founder set) and
+				// rb3_ps4g_npy_finalize derives the ternary/distance columns per (contig,bin,gameteSet)
+				// row exactly as for refmap. So for a chained read: 1 = founder carries EVERY SMEM of the
+				// winning chain (the chain-wide intersection, the same set stdout/PS4G report); each exon
+				// segment is its own row, judged against that founder's lift anchors at the segment's own
+				// start bin. Grid-snapped insertion rows (--insertion-rows=pav, the chain default) are
+				// looked up at the snapped coordinate, up to --pav-grid bp from the real breakpoint.
+				if (opt.algo == RB3_SA_CHAIN && opt.insertion_rows == 1 && opt.pav_grid > 0 && rb3_verbose >= 2)
+					fprintf(stderr, "WARNING: chain --anchor-dist-npy with --insertion-rows=pav: insertion rows are snapped to "
+									"--pav-grid=%d before the anchor-distance lookup; --insertion-rows=ordinary keeps them exact\n", opt.pav_grid);
 			}
 			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
 				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);

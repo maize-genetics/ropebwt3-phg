@@ -41,5 +41,15 @@ from the repository root. This builds `ropebwt3`, `test/test_ps4g`, and
   `--target-hits` under real multi-threaded compute). Both are skipped (not
   failed) when unavailable, with a `SKIP:` note on stderr.
 
+* **`test_lift.c`** — unit tests for the lift reference-position index and the
+  `--anchor-dist-npy` ternary/distance block (`rb3_lift_nearest_ref`,
+  `rb3_lift_ternary_state`, `rb3_ps4g_npy_finalize` with a lift index), including
+  the per-segment judgement of a spliced (`chain`) read's exon rows.
+
+`run_integration.sh` section 6 runs `chain --npy --anchor-dist-npy` end to end on
+the fixture plus a synthetic spliced read: the missing-`--lift` error, unchanged
+stdout/PS4G/bins.tsv versus plain `--npy`, the `3*n_gametes+2` shape and layout
+sidecar (identical to `refmap`'s), and a numpy check of the ternary definition.
+
 Outputs land in `test/output/` and `test/tmp/` (gitignored); `make clean`
 removes them along with the build artifacts.
