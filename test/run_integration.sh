@@ -412,6 +412,30 @@ else
 	echo "SKIP: chain --anchor-dist-npy numpy check needs a python3 with numpy" >&2
 fi
 
+# --- 7. chain never links SMEMs on different reference contigs ---
+# Two unrelated reference contigs: B73_chr1 (copied into Oh43) and B73_chr2 (copied into Mo17). The
+# read is 80 bp of chr1 at 1000 followed by 80 bp of chr2 at 1020, so the two SMEMs sit at
+# similar coordinates on different contigs. Linking them would emit one chr1 row whose founder set is
+# {B73,Oh43} ∩ {B73,Mo17} = {B73}; the colinear DP must instead keep them apart, leaving the best
+# single-contig chain. With this seed the chr2 SMEM extends 2 bp left into the chr1 half (the random
+# sequences share those bases), so it is the longer one and wins: chr2 at 1018, B73 + Mo17 = 0,1.
+awk 'BEGIN{srand(7); split("ACGT", b, ""); for (c = 1; c <= 2; ++c) { s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]; seq[c] = s }
+     print ">B73_chr1"; print seq[1]; print ">B73_chr2"; print seq[2]; print ">Oh43_chr1"; print seq[1]; print ">Mo17_chr2"; print seq[2]
+     print substr(seq[1], 1001, 80) substr(seq[2], 1021, 80) > "'"$TMP"'/xcontig_query.seq"}' > "$TMP/xcontig.fa"
+printf '>xcontig\n%s\n' "$(cat "$TMP/xcontig_query.seq")" > "$TMP/xcontig_query.fa"
+"$RB" build -d -o "$TMP/xcontig.fmd" "$TMP/xcontig.fa" >/dev/null 2>"$TMP/xcontig_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/xcontig.fmd.ssa" "$TMP/xcontig.fmd" >/dev/null 2>>"$TMP/xcontig_build.log"
+check_eq "cross-contig fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/xcontig.fa" | gzip > "$TMP/xcontig.fmd.len.gz"
+"$RB" chain --ref-prefix=B73 -t1 "$TMP/xcontig.fmd" "$TMP/xcontig_query.fa" > "$TMP/xcontig.tsv" 2>"$TMP/xcontig.log"
+check_eq "chain exits 0 (cross-contig read)" "$?" "0"
+check_eq "chain: one row for the cross-contig read" "$(grep -c '^xcontig' "$TMP/xcontig.tsv")" "1"
+check_line_in "chain: SMEMs on different contigs are not chained (best single-contig chain, B73 + Mo17)" \
+	"$TMP/xcontig.tsv" "$(printf 'xcontig\tchr2\t1018\t0,1')"
+check_eq "chain: no row with the cross-contig intersection {B73} alone" \
+	"$(awk -F'\t' '$1=="xcontig" && $4=="0"' "$TMP/xcontig.tsv" | wc -l | tr -d ' ')" "0"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \

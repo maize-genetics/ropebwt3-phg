@@ -1367,6 +1367,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t rj = cs[j].rpos, dr = strand? rj - ri : ri - rj;
 			int64_t dq = cs[i].qs - cs[j].qe, unexp;
 			int32_t anch; int64_t sc;
+			if (cs[j].rsid != cs[i].rsid) continue;       // different contigs: positions are not comparable
 			if (dr < 0 || cs[j].qs > cs[i].qs) continue;  // out of order -> not colinear
 			if (dq < 0) dq = 0;
 			unexp = dr - dq; if (unexp < 0) unexp = 0;    // intron length / paralog jump
