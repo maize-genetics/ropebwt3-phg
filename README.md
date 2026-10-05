@@ -188,8 +188,9 @@ block, then a per-founder **ternary read-sharing** state (`1`=match,
 (`-1`=no anchor at all on this reference sequence), before the usual `gA`/`gB`
 diploid training labels. `--anchor-dist-thresh=NUM` sets the bp cutoff between
 diverged and deletion [2000, matching `ropebwt3 lift`'s default anchor stride
-`-s`]. The reference genome's own gamete always reads back as match/distance 0
-(it has zero liftover anchors by construction). A `<npy>.layout.tsv` sidecar
+`-s`]. The reference genome's own gamete always has distance 0 (it has zero
+liftover anchors by construction), so it is never a deletion: it reads match
+when the row's reads carry it and diverged otherwise. A `<npy>.layout.tsv` sidecar
 records the exact column ranges; `--npy` without `--anchor-dist-npy` is
 unchanged.
 
@@ -279,6 +280,49 @@ row and an ordinary row landing on the same contig/bin/gameteSet are
 indistinguishable once aggregated. `--insertion-rows=ordinary` avoids the
 ambiguity by construction, since it never emits a coarse, prefix-only row.
 
+#### Ternary read-sharing block (`--anchor-dist-npy`)
+
+`chain` writes the same per-founder ternary + distance block as `refmap` (see
+[above](#refmap)), with the same options, defaults and validation
+(`--anchor-dist-npy` needs `--npy` and `--lift`), the same
+`(3*n_gametes+2)`-column int32 layout and the same `.bins.tsv`/`.gametes.tsv`/
+`.layout.tsv` sidecars, so downstream readers consume it unchanged:
+
+```sh
+ropebwt3 chain --ref-prefix=B73 --lift pan.lift --lift-local-win=20000 -t 20 \
+  --insertion-rows=ordinary --ps4g=reads.ps4g \
+  --npy=reads.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  pan.fmd reads.fq > reads.tsv
+```
+
+Both commands share one code path: every row printed on stdout is folded into
+the PS4G/npy accumulator as (reference contig, row start, founder set), and the
+ternary/distance columns are derived per npy row (contig, bin, founder set)
+exactly as for `refmap`. For a chained read this means:
+
+* **match (1)** — the founder is in the read's founder set, i.e. it carries
+  *every* SMEM of the winning colinear chain (the chain-wide intersection, the
+  same set printed in column 4 and counted in the PS4G file). As in `refmap`,
+  match is exactly "count > 0" in that row.
+* **diverged (0) / deletion (-1)** — any other founder, split by the distance
+  from the row's bin start to that founder's nearest `lift` anchor:
+  `<= --anchor-dist-thresh` is diverged, farther (or no anchor on that
+  contig) is a deletion. The reference gamete is never a deletion.
+* **Spliced reads.** A read split by an intron gives one row per exon segment
+  at that segment's own start (as on stdout), each carrying the whole read's
+  founder set; diverged/deletion is judged at each segment's own position, so a
+  founder can be diverged at one exon and deleted at another. A founder that
+  lacks any one exon does not support the read, the same whole-read standard
+  `refmap` uses.
+* **PAV rows** (with `--lift`, reads with no reference SMEM) use the assembly-only
+  founder set and the projected position. Grid-snapped insertion rows (the
+  default `--insertion-rows=pav`) are looked up at the snapped coordinate, up to
+  `--pav-grid` bp from the breakpoint, and `chain` warns about it; pass
+  `--insertion-rows=ordinary` to keep them at the exact projected position.
+
+`--lift-local-win`/`--lift-local-tol` apply to `chain`'s lift projections as
+they do to `refmap`'s.
+
 Options:
 
 * `--ref-prefix=STR` (required) marks reference sequences by name prefix.
@@ -308,6 +352,8 @@ Options:
   downstream per-contig windowing; `pav` is the grid-snapped, `pav:`-prefixed
   row (**default**, unchanged from prior behavior); `drop` discards the row
   entirely [pav].
+* `--anchor-dist-npy` (with `--npy` and `--lift`) / `--anchor-dist-thresh=NUM`
+  write the per-founder ternary + distance block, as for `refmap` [off / 2000].
 * `--trim-polya=INT` trim a terminal poly-A/poly-T run before searching [0 = off].
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
