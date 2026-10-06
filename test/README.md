@@ -6,8 +6,8 @@ Run everything with:
 make test
 ```
 
-from the repository root. This builds `ropebwt3`, `test/test_ps4g`, and
-`test/test_hitcount`, then runs all three:
+from the repository root. This builds `ropebwt3`, `test/test_ps4g`, `test/test_hitcount`,
+`test/test_lift` and `test/test_extract`, then runs them all:
 
 * **`test_ps4g.c`** — unit tests for `ps4g.c` (the gamete table, event
   accumulator, BED reader, and PS4G/`.npy` writers) in isolation, with no
@@ -41,6 +41,14 @@ from the repository root. This builds `ropebwt3`, `test/test_ps4g`, and
   `--target-hits` under real multi-threaded compute). Both are skipped (not
   failed) when unavailable, with a `SKIP:` note on stderr.
 
+* **`test_extract.c`** — unit tests for coordinate-based extraction: builds an
+  FM-index in memory from known random sequences (N runs, a 1-bp sequence, a
+  repeat), then checks that every `isa` entry point LF-walks exactly `pos` steps
+  to its own string start, extraction at/around every entry, sequence starts and
+  ends, length 1 and whole sequences on both strands for several bucket sizes,
+  the error codes, `.ssa` streaming vs in-memory, `.isa` round trip/validation,
+  and hand-computed `rb3_lift_project_inv` (reference->assembly) projections.
+
 * **`test_lift.c`** — unit tests for the lift reference-position index and the
   `--anchor-dist-npy` ternary/distance block (`rb3_lift_nearest_ref`,
   `rb3_lift_ternary_state`, `rb3_ps4g_npy_finalize` with a lift index), including
@@ -50,6 +58,12 @@ from the repository root. This builds `ropebwt3`, `test/test_ps4g`, and
 the fixture plus a synthetic spliced read: the missing-`--lift` error, unchanged
 stdout/PS4G/bins.tsv versus plain `--npy`, the `3*n_gametes+2` shape and layout
 sidecar (identical to `refmap`'s), and a numpy check of the ternary definition.
+
+`run_integration.sh` section 7 covers `isa`/`extract`: regions and TSV queries against
+the FASTA, error reporting/exit status, `--clamp`, `-t4` vs `-t1`, `-w`, in-memory vs
+file entry points, `--lift`/`--project-only` (incl. inverted and split founders), and
+a scaled-down run of the shared simulated pangenome (`simulate_pangenome.py`, checked
+by `check_extract_fixture.py`; skipped without numpy).
 
 Outputs land in `test/output/` and `test/tmp/` (gitignored); `make clean`
 removes them along with the build artifacts.

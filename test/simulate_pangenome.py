@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copied verbatim from grits experiments/seq-extract/simulate_pangenome.py: the fixture shared with
+# Copied from grits experiments/seq-extract/simulate_pangenome.py: the fixture shared with
 # the faidx-based extractor, used (scaled down) by test/run_integration.sh section 7.
 """Simulated pangenome with known coordinate maps, the shared fixture for the two sequence-extraction
 implementations (ropebwt3 `extract` and the faidx-based extractor) and their cross-check.

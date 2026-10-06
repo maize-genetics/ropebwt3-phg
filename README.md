@@ -46,6 +46,7 @@ echo CCAGGACCCCTGTCCAGTGTTAGACAGGAGCATGCAG | ./ropebwt3 sw -eN200 -Lm10 human579
   - [Haplotype diversity with end-to-end alignment](#e2e)
   - [Placing a query on a reference genome](#refmap)
   - [RNAseq: chaining and PAV placement](#chain)
+  - [Extracting sequence by coordinate](#extract)
   - [Deprecated](#deprecated)
   - [Indexing](#build)
   - [Binary BWT formats](#format)
@@ -357,6 +358,101 @@ Options:
 * `--trim-polya=INT` trim a terminal poly-A/poly-T run before searching [0 = off].
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
+
+### <a name="extract"></a>Extracting sequence by coordinate
+
+`ropebwt3 get` walks a whole sequence backward from its end (~0.5 µs per base,
+so ~1 minute for a mid-chromosome window). `ropebwt3 extract` instead starts from
+the nearest *entry point* at or after the window end and LF-walks back only
+through the window plus at most one sample gap.
+
+```sh
+# 0. the index needs .ssa and .len.gz (see refmap above); derive the entry points once
+ropebwt3 isa idx.fmd                 # -> idx.fmd.isa (reads .ssa + .len.gz only)
+# 1. direct: 0-based half-open [start,end) on the forward strand; ':-' = reverse complement
+ropebwt3 extract idx.fmd Oh43_chr1:1000000-1008000 Mo17_chr3:5000-5100:-
+ropebwt3 extract -t4 -f queries.tsv idx.fmd > out.fa      # qid contig start end [strand]
+# 2. projected: a B73 interval in founder Oh43, via the refmap liftover
+ropebwt3 extract --lift=idx.lift --ref-prefix=B73 --to=Oh43 idx.fmd B73_chr1:1000000-1008000
+ropebwt3 extract --lift=idx.lift --ref-prefix=B73 --project-only -f ref.tsv idx.fmd > proj.tsv
+```
+
+**Coordinates.** 0-based, half-open `[start,end)` on the forward strand of the named
+sequence, i.e. the sequence as it appeared in the FASTA given to `ropebwt3 build`
+(names as in `.len.gz`, e.g. `Oh43_chr1`). This is NOT samtools' convention:
+`CTG:S-E` here is `samtools faidx CTG:S+1-E`. Strand `-` returns the reverse
+complement of the same interval (`samtools faidx -i`). Bases come back upper
+case `ACGTN`: the BWT stores no case, and any non-ACGT base was stored as `N` at
+build time. Region strings are `CONTIG:START-END[:+|-]` (the contig may itself
+contain `:`).
+
+**Errors and clamping.** Unknown contig, unparsable region, `start >= end`, or `end`
+past the contig end are errors: the query is reported on stderr with its reason,
+no record is written for it, the other queries still are, and the exit status is
+1. Nothing is clamped silently: `--clamp` clips to the contig and marks the FASTA
+header with ` clamped` (an interval that is empty after clipping is still an error).
+
+**Output.** FASTA, header `>qid` (TSV) or the region string as given, one line per
+sequence unless `-w INT`. With `--lift` the header is `>qid CONTIG:START-END:STRAND
+ref=REF:START-END`.
+
+**Entry points (`ropebwt3 isa`).** `ropebwt3 ssa -s S` keeps the suffix-array value
+of every BWT row with `(row - #sequences) % 2^S == 0`, i.e. it samples by *row*,
+which lands on effectively random text positions (mean spacing 2^S, geometric
+gaps). Inverting these (row -> sequence, offset) pairs gives exactly the entry
+points needed, so no new pass over the BWT is made: `isa` streams the `.ssa`
+array, keeps per sequence the sample with the smallest offset in each 2^b-base
+bucket (`-b`, default 12 = 4 kb), and adds one exact entry per sequence for free,
+its end: row `sid` is the sentinel row that ends BWT string `sid` (what `get sid`
+walks from). Extraction binary-searches the first entry at offset >= end and
+LF-walks `entry - start` steps. On the 25-founder maize index (55.2 Gbp forward,
+3.4 GB `.ssa`, S=8), `isa -b 12` takes 6 s and 0.32 GB RAM and writes 13.5 M
+entries (162 MB); `-b 10` 7 s, 1.25 GB, 52.9 M entries (636 MB). `extract` loads
+the `.isa` in 0.05 s; without one it derives the same entries from the `.ssa` in
+memory (6 s per run), so `isa` is worth running once per index.
+
+**Strands.** `build` stores sequence j of `.len.gz` (FASTA order) as BWT string 2j
+(forward) and 2j+1 (reverse complement); `ropebwt3 get` numbers by BWT string.
+`isa` samples forward strings only (`-2` adds the reverse ones, which `extract`
+never needs): a `-` query is the forward interval, reverse-complemented.
+
+**Projection (`--lift`).** Queries are then *reference* intervals (`--ref-prefix`
+contigs), TSV `qid ref_contig ref_start ref_end [assembly]` (extra columns ignored)
+or region strings plus `--to=ASM` (the name prefix before `_`). The first and last
+reference base are each projected into the assembly with the same projector refmap
+uses (`lift.c`, run with the reference as the key axis over the founder's anchors
+on that reference contig: the nearest collinear flanking anchors within
+`--lift-local-win`, else the `--lift-win` median/MAD fit). The interval is
+`[proj(first), proj(last)+1)` on `+`, or `[proj(last), proj(first)+1)` on `-` for an
+inverted locus (the sequence is then reverse-complemented, so it reads in
+reference orientation). If either end does not project, or the ends land on
+different contigs or orientations, or the end precedes the start, the query fails
+with that reason (stderr, and the `status` column of `--project-only`), never a
+guess; projection failures do not set the exit status. `--project-only` prints
+`qid ref_contig ref_start ref_end assembly contig start end strand status method`,
+where `method` is the start/end projector (`local` bracket, `local1` one-sided,
+`median`, `identity` for the reference itself). Differences from refmap: the local
+bracket is ON by default (`--lift-local-win=20000`; `0` gives refmap's built-in
+default, the wide median only, which for an interval is typically kb off); the
+bracket picks the better-fitting slope rather than +1 first (refmap's forward
+projector is unchanged); and on `-` loci the result is shifted by k-1 so a base
+lands on its homologous base (`--lift-k`, default 100 = `lift`'s default; set it
+if the `.lift` was built with another `-k`, it is not stored in the file).
+`--lift-win=0` disables the median fallback entirely (only bracketed projections).
+
+Measured on the simulated pangenome (`test/simulate_pangenome.py`: 3 x 150-300 kb
+chromosomes, 5 founders with 1% SNPs, small and 0.5-5 kb indels, a 6-copy 2 kb
+element; 500 random 8 kb B73 windows) with an `s200` lift: projected interval ==
+true interval 44.6% (start 65.0%, end 66.2% exact; 95% within 10 bp; median
+identity to the true founder sequence 99.99%); with `--lift-local-win=0` 0.2%
+exact and only ~61% within 100 bp. Nearly all residual offsets are small indels
+between the query end and its nearest anchor (interpolation; anchors every ~1 kb
+here) and large indels between the flanking anchors; a denser lift (`-k 31 -s 20`)
+gives 87% exact intervals.
+
+**Speed.** 1,000 random 8 kb windows across all 25 maize assemblies: 6.5 s on one
+thread (6.5 ms per window, ~10.0 M LF steps), 1.5 s with `-t4`; plus 1.6 s to
+load the FMD (5.0 GB RSS; `-M` mmaps it instead) and 0.05 s for the `.isa`.
 
 ### <a name="deprecated"></a>Deprecated
 
