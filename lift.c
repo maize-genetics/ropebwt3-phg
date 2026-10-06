@@ -238,88 +238,116 @@ void rb3_lift_set_local(int64_t local_win, int64_t local_tol)
 	lift_local_win = local_win, lift_local_tol = local_tol;
 }
 
-// Two anchors are collinear if their reference spacing equals their assembly spacing
-// (slope +1) or its negation (slope -1) within tol. Returns the slope sign, 0 if not.
-static int lift_collinear(const rb3_liftpt_t *x, const rb3_liftpt_t *y, int64_t tol)
+// The projectors below run over a "view" of liftover points sorted by a key
+// coordinate, mapping it to a value coordinate on a value sequence:
+//  - forward (refmap/chain, rb3_lift_project*): pt[off[csid]..off[csid+1]), key =
+//    assembly cpos, value = (rsid, rpos);
+//  - inverse (extract --lift, rb3_lift_project_inv): one (gamete, rsid) bucket of a
+//    rb3_lift_ridx_t, key = reference rpos, value = (csid, cpos).
+// One implementation serves both so the reference->assembly projection is exactly the
+// same algorithm (local bracket, then wide-window median/MAD) as refmap's.
+typedef struct {
+	const rb3_liftpt_t *pt;
+	const int32_t *perm; // NULL = identity
+	int64_t lo, hi;      // view = [lo,hi) (indices into perm[] or pt[])
+	int inv;             // 0: key=cpos, value=(rsid,rpos); 1: key=rpos, value=(csid,cpos)
+} lift_view_t;
+
+static inline const rb3_liftpt_t *lv_pt(const lift_view_t *v, int64_t i) { return v->perm? &v->pt[v->perm[i]] : &v->pt[i]; }
+static inline int64_t lv_key(const lift_view_t *v, int64_t i) { const rb3_liftpt_t *p = lv_pt(v, i); return v->inv? p->rpos : p->cpos; }
+static inline int64_t lv_val(const lift_view_t *v, int64_t i) { const rb3_liftpt_t *p = lv_pt(v, i); return v->inv? p->cpos : p->rpos; }
+static inline int64_t lv_vsid(const lift_view_t *v, int64_t i) { const rb3_liftpt_t *p = lv_pt(v, i); return v->inv? p->csid : p->rsid; }
+
+// Two anchors are collinear if their value spacing equals their key spacing (slope
+// +1) or its negation (slope -1) within tol, on the same value sequence. Returns the
+// slope sign, 0 if not. (Forward view: reference spacing vs assembly spacing.)
+static int lift_collinear(const lift_view_t *v, int64_t x, int64_t y, int64_t tol)
 {
-	int64_t dc = y->cpos - x->cpos, dr = y->rpos - x->rpos;
-	if (x->rsid != y->rsid) return 0;
+	int64_t dc = lv_key(v, y) - lv_key(v, x), dr = lv_val(v, y) - lv_val(v, x);
+	if (lv_vsid(v, x) != lv_vsid(v, y)) return 0;
 	if (llabs(dr - dc) <= tol) return 1;
 	if (llabs(dr + dc) <= tol) return -1;
 	return 0;
 }
 
-static int lift_project_local(const rb3_lift_t *lf, int32_t csid, int64_t cpos,
-							  int64_t *out_rsid, int64_t *out_rpos)
+// *out_method: 1 = bracketed by a collinear pair, 2 = one-sided (nearer anchor
+// confirmed by its neighbour). *out_sign = slope.
+static int lift_project_local(const lift_view_t *v, int64_t cpos, int64_t *out_rsid, int64_t *out_rpos,
+							  int *out_sign, int *out_method)
 {
-	int64_t lo = lf->off[csid], hi = lf->off[csid + 1], j, l, r;
-	const rb3_liftpt_t *pt = lf->pt, *L = 0, *R = 0;
+	int64_t lo = v->lo, hi = v->hi, j, l, r, L = -1, R = -1;
 	int s;
 	if (hi - lo < 2) return 0;
-	l = lo, r = hi; // j = first index with pt.cpos > cpos
-	while (l < r) { int64_t mid = (l + r) >> 1; if (pt[mid].cpos <= cpos) l = mid + 1; else r = mid; }
+	l = lo, r = hi; // j = first index with key > cpos
+	while (l < r) { int64_t mid = (l + r) >> 1; if (lv_key(v, mid) <= cpos) l = mid + 1; else r = mid; }
 	j = l;
-	if (j - 1 >= lo && cpos - pt[j-1].cpos <= lift_local_win) L = &pt[j-1];
-	if (j < hi && pt[j].cpos - cpos <= lift_local_win) R = &pt[j];
-	if (L && R && (s = lift_collinear(L, R, lift_local_tol)) != 0) { // bracketed by a collinear pair
-		int64_t v = L->rpos + s * (cpos - L->cpos), a = L->rpos < R->rpos? L->rpos : R->rpos, b = L->rpos < R->rpos? R->rpos : L->rpos;
-		*out_rsid = L->rsid, *out_rpos = v < a? a : v > b? b : v;
+	if (j - 1 >= lo && cpos - lv_key(v, j-1) <= lift_local_win) L = j - 1;
+	if (j < hi && lv_key(v, j) - cpos <= lift_local_win) R = j;
+	if (L >= 0 && R >= 0 && (s = lift_collinear(v, L, R, lift_local_tol)) != 0) { // bracketed by a collinear pair
+		int64_t vl = lv_val(v, L), vr = lv_val(v, R);
+		int64_t x = vl + s * (cpos - lv_key(v, L)), a = vl < vr? vl : vr, b = vl < vr? vr : vl;
+		*out_rsid = lv_vsid(v, L), *out_rpos = x < a? a : x > b? b : x;
+		if (out_sign) *out_sign = s;
+		if (out_method) *out_method = 1;
 		return 1;
 	}
 	// one-sided: the nearer anchor, confirmed by the next anchor on the same side
 	{
-		const rb3_liftpt_t *N = 0, *N2 = 0;
-		int64_t dL = L? cpos - L->cpos : -1, dR = R? R->cpos - cpos : -1;
-		if (L && (!R || dL <= dR)) { N = L; N2 = (j - 2 >= lo && L->cpos - pt[j-2].cpos <= lift_local_win)? &pt[j-2] : 0; }
-		else if (R) { N = R; N2 = (j + 1 < hi && pt[j+1].cpos - R->cpos <= lift_local_win)? &pt[j+1] : 0; }
-		if (N && N2 && (s = lift_collinear(N, N2, lift_local_tol)) != 0) {
-			*out_rsid = N->rsid, *out_rpos = N->rpos + s * (cpos - N->cpos);
+		int64_t N = -1, N2 = -1;
+		int64_t dL = L >= 0? cpos - lv_key(v, L) : -1, dR = R >= 0? lv_key(v, R) - cpos : -1;
+		if (L >= 0 && (R < 0 || dL <= dR)) { N = L; N2 = (j - 2 >= lo && lv_key(v, L) - lv_key(v, j-2) <= lift_local_win)? j - 2 : -1; }
+		else if (R >= 0) { N = R; N2 = (j + 1 < hi && lv_key(v, j+1) - lv_key(v, R) <= lift_local_win)? j + 1 : -1; }
+		if (N >= 0 && N2 >= 0 && (s = lift_collinear(v, N, N2, lift_local_tol)) != 0) {
+			*out_rsid = lv_vsid(v, N), *out_rpos = lv_val(v, N) + s * (cpos - lv_key(v, N));
 			if (*out_rpos < 0) *out_rpos = 0;
+			if (out_sign) *out_sign = s;
+			if (out_method) *out_method = 2;
 			return 1;
 		}
 	}
 	return 0;
 }
 
-// Core projector. Finds the reference coordinate for a assembly hit by fitting a
+// Core projector. Finds the value coordinate for a key position by fitting a
 // colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
 // colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
-// falls back to the nearest reference anchor = the closest reference BREAKPOINT and
-// sets *out_mode=1; a colinear projection sets *out_mode=0. Returns 0 when there is
-// no confident reference nearby at all. win/max_mad in bp, min_support min anchors.
-static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
+// falls back to the nearest anchor = the closest BREAKPOINT and sets *out_mode=1; a
+// colinear projection sets *out_mode=0. Returns 0 when there is no confident
+// projection nearby at all. win/max_mad in bp, min_support min anchors.
+// *out_sign (may be NULL) = slope of the fit (0 for a breakpoint); *out_method (may
+// be NULL) = 1/2 local (see lift_project_local), 3 wide-window median, 4 breakpoint.
+static int lift_project_core(const lift_view_t *v, void *km, int64_t cpos,
 							 int64_t win, int64_t max_mad, int32_t min_support, int allow_bp,
-							 int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
+							 int64_t *out_rsid, int64_t *out_rpos, int *out_mode, int *out_sign, int *out_method)
 {
-	int64_t lo = lf->off[csid], hi = lf->off[csid + 1];
+	int64_t lo = v->lo, hi = v->hi;
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
 	int64_t *resP, *resM, madP, madM, med;
-	rb3_liftpt_t *pt = lf->pt;
-	if (lift_local_win > 0 && lift_project_local(lf, csid, cpos, out_rsid, out_rpos)) {
+	if (lift_local_win > 0 && lift_project_local(v, cpos, out_rsid, out_rpos, out_sign, out_method)) {
 		if (out_mode) *out_mode = 0;
 		return 1;
 	}
 	if (hi - lo < min_support) return 0;
 	// binary search the window [cpos-win, cpos+win] within [lo,hi)
 	{
-		int64_t l = lo, r = hi; // first index with cpos >= target-win
+		int64_t l = lo, r = hi; // first index with key >= target-win
 		int64_t t = cpos - win;
-		while (l < r) { int64_t mid = (l + r) >> 1; if (pt[mid].cpos < t) l = mid + 1; else r = mid; }
+		while (l < r) { int64_t mid = (l + r) >> 1; if (lv_key(v, mid) < t) l = mid + 1; else r = mid; }
 		a = l;
 		l = a, r = hi; t = cpos + win;
-		while (l < r) { int64_t mid = (l + r) >> 1; if (pt[mid].cpos <= t) l = mid + 1; else r = mid; }
+		while (l < r) { int64_t mid = (l + r) >> 1; if (lv_key(v, mid) <= t) l = mid + 1; else r = mid; }
 		b = l;
 	}
 	n = b - a;
 	if (n < min_support) return 0;
-	// majority reference sequence in the window. O(n) via a small first-seen tally
-	// (a window touches only a handful of reference sids); tie-break = earliest first
+	// majority value sequence in the window. O(n) via a small first-seen tally
+	// (a window touches only a handful of sids); tie-break = earliest first
 	// occurrence, identical to the previous O(n^2) scan so refmap output is unchanged.
 	best_rsid = -1, best_n = 0;
 	{
 		int64_t vals[256], cnts[256]; int nv = 0, u;
 		for (i = a; i < b; ++i) {
-			int64_t rs = pt[i].rsid, f = -1;
+			int64_t rs = lv_vsid(v, i), f = -1;
 			for (u = 0; u < nv; ++u) if (vals[u] == rs) { f = u; break; }
 			if (f < 0) { if (nv < 256) { vals[nv] = rs; cnts[nv] = 1; ++nv; } } // >256 distinct: degenerate, drop
 			else ++cnts[f];
@@ -328,14 +356,14 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	}
 	(void)cnt;
 	if (best_n < min_support) return 0;
-	// residuals for slope +1 (rpos-cpos) and -1 (rpos+cpos) over majority-chr points
+	// residuals for slope +1 (val-key) and -1 (val+key) over majority-sid points
 	resP = Kmalloc(km, int64_t, best_n);
 	resM = Kmalloc(km, int64_t, best_n);
 	n = 0;
 	for (i = a; i < b; ++i)
-		if (pt[i].rsid == best_rsid) {
-			resP[n] = pt[i].rpos - pt[i].cpos;
-			resM[n] = pt[i].rpos + pt[i].cpos;
+		if (lv_vsid(v, i) == best_rsid) {
+			resP[n] = lv_val(v, i) - lv_key(v, i);
+			resM[n] = lv_val(v, i) + lv_key(v, i);
 			++n;
 		}
 	{
@@ -351,15 +379,17 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 		if ((madP <= madM? madP : madM) > max_mad) { // not colinear: an insertion between flanks
 			kfree(km, resP); kfree(km, resM);
 			if (!allow_bp) return 0;
-			{ // breakpoint: nearest reference anchor (by assembly distance) on the majority chr
+			{ // breakpoint: nearest anchor (by key distance) on the majority sid
 				int64_t best_d = -1, bp = -1;
-				for (i = a; i < b; ++i) if (pt[i].rsid == best_rsid) {
-					int64_t d = llabs(pt[i].cpos - cpos);
-					if (best_d < 0 || d < best_d) best_d = d, bp = pt[i].rpos;
+				for (i = a; i < b; ++i) if (lv_vsid(v, i) == best_rsid) {
+					int64_t d = llabs(lv_key(v, i) - cpos);
+					if (best_d < 0 || d < best_d) best_d = d, bp = lv_val(v, i);
 				}
 				if (bp < 0) return 0;
 				*out_rsid = best_rsid, *out_rpos = bp;
 				if (out_mode) *out_mode = 1;
+				if (out_sign) *out_sign = 0;
+				if (out_method) *out_method = 4;
 				return 1;
 			}
 		}
@@ -368,8 +398,15 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	*out_rpos = sign * cpos + med;
 	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
 	if (out_mode) *out_mode = 0;
+	if (out_sign) *out_sign = (int)sign;
+	if (out_method) *out_method = 3;
 	kfree(km, resP); kfree(km, resM);
 	return 1;
+}
+
+static inline void lift_view_fwd(lift_view_t *v, const rb3_lift_t *lf, int32_t csid)
+{
+	v->pt = lf->pt, v->perm = 0, v->lo = lf->off[csid], v->hi = lf->off[csid + 1], v->inv = 0;
 }
 
 // Project a assembly hit (csid, cpos) to a reference coordinate. Returns 1 and sets
@@ -379,7 +416,9 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 					 int64_t win, int64_t max_mad, int32_t min_support,
 					 int64_t *out_rsid, int64_t *out_rpos)
 {
-	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 0, out_rsid, out_rpos, 0);
+	lift_view_t v;
+	lift_view_fwd(&v, lf, csid);
+	return lift_project_core(&v, km, cpos, win, max_mad, min_support, 0, out_rsid, out_rpos, 0, 0, 0);
 }
 
 // Like rb3_lift_project, but when the locus is NOT colinear (a PAV/insertion between
@@ -390,7 +429,9 @@ int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cp
 						int64_t win, int64_t max_mad, int32_t min_support,
 						int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
 {
-	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode);
+	lift_view_t v;
+	lift_view_fwd(&v, lf, csid);
+	return lift_project_core(&v, km, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode, 0, 0);
 }
 
 /* ---- reference-position index (nearest-anchor queries) ----------------- */
@@ -480,6 +521,21 @@ int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_
 		if (best < 0 || d < best) best = d;
 	}
 	return best;
+}
+
+// Inverse projection, reference -> assembly: the forward projector run over the
+// (gamete, rsid) bucket of the reference-position index, i.e. with the roles of the
+// two coordinates swapped. Honours rb3_lift_set_local() exactly as refmap does.
+int rb3_lift_project_inv(const rb3_lift_ridx_t *ridx, void *km, int32_t gamete, int64_t rsid, int64_t rpos,
+						 int64_t win, int64_t max_mad, int32_t min_support,
+						 int64_t *out_csid, int64_t *out_cpos, int *out_sign, int *out_method)
+{
+	lift_view_t v;
+	int64_t key;
+	if (ridx == 0 || gamete < 0 || gamete >= ridx->n_gamete || rsid < 0 || rsid >= ridx->n_seq) return 0;
+	key = (int64_t)gamete * ridx->n_seq + rsid;
+	v.pt = ridx->lf->pt, v.perm = ridx->perm, v.lo = ridx->off[key], v.hi = ridx->off[key + 1], v.inv = 1;
+	return lift_project_core(&v, km, rpos, win, max_mad, min_support, 0, out_csid, out_cpos, 0, out_sign, out_method);
 }
 
 int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh)
