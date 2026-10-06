@@ -616,6 +616,14 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
 		> /dev/null 2>"$TMP/valgrind_target.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
+
+	# extract: multi-threaded direct extraction, and --lift projection incl. failures
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" extract -t2 -f "$TMP/rand.tsv" "$IDX" > /dev/null 2>"$TMP/valgrind_extract.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on extract; see $TMP/valgrind_extract.log"; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" extract --lift="$TMP/inv.lift" --lift-k 31 --ref-prefix=B73 -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > /dev/null 2>"$TMP/valgrind_extract_lift.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on extract --lift; see $TMP/valgrind_extract_lift.log"; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi
