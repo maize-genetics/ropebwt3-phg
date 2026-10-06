@@ -47,7 +47,10 @@ from the repository root. This builds `ropebwt3`, `test/test_ps4g`, `test/test_h
   to its own string start, extraction at/around every entry, sequence starts and
   ends, length 1 and whole sequences on both strands for several bucket sizes,
   the error codes, `.ssa` streaming vs in-memory, `.isa` round trip/validation,
-  and hand-computed `rb3_lift_project_inv` (reference->assembly) projections.
+  and hand-computed `rb3_lift_project_inv` (reference->assembly) projections, and the
+  snap aligner (`snap.c`): SNPs/indels in the flank, deleted end bases, insertions
+  next to an end, repeats (ambiguous), short flanks, low identity, the clipped walk
+  alignment, and the k-mer prefilter against the full DP on 300 random cases.
 
 * **`test_lift.c`** — unit tests for the lift reference-position index and the
   `--anchor-dist-npy` ternary/distance block (`rb3_lift_nearest_ref`,

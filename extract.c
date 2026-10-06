@@ -19,6 +19,7 @@
 #include "lift.h"
 #include "ps4g.h"
 #include "isa.h"
+#include "snap.h"
 
 #define EXT_BATCH 4096
 
@@ -36,6 +37,8 @@ typedef struct {
 	char *asm_name;
 	int clamped;        // the interval was clamped (input --clamp, or a projected end past the contig end)
 	int meth[2];        // projection method of the start / end
+	int snap[2];        // SNAP_* label of the start / end
+	int64_t shift[2];   // bp the snap moved the founder base of the reference start / end (forward coords)
 	int status;         // ST_*
 	const char *msg;    // failure reason (static string), or 0
 	char *seq;          // extracted sequence (ACGTN), NUL-terminated
@@ -44,6 +47,9 @@ typedef struct {
 
 typedef struct {
 	int32_t n_threads, line_width, clamp, project_only, use_mmap, min_support, lift_k;
+	int32_t snap, snap_flank;
+	int64_t snap_r1, snap_r2;
+	rb3_snap_opt_t sopt;
 	char *lift_fn, *ref_prefix, *to_asm, *isa_fn, *tsv_fn;
 	int64_t lift_win, lift_mad, local_win, local_tol;
 } ext_opt_t;
@@ -246,6 +252,174 @@ static const char *meth_name(int m)
 	return m >= 0 && m <= 5? names[m] : "none";
 }
 
+enum { SNAP_OFF = 0, SNAP_SNAP, SNAP_WIDE, SNAP_AMBIG, SNAP_LOWID, SNAP_SHORT, SNAP_IDENTITY, SNAP_WALK };
+
+static const char *snap_name(int m)
+{
+	static const char *names[] = { "proj", "snap", "snap_wide", "proj_ambiguous", "proj_lowid", "proj_short", "identity", "snap_walk" };
+	return m >= 0 && m <= 7? names[m] : "proj";
+}
+
+// An oriented founder window extracted once per end and reused by the wide retry and
+// every walk step (each would otherwise pay its own LF walk of ~R2 bases).
+typedef struct { int64_t lo, hi; uint8_t *buf; } snap_cache_t;
+
+static void snap_cache_fill(const ext_ctx_t *c, ext_query_t *q, int64_t tsid, int sign, int64_t lo, int64_t hi, snap_cache_t *ca)
+{
+	int64_t L = c->sid->len[tsid], r;
+	if (lo < 0) lo = 0;
+	if (hi > L) hi = L;
+	if (ca->buf || hi <= lo) return;
+	ca->buf = RB3_MALLOC(uint8_t, hi - lo);
+	if ((r = rb3_isa_extract(&c->f, c->isa, tsid * 2, sign > 0? lo : L - hi, sign > 0? hi : L - lo, ca->buf)) < 0) {
+		free(ca->buf); ca->buf = 0; return;
+	}
+	q->steps += r;
+	if (sign < 0) rb3_revcomp6(hi - lo, ca->buf);
+	ca->lo = lo, ca->hi = hi;
+}
+
+// Extract the oriented founder window [wlo,whi) (clamped to [0,L)) of sequence tsid
+// (from the cache when it covers it) and align q[0,nq) to it. Returns the status (RB3_SNAP_SHORT on an extraction
+// failure); *wlo_out = the clamped window start.
+static int snap_window(const ext_ctx_t *c, ext_query_t *q, int64_t tsid, int sign, int64_t wlo, int64_t whi,
+					   const uint8_t *qs, int32_t nq, const rb3_snap_opt_t *so, rb3_snap_res_t *res, int64_t *wlo_out, int reversed,
+					   const snap_cache_t *ca)
+{
+	int64_t L = c->sid->len[tsid], flo, fhi, r;
+	uint8_t *win;
+	if (wlo < 0) wlo = 0;
+	if (whi > L) whi = L;
+	*wlo_out = wlo;
+	if (whi <= wlo) { memset(res, 0, sizeof(*res)); return (res->status = RB3_SNAP_SHORT); }
+	win = RB3_MALLOC(uint8_t, whi - wlo);
+	if (ca && ca->buf && ca->lo <= wlo && whi <= ca->hi) {
+		memcpy(win, ca->buf + (wlo - ca->lo), whi - wlo);
+	} else {
+		flo = sign > 0? wlo : L - whi, fhi = sign > 0? whi : L - wlo;
+		if ((r = rb3_isa_extract(&c->f, c->isa, tsid * 2, flo, fhi, win)) < 0) { free(win); memset(res, 0, sizeof(*res)); return (res->status = RB3_SNAP_SHORT); }
+		q->steps += r;
+		if (sign < 0) rb3_revcomp6(whi - wlo, win);
+	}
+	if (reversed) {
+		int64_t j, m = whi - wlo;
+		for (j = 0; j < m>>1; ++j) { uint8_t z = win[j]; win[j] = win[m-1-j]; win[m-1-j] = z; }
+	}
+	rb3_snap_align(qs, nq, win, (int32_t)(whi - wlo), so, res);
+	if (reversed && res->t_first >= 0) { // map back: reversed first M = last M of the forward window
+		int32_t m = (int32_t)(whi - wlo), tf = res->t_first, qf = res->q_first;
+		res->t_first = m - 1 - res->t_last, res->t_last = m - 1 - tf;
+		res->q_first = nq - 1 - res->q_last, res->q_last = nq - 1 - qf;
+	}
+	free(win);
+	return res->status;
+}
+
+// The end base and the whole flank are deleted in the founder (a deletion longer than
+// the flank): step the flank inward (t = F, 2F, 4F, ... <= radius2) until it aligns,
+// then align the whole reference stretch from the end to that flank, so the first
+// (start) / last (end) present reference base is found exactly. Oriented coordinates.
+static int snap_walk(const ext_ctx_t *c, ext_query_t *q, int i, int sign, int64_t tsid, int64_t p, int64_t *u_out, const snap_cache_t *ca)
+{
+	const ext_opt_t *o = c->opt;
+	int64_t t, tmax, F = o->snap_flank, ilen = q->ren - q->rst, wlo, y = -1, r, ra, rb;
+	rb3_snap_res_t res;
+	uint8_t *rs, *qs;
+	int status = RB3_SNAP_LOWID;
+	for (tmax = 0, t = F; t + F <= ilen && t <= o->snap_r2; t <<= 1) tmax = t;
+	if (tmax == 0) return status;
+	// the reference stretch [end .. end +- tmax+F), extracted once
+	ra = i == 0? q->rst : q->ren - tmax - F, rb = i == 0? q->rst + tmax + F : q->ren;
+	rs = RB3_MALLOC(uint8_t, rb - ra);
+	if ((r = rb3_isa_extract(&c->f, c->isa, q->rsid * 2, ra, rb, rs)) < 0) { free(rs); return RB3_SNAP_SHORT; }
+	q->steps += r;
+	for (t = F; t <= tmax; t <<= 1) {
+		int64_t a = i == 0? q->rst + t : q->ren - t - F;
+		// the stepped flank's homolog: near p if [end, end+t) is deleted, up to t further otherwise
+		if (i == 0) status = snap_window(c, q, tsid, sign, p - o->snap_r2, p + t + F + o->snap_r2, rs + (a - ra), (int32_t)F, &o->sopt, &res, &wlo, 0, ca);
+		else status = snap_window(c, q, tsid, sign, p - t - F - o->snap_r2, p + o->snap_r2 + 1, rs + (a - ra), (int32_t)F, &o->sopt, &res, &wlo, 0, ca);
+		if (status == RB3_SNAP_OK) { y = wlo + (i == 0? res.t_first : res.t_last); break; }
+		if (status == RB3_SNAP_AMBIG) break;
+	}
+	if (y < 0) { free(rs); return status; }
+	// whole stretch [end .. stepped flank]: every base is aligned or deleted. Most of it
+	// is deleted, so the deleted run at the outer end is clipped at a flat cost (as one
+	// gap event) instead of letting random bases align across the founder window; the
+	// end case is aligned reversed so that run is always the query prefix.
+	{
+		rb3_snap_opt_t so = o->sopt;
+		int64_t a = i == 0? q->rst : q->ren - t - F, n = t + F, wlo2, whi2, j;
+		so.min_frac = 0, so.min_aligned = (int32_t)(F / 2), so.clip5 = so.gap_open + so.gap_ext;
+		qs = RB3_MALLOC(uint8_t, n);
+		memcpy(qs, rs + (a - ra), n);
+		if (i == 0) wlo2 = y - t - o->snap_r1, whi2 = y + F + o->snap_r1;
+		else wlo2 = y - F - o->snap_r1, whi2 = y + t + o->snap_r1 + 1;
+		if (i == 1) for (j = 0; j < n>>1; ++j) { uint8_t z = qs[j]; qs[j] = qs[n-1-j]; qs[n-1-j] = z; }
+		status = snap_window(c, q, tsid, sign, wlo2, whi2, qs, (int32_t)n, &so, &res, &wlo, i == 1, ca);
+		free(qs);
+		if (status == RB3_SNAP_OK) *u_out = i == 0? wlo + res.t_first : wlo + res.t_last;
+	}
+	free(rs);
+	return status;
+}
+
+// Snap one end. i = 0: the reference start (flank [rst, rst+F)), 1: the reference end
+// (flank [ren-F, ren)). *cp (forward founder coordinate of the homologous base of
+// the first/last reference base) is replaced by the aligned founder base of the
+// first/last flank base present in the founder, if the alignment is accepted.
+// Inverted loci (sign < 0) are aligned on the reverse complement of the window, i.e.
+// always in reference orientation; "oriented" coordinates u = L-1-x there.
+static void q_snap_end(const ext_ctx_t *c, ext_query_t *q, int i, int sign, int64_t tsid, int64_t *cp)
+{
+	const ext_opt_t *o = c->opt;
+	int64_t L = c->sid->len[tsid], a, b, p, radii[2], r, wlo, u = -1;
+	int32_t F = o->snap_flank, nq, k;
+	uint8_t *fl;
+	rb3_snap_res_t res;
+	snap_cache_t ca = { 0, 0, 0 };
+	a = i == 0? q->rst : (q->ren - F > q->rst? q->ren - F : q->rst);
+	b = i == 0? (q->rst + F < q->ren? q->rst + F : q->ren) : q->ren;
+	nq = (int32_t)(b - a);
+	q->snap[i] = SNAP_SHORT;
+	if (nq < o->sopt.min_aligned) return;
+	fl = RB3_MALLOC(uint8_t, nq);
+	if ((r = rb3_isa_extract(&c->f, c->isa, q->rsid * 2, a, b, fl)) < 0) { free(fl); return; }
+	q->steps += r;
+	p = sign > 0? *cp : L - 1 - *cp;
+	if (p < 0) p = 0;
+	if (p > L - 1) p = L - 1;
+	radii[0] = o->snap_r1, radii[1] = o->snap_r2;
+	for (k = 0; k < 2; ++k) {
+		int st;
+		if (k == 1 && radii[1] <= radii[0]) break;
+		if (k == 1) { // one extraction covering the wide window and every walk step (t <= tmax)
+			int64_t tmax = 0, t, ilen = q->ren - q->rst;
+			for (t = F; t + F <= ilen && t <= o->snap_r2; t <<= 1) tmax = t;
+			if (i == 0) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + radii[1] + tmax + 2 * F + 1, &ca);
+			else snap_cache_fill(c, q, tsid, sign, p - radii[1] - tmax - 2 * F, p + radii[1] + F + 1, &ca);
+		}
+		st = snap_window(c, q, tsid, sign, p - radii[k] - F, p + radii[k] + F + 1, fl, nq, &o->sopt, &res, &wlo, 0, &ca);
+		if (st == RB3_SNAP_OK) {
+			u = wlo + (i == 0? res.t_first : res.t_last);
+			q->snap[i] = k == 0? SNAP_SNAP : SNAP_WIDE;
+			break;
+		}
+		q->snap[i] = st == RB3_SNAP_AMBIG? SNAP_AMBIG : st == RB3_SNAP_LOWID? SNAP_LOWID : SNAP_SHORT;
+		if (st != RB3_SNAP_LOWID) break; // a wider window cannot resolve an ambiguity
+	}
+	free(fl);
+	if (u < 0 && q->snap[i] == SNAP_LOWID && o->snap_r2 > 0) { // the flank itself may be deleted
+		int st = snap_walk(c, q, i, sign, tsid, p, &u, &ca);
+		if (st == RB3_SNAP_OK) q->snap[i] = SNAP_WALK;
+		else if (st == RB3_SNAP_AMBIG) q->snap[i] = SNAP_AMBIG;
+	}
+	free(ca.buf);
+	if (u >= 0) {
+		int64_t x = sign > 0? u : L - 1 - u;
+		q->shift[i] = x - *cp, *cp = x;
+	}
+}
+
 static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 {
 	const ext_opt_t *o = c->opt;
@@ -254,6 +428,7 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	int sg[2], i;
 	if (g == c->gtab->sid2g[q->rsid]) { // the reference itself: identity
 		q->tsid = q->rsid, q->st = q->rst, q->en = q->ren, q->strand = 1, q->meth[0] = q->meth[1] = 5;
+		if (o->snap) q->snap[0] = q->snap[1] = SNAP_IDENTITY;
 		return;
 	}
 	for (i = 0; i < 2; ++i) {
@@ -266,6 +441,7 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	if (cs[0] != cs[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project to different contigs"); q->tsid = -1; return; }
 	if (sg[0] != sg[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project with different orientations"); return; }
 	q->tsid = cs[0], q->strand = sg[0];
+	if (o->snap) for (i = 0; i < 2; ++i) q_snap_end(c, q, i, q->strand, q->tsid, &cp[i]);
 	if (q->strand > 0) q->st = cp[0], q->en = cp[1] + 1;
 	else q->st = cp[1], q->en = cp[0] + 1;
 	if (q->en <= q->st) { q_fail(q, ST_PROJ_FAIL, "projected end precedes projected start"); return; }
@@ -288,7 +464,7 @@ static void q_extract(const ext_ctx_t *c, ext_query_t *q)
 		q_fail(q, ST_INPUT_ERR, r == RB3_ISA_ERR_WALK? "LF walk hit a sentinel: the .isa does not match this index" : "extraction failed (range/strand not covered by the .isa)");
 		return;
 	}
-	q->steps = r;
+	q->steps += r;
 	if (q->strand < 0) rb3_revcomp6(n, buf);
 	for (i = 0; i < n; ++i) buf[i] = "$ACGTN"[buf[i] < 6? buf[i] : 5];
 	buf[n] = 0;
@@ -311,7 +487,7 @@ static void ext_worker(void *data, long i, int tid)
 
 static void print_proj_header(void)
 {
-	printf("qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\n");
+	printf("qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift\n");
 }
 
 static void print_proj_row(const ext_ctx_t *c, const ext_query_t *q)
@@ -322,11 +498,12 @@ static void print_proj_row(const ext_ctx_t *c, const ext_query_t *q)
 	else printf(".\t.\t");
 	printf("%s\t", q->asm_name && *q->asm_name? q->asm_name : ".");
 	if (q->status == ST_OK)
-		printf("%s\t%ld\t%ld\t%c\t%s\t%s,%s\n", c->sid->name[q->tsid], (long)q->st, (long)q->en, q->strand > 0? '+' : '-',
-			   q->clamped? "ok_clamped" : "ok", meth_name(q->meth[0]), meth_name(q->meth[1]));
+		printf("%s\t%ld\t%ld\t%c\t%s\t%s,%s\t%s,%s\t%ld,%ld\n", c->sid->name[q->tsid], (long)q->st, (long)q->en, q->strand > 0? '+' : '-',
+			   q->clamped? "ok_clamped" : "ok", meth_name(q->meth[0]), meth_name(q->meth[1]),
+			   snap_name(q->snap[0]), snap_name(q->snap[1]), (long)q->shift[0], (long)q->shift[1]);
 	else
-		printf(".\t.\t.\t.\t%s: %s\t%s,%s\n", q->status == ST_INPUT_ERR? "input_error" : "projection_failed", q->msg,
-			   meth_name(q->meth[0]), meth_name(q->meth[1]));
+		printf(".\t.\t.\t.\t%s: %s\t%s,%s\t%s,%s\t%ld,%ld\n", q->status == ST_INPUT_ERR? "input_error" : "projection_failed", q->msg,
+			   meth_name(q->meth[0]), meth_name(q->meth[1]), snap_name(q->snap[0]), snap_name(q->snap[1]), (long)q->shift[0], (long)q->shift[1]);
 }
 
 static void print_fasta(const ext_ctx_t *c, const ext_query_t *q)
@@ -336,6 +513,7 @@ static void print_fasta(const ext_ctx_t *c, const ext_query_t *q)
 	if (c->lift)
 		printf(" %s:%ld-%ld:%c ref=%s:%ld-%ld", c->sid->name[q->tsid], (long)q->st, (long)q->en, q->strand > 0? '+' : '-',
 			   c->sid->name[q->rsid], (long)q->rst, (long)q->ren);
+	if (c->lift) printf(" snap=%s,%s", snap_name(q->snap[0]), snap_name(q->snap[1]));
 	if (q->clamped) printf(" clamped");
 	putchar('\n');
 	if (c->opt->line_width <= 0) { fwrite(q->seq, 1, n, stdout); putchar('\n'); }
@@ -384,6 +562,13 @@ static int usage_extract(FILE *fp, const ext_opt_t *o)
 	fprintf(fp, "  --lift-min-support=INT  min anchors for the median fit (refmap uses 4) [%d]\n", o->min_support);
 	fprintf(fp, "  --lift-k=INT   the -k the .lift was built with (not stored in the file); only\n");
 	fprintf(fp, "                 shifts projections onto inverted ('-') loci by k-1 [%d]\n", o->lift_k);
+	fprintf(fp, "Snapping projected ends to the homologous base (with --lift):\n");
+	fprintf(fp, "  --no-snap      keep the lift projection as is [snap on]\n");
+	fprintf(fp, "  --snap-flank=INT  reference flank aligned at each end [%d]\n", o->snap_flank);
+	fprintf(fp, "  --snap-radius=NUM, --snap-radius2=NUM  founder window +- around the projection; the\n");
+	fprintf(fp, "                 second (0 = off) is tried when the first gives low identity [%ld, %ld]\n", (long)o->snap_r1, (long)o->snap_r2);
+	fprintf(fp, "  --snap-min-id=FLOAT  min gap-compressed identity of the flank alignment [%.2f]\n", o->sopt.min_id);
+	fprintf(fp, "  --snap-margin=INT  ambiguous if another placement scores within INT of the best [%d]\n", o->sopt.margin);
 	fprintf(fp, "Output:\n");
 	fprintf(fp, "  -w INT         FASTA line width, 0 = one line [%d]\n", o->line_width);
 	fprintf(fp, "Exit status 1 if any query had an input error (unparsable, unknown contig/assembly,\n");
@@ -413,11 +598,20 @@ int main_extract(int argc, char *argv[])
 		{ "lift-min-support", ko_required_argument, 409 },
 		{ "clamp",            ko_no_argument,       410 },
 		{ "lift-k",           ko_required_argument, 411 },
+		{ "snap",             ko_no_argument,       412 },
+		{ "no-snap",          ko_no_argument,       413 },
+		{ "snap-flank",       ko_required_argument, 414 },
+		{ "snap-radius",      ko_required_argument, 415 },
+		{ "snap-radius2",     ko_required_argument, 416 },
+		{ "snap-min-id",      ko_required_argument, 417 },
+		{ "snap-margin",      ko_required_argument, 418 },
 		{ 0, 0, 0 }
 	};
 
 	memset(&opt, 0, sizeof(opt));
 	opt.n_threads = 1, opt.line_width = 0, opt.min_support = 4, opt.lift_k = 100;
+	opt.snap = 1, opt.snap_flank = 64, opt.snap_r1 = 200, opt.snap_r2 = 6000;
+	rb3_snap_opt_init(&opt.sopt);
 	// refmap's projection defaults, except the local bracket is ON (20 kb, the adopted
 	// refmap setting): without it the +-500 kb median offset is kb-scale off for an
 	// interval (see README); --lift-local-win=0 gives refmap's built-in default exactly
@@ -439,6 +633,13 @@ int main_extract(int argc, char *argv[])
 		else if (c == 409) opt.min_support = atoi(o.arg);
 		else if (c == 410) opt.clamp = 1;
 		else if (c == 411) opt.lift_k = atoi(o.arg);
+		else if (c == 412) opt.snap = 1;
+		else if (c == 413) opt.snap = 0;
+		else if (c == 414) opt.snap_flank = atoi(o.arg);
+		else if (c == 415) opt.snap_r1 = rb3_parse_num(o.arg);
+		else if (c == 416) opt.snap_r2 = rb3_parse_num(o.arg);
+		else if (c == 417) opt.sopt.min_id = atof(o.arg);
+		else if (c == 418) opt.sopt.margin = atoi(o.arg);
 		else if (c == '?' || c == ':') {
 			fprintf(stderr, "ERROR: unknown or incomplete option '%s'\n", argv[o.i - 1]);
 			return 1;
@@ -453,6 +654,11 @@ int main_extract(int argc, char *argv[])
 	if (opt.lift_fn == 0 && (opt.to_asm || opt.ref_prefix)) { fprintf(stderr, "ERROR: --to/--ref-prefix need --lift\n"); return 1; }
 	if (opt.lift_fn && opt.ref_prefix == 0) { fprintf(stderr, "ERROR: --lift needs --ref-prefix\n"); return 1; }
 	if (opt.n_threads < 1) opt.n_threads = 1;
+	if (opt.lift_fn == 0) opt.snap = 0;
+	if (opt.snap && (opt.snap_flank < opt.sopt.min_aligned || opt.snap_r1 < 0 || opt.snap_r2 < 0)) {
+		fprintf(stderr, "ERROR: --snap-flank must be >= %d and the radii >= 0\n", opt.sopt.min_aligned);
+		return 1;
+	}
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.opt = &opt;
@@ -465,8 +671,8 @@ int main_extract(int argc, char *argv[])
 		ret = 1; goto end_extract;
 	}
 	ctx.name_ord = name_index_build(ctx.sid);
-	// the BWT (not needed for --project-only)
-	if (!opt.project_only) {
+	// the BWT (not needed for --project-only without snapping)
+	if (!opt.project_only || opt.snap) {
 		rb3_fmi_restore(&ctx.f, argv[o.ind], opt.use_mmap);
 		if (ctx.f.e == 0 && ctx.f.r == 0) {
 			fprintf(stderr, "ERROR: failed to load the FM-index '%s'\n", argv[o.ind]);

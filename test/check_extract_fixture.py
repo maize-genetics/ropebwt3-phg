@@ -134,6 +134,9 @@ def main():
     print(f"projection: {n_ok}/{n} projected ({dict(status)})")
     meth = Counter(pr[k]["method"] for k in q if k in pr)
     print(f"projection methods (start,end): {dict(meth.most_common())}")
+    if any("snap" in pr[k] for k in q if k in pr):
+        sn = Counter(lab for k in q if k in pr for lab in pr[k]["snap"].split(","))
+        print(f"snap labels (per end): {dict(sn.most_common())}")
     groups = {"all": [], "spans_large_indel=0": [], "spans_large_indel=1": []}
     for k, r in q.items():
         p = pr.get(k)

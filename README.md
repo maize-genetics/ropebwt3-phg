@@ -429,7 +429,7 @@ reference orientation). If either end does not project, or the ends land on
 different contigs or orientations, or the end precedes the start, the query fails
 with that reason (stderr, and the `status` column of `--project-only`), never a
 guess; projection failures do not set the exit status. `--project-only` prints
-`qid ref_contig ref_start ref_end assembly contig start end strand status method`,
+`qid ref_contig ref_start ref_end assembly contig start end strand status method snap snap_shift`,
 where `method` is the start/end projector (`local` bracket, `local1` one-sided,
 `median`, `identity` for the reference itself). Differences from refmap: the local
 bracket is ON by default (`--lift-local-win=20000`; `0` gives refmap's built-in
@@ -440,19 +440,62 @@ lands on its homologous base (`--lift-k`, default 100 = `lift`'s default; set it
 if the `.lift` was built with another `-k`, it is not stored in the file).
 `--lift-win=0` disables the median fallback entirely (only bracketed projections).
 
+**Snapping projected ends to the homologous base (default; `--no-snap` turns it off).**
+The lift only knows anchors every few hundred bp, so a projected end is interpolated
+and is off by any indel between it and its anchor. Each end is therefore refined by
+aligning the reference flank at that end (`[s, s+F)` for the start, `[e-F, e)` for the
+end, read from the index itself; `--snap-flank`, F = 64) to the founder within
++-`--snap-radius` (200) of the projection (in reference orientation; on `-` loci the
+window is reverse-complemented). The aligner (`snap.c`; ropebwt3 had no pairwise
+aligner) is an affine-gap DP, global on the flank and free at both ends of the window
+(match 1, mismatch 4, gap 6+1/bp). Then, exactly as `simulate_pangenome.py` defines the
+truth, the start is the founder base aligned to the first flank base present in the
+founder and the end is one past the founder base aligned to the last one: deleted end
+bases are walked over, and founder-only bases next to an end are never included.
+A snap is accepted if >= half the flank aligns at gap-compressed identity
+>= `--snap-min-id` (0.85) and no placement >= 8 bp away scores within `--snap-margin`
+(5, about one mismatch) of the best; otherwise:
+* low identity -> retry once within +-`--snap-radius2` (6000; 0 = off), which catches
+  large indels between the end and its anchors (`snap_wide`);
+* still low identity -> the flank itself may be deleted (an indel longer than F): step
+  the flank inward (F, 2F, 4F, ... <= radius2) until it aligns, then align the whole
+  stretch from the end to it with the deleted outer run clipped (`snap_walk`);
+* ambiguous (a repeat) or still unaligned -> the projected end is kept
+  (`proj_ambiguous`, `proj_lowid`, `proj_short` for a flank < 16 bp).
+`--project-only` adds two columns AFTER the existing ones, `snap` (start,end labels:
+`snap`, `snap_wide`, `snap_walk`, `proj_*`, `identity`, or `proj` with `--no-snap`)
+and `snap_shift` (bp each end's founder base moved, forward coordinates); the FASTA
+header gets ` snap=START,END`. F = 64 makes a chance hit in a 12 kb window negligible
+while staying short enough that most flanks carry no indel; windows wider than 8F are
+first cut to the regions sharing an exact 10-mer with the flank (the same answer as
+the full DP; tested), which keeps the wide retry cheap. Snapping needs the FMD and
+`.isa` even with `--project-only`.
+
 Measured on the simulated pangenome (`test/simulate_pangenome.py`: 3 x 150-300 kb
 chromosomes, 5 founders with 1% SNPs, small and 0.5-5 kb indels, a 6-copy 2 kb
-element; 500 random 8 kb B73 windows) with an `s200` lift: projected interval ==
-true interval 44.6% (start 65.0%, end 66.2% exact; 95% within 10 bp; median
-identity to the true founder sequence 99.99%); with `--lift-local-win=0` 0.2%
-exact and only ~61% within 100 bp. Nearly all residual offsets are small indels
-between the query end and its nearest anchor (interpolation; anchors every ~1 kb
-here) and large indels between the flanking anchors; a denser lift (`-k 31 -s 20`)
-gives 87% exact intervals.
+element; 500 random 8 kb B73 windows) with an `s200` lift:
+
+| | ends exact | intervals exact |
+|---|---|---|
+| `--lift-local-win=0` (refmap's wide median), no snap | 2.6% | 0.2% |
+| local bracket, `--no-snap` | 65.6% | 44.6% |
+| local bracket + snap (default) | 99.2% | 98.4% |
+
+The 8 remaining ends are all deletion-boundary placements: 7 are equivalent alignments
+(the bases separating the two placements are identical, so the sequence cannot tell
+them apart; 1-3 bp) and 1 is a 2-bp terminal deletion that scores worse than a
+mismatch+match (2 bp). On the 25-founder maize index (200 random B73 8 kb windows,
+`_v2_s200.lift`) 66% of ends snap (`snap` 198, `snap_wide` 16, `snap_walk` 26 of 364
+projected ends); of the 145 `proj_lowid`, 117 had only the coarse wide-median
+projection (no collinear anchors within 20 kb, i.e. non-syntenic sequence), where the
+flank is genuinely not near the projection.
 
 **Speed.** 1,000 random 8 kb windows across all 25 maize assemblies: 6.5 s on one
 thread (6.5 ms per window, ~10.0 M LF steps), 1.5 s with `-t4`; plus 1.6 s to
-load the FMD (5.0 GB RSS; `-M` mmaps it instead) and 0.05 s for the `.isa`.
+load the FMD (5.0 GB RSS; `-M` mmaps it instead) and 0.05 s for the `.isa`. With
+`--lift` (1,000 random B73 windows): 6.4 s without snapping, 27.6 s with (`-t4`: 1.7 s
+vs 7.3 s); the extra time is mostly the LF walks for the flanks and windows (39.6 M vs
+12.2 M steps), concentrated in the ends that fall back to the wide/walk search.
 
 ### <a name="deprecated"></a>Deprecated
 

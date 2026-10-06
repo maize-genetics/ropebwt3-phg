@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o isa.o extract.o
+			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o isa.o extract.o snap.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -54,10 +54,10 @@ test/test_lift.o:test/test_lift.c lift.h ps4g.h rb3priv.h
 test/test_lift:test/test_lift.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o
 		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
 
-test/test_extract.o:test/test_extract.c isa.h lift.h ps4g.h fm-index.h rb3priv.h
+test/test_extract.o:test/test_extract.c snap.h isa.h lift.h ps4g.h fm-index.h rb3priv.h
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
 
-test/test_extract:test/test_extract.o isa.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o sais-ss.o libsais.o libsais64.o
+test/test_extract:test/test_extract.o snap.o isa.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o sais-ss.o libsais.o libsais64.o
 		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
 test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_extract
@@ -104,4 +104,5 @@ lift.o: fm-index.h io.h rb3priv.h ketopt.h kalloc.h kthread.h lift.h
 ps4g.o: rb3priv.h ps4g.h io.h kseq.h
 hitcount.o: hitcount.h
 isa.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h isa.h
+snap.o: rb3priv.h snap.h
 extract.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h kalloc.h kthread.h lift.h ps4g.h isa.h

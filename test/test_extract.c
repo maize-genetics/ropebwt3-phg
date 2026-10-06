@@ -17,6 +17,7 @@
 #include "ps4g.h"
 #include "lift.h"
 #include "isa.h"
+#include "snap.h"
 
 void rb3_bwtl_init(void) {} // misc.o's rb3_init() references this dawg.c symbol (see test_ps4g.c)
 
@@ -447,6 +448,152 @@ static void test_inverse_lift(const char *outdir)
 	km_destroy(km);
 }
 
+
+/*****************************
+ * snap: the flank aligner   *
+ *****************************/
+
+static void rand_bases(char *s, int n) { int i; for (i = 0; i < n; ++i) s[i] = "ACGT"[rng() & 3]; s[n] = 0; }
+
+static int snap_str(const char *q, const char *t, const rb3_snap_opt_t *o, rb3_snap_res_t *r)
+{
+	int32_t n = (int32_t)strlen(q), m = (int32_t)strlen(t);
+	uint8_t *qq = RB3_MALLOC(uint8_t, n + 1), *tt = RB3_MALLOC(uint8_t, m + 1);
+	int st;
+	memcpy(qq, q, n); memcpy(tt, t, m);
+	rb3_char2nt6(n, qq); rb3_char2nt6(m, tt);
+	st = rb3_snap_align(qq, n, tt, m, o, r);
+	free(qq); free(tt);
+	return st;
+}
+
+static char other_base(char c) { return c == 'A'? 'C' : 'A'; }
+static char base_not_in(const char *s, int n) { const char *b = "ACGT"; int i, k; for (k = 0; k < 4; ++k) { for (i = 0; i < n && s[i] != b[k]; ++i) {} if (i == n) return b[k]; } return 'N'; }
+
+static void test_snap_align(void)
+{
+	rb3_snap_opt_t o;
+	rb3_snap_res_t r;
+	char fl[65], L[101], R[101], t[1000], q[400], tmp[200];
+	rb3_snap_opt_init(&o);
+	rand_bases(fl, 64); rand_bases(L, 100); rand_bases(R, 100);
+	// 1. exact
+	sprintf(t, "%s%s%s", L, fl, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.t_last == 163 && r.q_first == 0 && r.q_last == 63 && r.identity == 1.0,
+		  "snap: exact flank found at its offset");
+	// 2. SNPs, incl. the very first and last flank base (present, so they still define the ends)
+	strcpy(tmp, fl); tmp[0] = other_base(tmp[0]); tmp[20] = other_base(tmp[20]); tmp[63] = other_base(tmp[63]);
+	sprintf(t, "%s%s%s", L, tmp, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.t_last == 163 && r.n_match == 61,
+		  "snap: SNPs (incl. at both flank ends) do not move the ends");
+	// 3. small deletion inside the flank (founder lacks flank[30,33))
+	sprintf(t, "%s%.30s%s%s", L, fl, fl + 33, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.t_last == 100 + 60,
+		  "snap: 3-bp deletion inside the flank (end shifts by -3)");
+	// 4. small insertion inside the flank
+	sprintf(t, "%s%.30sGTCA%s%s", L, fl, fl + 30, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.t_last == 167,
+		  "snap: 4-bp insertion inside the flank (end shifts by +4)");
+	// 5. the end base deleted: flank[0,3) absent; start = founder base of flank[3]
+	strcpy(tmp, L); // no accidental slide of the deletion into the left flank (an equally valid placement)
+	{ int i; char c = base_not_in(fl, 3); for (i = 95; i < 100; ++i) tmp[i] = c; }
+	sprintf(t, "%s%s%s", tmp, fl + 3, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.q_first == 3 && r.t_first == 100,
+		  "snap: deleted end bases -> the first present flank base (q_first=3) at its founder base");
+	strcpy(tmp, R);
+	{ int i; char c = base_not_in(fl + 61, 3); for (i = 0; i < 5; ++i) tmp[i] = c; }
+	sprintf(t, "%s%.61s%s", L, fl, tmp);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.q_last == 60 && r.t_last == 160,
+		  "snap: deleted last bases -> the last present flank base");
+	// 6. insertion adjacent to the end is never included; an equal-base one maps to the own copy
+	sprintf(t, "%sGGTTC%s%s", L, fl, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 105, "snap: insertion right before the start is excluded");
+	tmp[0] = fl[0], tmp[1] = 0;
+	sprintf(t, "%s%s%s%s", L, tmp, fl, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 101,
+		  "snap: an equal-base insertion before the start: s maps to its own (rightmost) copy");
+	tmp[0] = fl[63], tmp[1] = 0;
+	sprintf(t, "%s%s%s%s", L, fl, tmp, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_last == 163 && r.t_end == 164,
+		  "snap: an equal-base insertion after the end is left out (leftmost end)");
+	// 7. repeat in the window -> ambiguous; a diverged second copy is not
+	sprintf(t, "%s%s%.50s%s%s", L, fl, R, fl, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_AMBIG && r.second == r.score, "snap: two identical copies -> ambiguous");
+	strcpy(tmp, fl); tmp[10] = other_base(tmp[10]); tmp[30] = other_base(tmp[30]); tmp[50] = other_base(tmp[50]);
+	sprintf(t, "%s%s%.50s%s%s", L, fl, R, tmp, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.second <= r.score - 10,
+		  "snap: a copy with 3 mismatches scores well below the best -> unique");
+	tmp[50] = fl[50], tmp[30] = fl[30]; // one mismatch: best-5, within the margin
+	sprintf(t, "%s%s%.50s%s%s", L, fl, R, tmp, R);
+	CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_AMBIG, "snap: a copy with 1 mismatch is within --snap-margin -> ambiguous");
+	// 8. too short
+	CHECK(snap_str("ACGTACGTAC", t, &o, &r) == RB3_SNAP_SHORT, "snap: flank shorter than min_aligned -> short");
+	CHECK(snap_str(fl, "ACGTACGTACGT", &o, &r) == RB3_SNAP_SHORT, "snap: window shorter than the required aligned length -> short");
+	{ // a 20-bp flank (e.g. a short interval) at the very start of a contig window
+		char f20[21]; memcpy(f20, fl, 20); f20[20] = 0;
+		sprintf(t, "%s%s", fl, R);
+		CHECK(snap_str(f20, t, &o, &r) == RB3_SNAP_OK && r.t_first == 0 && r.t_last == 19, "snap: short flank at the window (contig) start");
+	}
+	// 9. low identity: unrelated sequence
+	rand_bases(tmp, 64);
+	sprintf(t, "%s%s", L, R);
+	CHECK(snap_str(tmp, t, &o, &r) == RB3_SNAP_LOWID, "snap: unrelated flank -> low identity");
+	{ // 25% divergence -> below 0.85
+		strcpy(tmp, fl);
+		{ int i; for (i = 0; i < 64; i += 4) tmp[i] = other_base(tmp[i]); }
+		sprintf(t, "%s%s%s", L, tmp, R);
+		CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_LOWID, "snap: 25% mismatches -> low identity (fallback expected)");
+		o.min_id = 0.7;
+		CHECK(snap_str(fl, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100, "snap: ... accepted with --snap-min-id 0.7");
+		o.min_id = 0.85;
+	}
+	// 10. N in the flank never matches but does not break the placement
+	strcpy(tmp, fl); tmp[40] = 'N';
+	sprintf(t, "%s%s%s", L, fl, R);
+	CHECK(snap_str(tmp, t, &o, &r) == RB3_SNAP_OK && r.t_first == 100 && r.n_match == 63, "snap: an N in the flank");
+	// 11. clip5: a long deleted prefix (the walk-inward final alignment)
+	rand_bases(q, 200); strcat(q, fl);
+	sprintf(t, "%s%s%s", L, fl, R);
+	{
+		rb3_snap_opt_t c = o;
+		c.clip5 = c.gap_open + c.gap_ext, c.min_frac = 0, c.min_aligned = 32;
+		CHECK(snap_str(q, t, &c, &r) == RB3_SNAP_OK && r.q_first == 200 && r.t_first == 100,
+			  "snap clip5: a 200-bp deleted prefix is clipped, start = founder base of the first present base");
+		CHECK(snap_str(q, t, &o, &r) == RB3_SNAP_LOWID, "snap: without clip5 the same query needs half of it aligned -> low identity");
+	}
+	// 13. the k-mer prefilter on wide windows (m > 8n) gives the full DP's answer
+	{
+		int it, nbad = 0, n = 0;
+		rb3_snap_opt_t full = o;
+		rb3_snap_res_t r2;
+		static char big[6000], v[200];
+		full.no_seed = 1;
+		for (it = 0; it < 300; ++it) {
+			int pos = 200 + rng() % 5000, nd = rng() % 8, d, kind = rng() % 4;
+			rand_bases(big, 5800);
+			strcpy(v, fl);
+			for (d = 0; d < nd; ++d) v[rng() % 64] = "ACGT"[rng() & 3];         // 0-7 random substitutions
+			if (kind == 1) memmove(v + 30, v + 33, strlen(v + 33) + 1);          // 3-bp deletion
+			if (kind == 2) { memmove(v + 33, v + 30, strlen(v + 30) + 1); memcpy(v + 30, "GTA", 3); } // insertion
+			memcpy(big + pos, v, strlen(v));
+			if (kind == 3) memcpy(big + (pos + 1500) % 5600, fl, 64);             // a second copy
+			if (snap_str(fl, big, &o, &r) != snap_str(fl, big, &full, &r2)) ++nbad;
+			else if (r.status == RB3_SNAP_OK && (r.t_first != r2.t_first || r.t_last != r2.t_last || r.score != r2.score)) ++nbad;
+			++n;
+		}
+		LOOP_CHECK(nbad, n, "snap: seeded alignment on a 5.8 kb window == the full DP (300 random cases)");
+	}
+	// 12. identical flank on a reverse-complemented window (what extract does on '-' loci)
+	{
+		char rc[300]; int n;
+		sprintf(t, "%s%s%s", L, fl, R);
+		n = (int)strlen(t);
+		revcomp_str(t, n, rc);   // the founder stores the locus inverted ...
+		revcomp_str(rc, n, tmp); // ... extract revcomps the window back into reference orientation
+		CHECK(snap_str(fl, tmp, &o, &r) == RB3_SNAP_OK && r.t_first == 100, "snap: reverse-complemented window, re-oriented");
+	}
+}
+
 int main(int argc, char *argv[])
 {
 	const char *outdir = argc > 1? argv[1] : "test/output";
@@ -481,6 +628,7 @@ int main(int argc, char *argv[])
 		rb3_isa_destroy(x);
 	}
 	test_inverse_lift(outdir);
+	test_snap_align();
 
 	rb3_ssa_destroy(sa);
 	rb3_fmi_free(&f);
