@@ -54,15 +54,22 @@ test/test_lift.o:test/test_lift.c lift.h ps4g.h rb3priv.h
 test/test_lift:test/test_lift.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o
 		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
 
-test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift
+test/test_extract.o:test/test_extract.c isa.h lift.h ps4g.h fm-index.h rb3priv.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_extract:test/test_extract.o isa.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o sais-ss.o libsais.o libsais64.o
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_extract
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
 		./test/test_lift
+		./test/test_extract test/output
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_extract test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
