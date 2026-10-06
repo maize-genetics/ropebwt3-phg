@@ -251,6 +251,7 @@ typedef struct {
 	const int32_t *perm; // NULL = identity
 	int64_t lo, hi;      // view = [lo,hi) (indices into perm[] or pt[])
 	int inv;             // 0: key=cpos, value=(rsid,rpos); 1: key=rpos, value=(csid,cpos)
+	int best_slope;      // lift_collinear: take the slope with the smaller residual (see there)
 } lift_view_t;
 
 static inline const rb3_liftpt_t *lv_pt(const lift_view_t *v, int64_t i) { return v->perm? &v->pt[v->perm[i]] : &v->pt[i]; }
@@ -261,10 +262,20 @@ static inline int64_t lv_vsid(const lift_view_t *v, int64_t i) { const rb3_liftp
 // Two anchors are collinear if their value spacing equals their key spacing (slope
 // +1) or its negation (slope -1) within tol, on the same value sequence. Returns the
 // slope sign, 0 if not. (Forward view: reference spacing vs assembly spacing.)
+// The forward view tests slope +1 first, so two anchors closer than tol/2 always read
+// as +1 even in an inverted region (the bracket clamp then bounds the error by the
+// anchor gap); kept as is so refmap/chain output does not change. The inverse view
+// (extract), where the orientation decides the output strand, sets best_slope and
+// takes the slope with the smaller residual instead.
 static int lift_collinear(const lift_view_t *v, int64_t x, int64_t y, int64_t tol)
 {
 	int64_t dc = lv_key(v, y) - lv_key(v, x), dr = lv_val(v, y) - lv_val(v, x);
 	if (lv_vsid(v, x) != lv_vsid(v, y)) return 0;
+	if (v->best_slope) {
+		int64_t eP = llabs(dr - dc), eM = llabs(dr + dc);
+		if ((eP < eM? eP : eM) > tol) return 0;
+		return eP <= eM? 1 : -1;
+	}
 	if (llabs(dr - dc) <= tol) return 1;
 	if (llabs(dr + dc) <= tol) return -1;
 	return 0;
@@ -406,7 +417,7 @@ static int lift_project_core(const lift_view_t *v, void *km, int64_t cpos,
 
 static inline void lift_view_fwd(lift_view_t *v, const rb3_lift_t *lf, int32_t csid)
 {
-	v->pt = lf->pt, v->perm = 0, v->lo = lf->off[csid], v->hi = lf->off[csid + 1], v->inv = 0;
+	v->pt = lf->pt, v->perm = 0, v->lo = lf->off[csid], v->hi = lf->off[csid + 1], v->inv = 0, v->best_slope = 0;
 }
 
 // Project a assembly hit (csid, cpos) to a reference coordinate. Returns 1 and sets
@@ -526,16 +537,23 @@ int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_
 // Inverse projection, reference -> assembly: the forward projector run over the
 // (gamete, rsid) bucket of the reference-position index, i.e. with the roles of the
 // two coordinates swapped. Honours rb3_lift_set_local() exactly as refmap does.
+// A liftover point pairs the LEFTMOST base of the anchor k-mer on each side, which on
+// an inverted (slope -1) locus pairs reference base r with assembly base c+k-1, not c;
+// that k-1 is added back so a projected base lands on its own homologous base.
 int rb3_lift_project_inv(const rb3_lift_ridx_t *ridx, void *km, int32_t gamete, int64_t rsid, int64_t rpos,
-						 int64_t win, int64_t max_mad, int32_t min_support,
+						 int64_t win, int64_t max_mad, int32_t min_support, int32_t anchor_k,
 						 int64_t *out_csid, int64_t *out_cpos, int *out_sign, int *out_method)
 {
 	lift_view_t v;
 	int64_t key;
+	int sign = 0, ret;
 	if (ridx == 0 || gamete < 0 || gamete >= ridx->n_gamete || rsid < 0 || rsid >= ridx->n_seq) return 0;
 	key = (int64_t)gamete * ridx->n_seq + rsid;
-	v.pt = ridx->lf->pt, v.perm = ridx->perm, v.lo = ridx->off[key], v.hi = ridx->off[key + 1], v.inv = 1;
-	return lift_project_core(&v, km, rpos, win, max_mad, min_support, 0, out_csid, out_cpos, 0, out_sign, out_method);
+	v.pt = ridx->lf->pt, v.perm = ridx->perm, v.lo = ridx->off[key], v.hi = ridx->off[key + 1], v.inv = 1, v.best_slope = 1;
+	ret = lift_project_core(&v, km, rpos, win, max_mad, min_support, 0, out_csid, out_cpos, 0, &sign, out_method);
+	if (ret && sign < 0 && anchor_k > 1) *out_cpos += anchor_k - 1;
+	if (out_sign) *out_sign = sign;
+	return ret;
 }
 
 int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh)

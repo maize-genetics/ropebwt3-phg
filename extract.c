@@ -43,7 +43,7 @@ typedef struct {
 } ext_query_t;
 
 typedef struct {
-	int32_t n_threads, line_width, clamp, project_only, use_mmap, min_support;
+	int32_t n_threads, line_width, clamp, project_only, use_mmap, min_support, lift_k;
 	char *lift_fn, *ref_prefix, *to_asm, *isa_fn, *tsv_fn;
 	int64_t lift_win, lift_mad, local_win, local_tol;
 } ext_opt_t;
@@ -258,7 +258,7 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	}
 	for (i = 0; i < 2; ++i) {
 		int64_t rp = i == 0? q->rst : q->ren - 1; // first and last reference base
-		if (!rb3_lift_project_inv(c->ridx, km, g, q->rsid, rp, o->lift_win, o->lift_mad, o->min_support, &cs[i], &cp[i], &sg[i], &q->meth[i])) {
+		if (!rb3_lift_project_inv(c->ridx, km, g, q->rsid, rp, o->lift_win, o->lift_mad, o->min_support, o->lift_k, &cs[i], &cp[i], &sg[i], &q->meth[i])) {
 			q_fail(q, ST_PROJ_FAIL, i == 0? "no confident projection for the start" : "no confident projection for the end");
 			return;
 		}
@@ -378,9 +378,12 @@ static int usage_extract(FILE *fp, const ext_opt_t *o)
 	fprintf(fp, "                 without an assembly column\n");
 	fprintf(fp, "  --project-only print the projected interval as TSV, do not extract\n");
 	fprintf(fp, "  --lift-win=NUM, --lift-mad=NUM  projection window / max residual MAD [%ld, %ld]\n", (long)o->lift_win, (long)o->lift_mad);
-	fprintf(fp, "  --lift-local-win=NUM  nearest collinear flanking anchors within NUM bp first (0 = off) [%ld]\n", (long)o->local_win);
+	fprintf(fp, "  --lift-local-win=NUM  nearest collinear flanking anchors within NUM bp first; 0 = off,\n");
+	fprintf(fp, "                 the wide median only (refmap's built-in default) [%ld]\n", (long)o->local_win);
 	fprintf(fp, "  --lift-local-tol=NUM  collinearity tolerance for --lift-local-win [%ld]\n", (long)o->local_tol);
 	fprintf(fp, "  --lift-min-support=INT  min anchors for the median fit (refmap uses 4) [%d]\n", o->min_support);
+	fprintf(fp, "  --lift-k=INT   the -k the .lift was built with (not stored in the file); only\n");
+	fprintf(fp, "                 shifts projections onto inverted ('-') loci by k-1 [%d]\n", o->lift_k);
 	fprintf(fp, "Output:\n");
 	fprintf(fp, "  -w INT         FASTA line width, 0 = one line [%d]\n", o->line_width);
 	fprintf(fp, "Exit status 1 if any query had an input error (unparsable, unknown contig/assembly,\n");
@@ -409,12 +412,16 @@ int main_extract(int argc, char *argv[])
 		{ "lift-local-tol",   ko_required_argument, 408 },
 		{ "lift-min-support", ko_required_argument, 409 },
 		{ "clamp",            ko_no_argument,       410 },
+		{ "lift-k",           ko_required_argument, 411 },
 		{ 0, 0, 0 }
 	};
 
 	memset(&opt, 0, sizeof(opt));
-	opt.n_threads = 1, opt.line_width = 0, opt.min_support = 4;
-	opt.lift_win = 500000, opt.lift_mad = 200000, opt.local_win = 0, opt.local_tol = 1000; // = refmap's defaults
+	opt.n_threads = 1, opt.line_width = 0, opt.min_support = 4, opt.lift_k = 100;
+	// refmap's projection defaults, except the local bracket is ON (20 kb, the adopted
+	// refmap setting): without it the +-500 kb median offset is kb-scale off for an
+	// interval (see README); --lift-local-win=0 gives refmap's built-in default exactly
+	opt.lift_win = 500000, opt.lift_mad = 200000, opt.local_win = 20000, opt.local_tol = 1000;
 	while ((c = ketopt(&o, argc, argv, 1, "f:I:Mt:w:", lo)) >= 0) {
 		if (c == 'f') opt.tsv_fn = o.arg;
 		else if (c == 'I') opt.isa_fn = o.arg;
@@ -431,6 +438,7 @@ int main_extract(int argc, char *argv[])
 		else if (c == 408) opt.local_tol = rb3_parse_num(o.arg);
 		else if (c == 409) opt.min_support = atoi(o.arg);
 		else if (c == 410) opt.clamp = 1;
+		else if (c == 411) opt.lift_k = atoi(o.arg);
 		else if (c == '?' || c == ':') {
 			fprintf(stderr, "ERROR: unknown or incomplete option '%s'\n", argv[o.i - 1]);
 			return 1;
