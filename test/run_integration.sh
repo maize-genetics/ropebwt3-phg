@@ -613,6 +613,51 @@ check_eq "span check: failures reported on stderr" "$(grep -c 'projection failed
 "$RB" extract --lift="$TMP/span.lift" --ref-prefix=B73 --max-span-ratio=-1 -f "$TMP/span_q.tsv" "$TMP/span.fmd" > /dev/null 2>&1
 check_eq "span check: a negative value is an error" "$?" "1"
 
+# boundary consistency: [5000,m) and [m,16000) projected into the same founder must meet
+# at m (end of the left piece == start of the right piece), except for founder bases
+# inserted exactly at m, which belong to neither piece (truth convention).
+#   Del = B73 minus [9000,12000); Ins = 500 bp inserted at 10000; Rep = [9000,12000)
+#   replaced by 2 kb of other sequence; Div = every 3rd base of [9930,10000) changed (a
+#   low-identity left flank at m = 10000); Inv = the reverse complement of Del
+awk 'function rnd(n,  s,i){s=""; for(i=0;i<n;i++) s=s substr("ACGT",int(rand()*4)+1,1); return s}
+function rc(s,  t,i,c){t=""; for(i=length(s);i>0;i--){c=substr(s,i,1); t=t (c=="A"?"T":c=="C"?"G":c=="G"?"C":"A")} return t}
+function mut(s,  t,i,c){t=""; for(i=1;i<=length(s);i++){c=substr(s,i,1); if(i%3==0) c=(c=="A"?"C":"A"); t=t c} return t}
+BEGIN{srand(11); r=rnd(20000);
+	print ">B73_chr1"; print r;
+	print ">Del_chr1"; print substr(r,1,9000) substr(r,12001);
+	print ">Ins_chr1"; print substr(r,1,10000) rnd(500) substr(r,10001);
+	print ">Rep_chr1"; print substr(r,1,9000) rnd(2000) substr(r,12001);
+	print ">Div_chr1"; print substr(r,1,9930) mut(substr(r,9931,70)) substr(r,10001);
+	print ">Inv_chr1"; print rc(substr(r,1,9000) substr(r,12001)) }' > "$TMP/junc.fa"
+"$RB" build -d -o "$TMP/junc.fmd" "$TMP/junc.fa" 2>/dev/null && "$RB" ssa -s4 -o "$TMP/junc.fmd.ssa" "$TMP/junc.fmd" 2>/dev/null
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$TMP/junc.fa" | gzip > "$TMP/junc.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$TMP/junc.lift" "$TMP/junc.fmd" "$TMP/junc.fa" 2>/dev/null
+"$RB" isa -b 6 "$TMP/junc.fmd" 2>/dev/null
+{ printf 'qid\tref_contig\tref_start\tref_end\tassembly\n'
+  for A in Del Ins Rep Div Inv; do for m in 10000 9000 12000 9010 11990 9990; do
+	printf '%s|%s|L\tB73_chr1\t5000\t%s\t%s\n%s|%s|R\tB73_chr1\t%s\t16000\t%s\n' $A $m $m $A $A $m $m $A; done; done; } > "$TMP/junc_q.tsv"
+junc() { # junc <extra options> -> one "founder|m:junction_offset" per split, sorted
+	"$RB" extract --lift="$TMP/junc.lift" --lift-k 31 --ref-prefix=B73 --project-only "$@" -f "$TMP/junc_q.tsv" "$TMP/junc.fmd" 2>/dev/null |
+	awk -F'\t' 'NR>1{split($1,k,"|"); key=k[1]"|"k[2]; ok=($10 ~ /^ok/); if(k[3]=="L"){Ls[key]=$7; Le[key]=$8; lo[key]=ok} else {Rs[key]=$7; Re[key]=$8; sd[key]=$9; ro[key]=ok}}
+		END{for(key in Ls) if(lo[key] && ro[key]) print key":"((sd[key]=="+")? Rs[key]-Le[key] : Ls[key]-Re[key]); else print key":failed"}' | sort | tr '\n' ' '
+}
+J=$(junc)
+check_eq "boundary consistency (snap): every split meets at m; only the 500 bp inserted at m is between the pieces" "$J" \
+	"Del|10000:0 Del|11990:0 Del|12000:0 Del|9000:0 Del|9010:0 Del|9990:0 Div|10000:0 Div|11990:0 Div|12000:0 Div|9000:0 Div|9010:0 Div|9990:0 Ins|10000:500 Ins|11990:0 Ins|12000:0 Ins|9000:0 Ins|9010:0 Ins|9990:0 Inv|10000:0 Inv|11990:failed Inv|12000:failed Inv|9000:0 Inv|9010:0 Inv|9990:0 Rep|10000:0 Rep|11990:0 Rep|12000:0 Rep|9000:0 Rep|9010:0 Rep|9990:0 "
+check_eq "boundary consistency (--no-snap): the lift projection of m is shared too" "$(junc --no-snap | tr ' ' '\n' | grep -v ':0$' | grep . | tr '\n' ' ')" \
+	"Inv|11990:failed Inv|12000:failed "
+"$RB" extract --lift="$TMP/junc.lift" --lift-k 31 --ref-prefix=B73 --project-only -f "$TMP/junc_q.tsv" "$TMP/junc.fmd" 2>/dev/null > "$TMP/junc.tsv"
+check_eq "junction: a deletion containing m -> both pieces at the junction (Del 10000: left end 9000, right start 9000)" \
+	"$(awk -F'\t' '$1=="Del|10000|L"{e=$8} $1=="Del|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "9000 9000"
+check_eq "junction: a replacement containing m -> the replacement goes to the right piece" \
+	"$(awk -F'\t' '$1=="Rep|10000|L"{e=$8} $1=="Rep|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "9000 9000"
+check_eq "junction: an insertion at m belongs to neither piece (truth convention): left end 10000, right start 10500" \
+	"$(awk -F'\t' '$1=="Ins|10000|L"{e=$8} $1=="Ins|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "10000 10500"
+check_eq "junction: low-identity left flank -> both sides placed by the right flank (end labelled snap_x)" \
+	"$(awk -F'\t' '$1=="Div|10000|L"{split($12,a,","); e=$8" "a[2]} $1=="Div|10000|R"{split($12,a,","); s=$7" "a[1]} END{print e" | "s}' "$TMP/junc.tsv")" "10000 snap_x | 10000 snap"
+check_eq "junction: '-' strand, deletion containing m (Inv: reference 9000 = founder 8000)" \
+	"$(awk -F'\t' '$1=="Inv|10000|L"{print $7" "$9} $1=="Inv|10000|R"{print $8" "$9}' "$TMP/junc.tsv" | tr '\n' ' ')" "8000 - 8000 - "
+
 "$RB" extract -I "$TMP/inv.fmd.isa" "$IDX" B73_chr1:0-5 > /dev/null 2>"$TMP/ext_wrongisa.log"
 check_eq "extract: an .isa from another index is rejected" "$(grep -c 'not built from this index' "$TMP/ext_wrongisa.log")" "1"
 
@@ -645,6 +690,13 @@ if [ -n "$NPY_PY" ]; then
 		pass
 	else
 		fail "simulated fixture check (snap) failed; see $TMP/sim_check.log"; cat "$TMP/sim_check.log" >&2
+	fi
+	# X -> X switches: each reference query split at its midpoint, both halves into the same
+	# founder; the junction must equal the truth gap (0 unless bases were inserted at m)
+	if "$NPY_PY" check_extract_junctions.py "$SIM" "$RB" "$SIM/p.fmd" "$SIM/p.lift" --min-consistent 0.99 > "$TMP/sim_junc.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture junction check failed; see $TMP/sim_junc.log"; cat "$TMP/sim_junc.log" >&2
 	fi
 else
 	echo "SKIP: simulated-pangenome extract check needs a python3 with numpy" >&2

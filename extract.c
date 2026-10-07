@@ -255,12 +255,14 @@ static const char *meth_name(int m)
 	return m >= 0 && m <= 5? names[m] : "none";
 }
 
-enum { SNAP_OFF = 0, SNAP_SNAP, SNAP_WIDE, SNAP_AMBIG, SNAP_LOWID, SNAP_SHORT, SNAP_IDENTITY, SNAP_WALK };
+enum { SNAP_OFF = 0, SNAP_SNAP, SNAP_WIDE, SNAP_AMBIG, SNAP_LOWID, SNAP_SHORT, SNAP_IDENTITY, SNAP_WALK,
+	   SNAP_R_SNAP, SNAP_R_WIDE, SNAP_R_WALK };
 
 static const char *snap_name(int m)
 {
-	static const char *names[] = { "proj", "snap", "snap_wide", "proj_ambiguous", "proj_lowid", "proj_short", "identity", "snap_walk" };
-	return m >= 0 && m <= 7? names[m] : "proj";
+	static const char *names[] = { "proj", "snap", "snap_wide", "proj_ambiguous", "proj_lowid", "proj_short", "identity", "snap_walk",
+								   "snap_x", "snap_x_wide", "snap_x_walk" };
+	return m >= 0 && m <= 10? names[m] : "proj";
 }
 
 // An oriented founder window extracted once per end and reused by the wide retry and
@@ -318,124 +320,185 @@ static int snap_window(const ext_ctx_t *c, ext_query_t *q, int64_t tsid, int sig
 	return res->status;
 }
 
-// The end base and the whole flank are deleted in the founder (a deletion longer than
-// the flank): step the flank inward (t = F, 2F, 4F, ... <= radius2) until it aligns,
-// then align the whole reference stretch from the end to that flank, so the first
-// (start) / last (end) present reference base is found exactly. Oriented coordinates.
-static int snap_walk(const ext_ctx_t *c, ext_query_t *q, int i, int sign, int64_t tsid, int64_t p, int64_t *u_out, const snap_cache_t *ca)
+// The flank itself is deleted in the founder (a deletion longer than the flank): step
+// the flank away from the boundary x (t = F, 2F, 4F, ... <= radius2, inside the
+// reference contig) until it aligns, then align the whole reference stretch from x to
+// that flank, so the last present base before x (left side, dir = 1) / the first
+// present base from x on (right side, dir = 0) is found exactly. Oriented coordinates;
+// p = the estimated homolog of the flank base next to x. Depends only on (x, dir, p),
+// never on the query interval, so both pieces sharing a boundary get the same answer.
+static int snap_walk(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x, int dir, int sign, int64_t tsid, int64_t p,
+					 int64_t *u_out, const snap_cache_t *ca)
 {
 	const ext_opt_t *o = c->opt;
-	int64_t t, tmax, F = o->snap_flank, ilen = q->ren - q->rst, wlo, y = -1, r, ra, rb;
+	int64_t t, tmax, F = o->snap_flank, Lr = c->sid->len[rsid], wlo, y = -1, r, ra, rb;
 	rb3_snap_res_t res;
 	uint8_t *rs, *qs;
 	int status = RB3_SNAP_LOWID;
-	for (tmax = 0, t = F; t + F <= ilen && t <= o->snap_r2; t <<= 1) tmax = t;
+	for (tmax = 0, t = F; t <= o->snap_r2 && (dir? x - t - F >= 0 : x + t + F <= Lr); t <<= 1) tmax = t;
 	if (tmax == 0) return status;
-	// the reference stretch [end .. end +- tmax+F), extracted once
-	ra = i == 0? q->rst : q->ren - tmax - F, rb = i == 0? q->rst + tmax + F : q->ren;
+	// the reference stretch [x .. x +- tmax+F), extracted once
+	ra = dir? x - tmax - F : x, rb = dir? x : x + tmax + F;
 	rs = RB3_MALLOC(uint8_t, rb - ra);
-	if ((r = rb3_isa_extract(&c->f, c->isa, q->rsid * 2, ra, rb, rs)) < 0) { free(rs); return RB3_SNAP_SHORT; }
+	if ((r = rb3_isa_extract(&c->f, c->isa, rsid * 2, ra, rb, rs)) < 0) { free(rs); return RB3_SNAP_SHORT; }
 	q->steps += r;
 	for (t = F; t <= tmax; t <<= 1) {
-		int64_t a = i == 0? q->rst + t : q->ren - t - F;
-		// the stepped flank's homolog: near p if [end, end+t) is deleted, up to t further otherwise
-		if (i == 0) status = snap_window(c, q, tsid, sign, p - o->snap_r2, p + t + F + o->snap_r2, rs + (a - ra), (int32_t)F, &o->sopt, &res, &wlo, 0, ca);
+		int64_t a = dir? x - t - F : x + t;
+		// the stepped flank's homolog: near p if [x, x+-t) is deleted, up to t further otherwise
+		if (!dir) status = snap_window(c, q, tsid, sign, p - o->snap_r2, p + t + F + o->snap_r2, rs + (a - ra), (int32_t)F, &o->sopt, &res, &wlo, 0, ca);
 		else status = snap_window(c, q, tsid, sign, p - t - F - o->snap_r2, p + o->snap_r2 + 1, rs + (a - ra), (int32_t)F, &o->sopt, &res, &wlo, 0, ca);
-		if (status == RB3_SNAP_OK) { y = wlo + (i == 0? res.t_first : res.t_last); break; }
+		if (status == RB3_SNAP_OK) { y = wlo + (dir? res.t_last : res.t_first); break; }
 		if (status == RB3_SNAP_AMBIG) break;
 	}
 	if (y < 0) { free(rs); return status; }
-	// whole stretch [end .. stepped flank]: every base is aligned or deleted. Most of it
-	// is deleted, so the deleted run at the outer end is clipped at a flat cost (as one
-	// gap event) instead of letting random bases align across the founder window; the
-	// end case is aligned reversed so that run is always the query prefix.
+	// whole stretch [x .. stepped flank]: every base is aligned or deleted. Most of it
+	// is deleted, so the deleted run next to x is clipped at a flat cost (as one gap
+	// event) instead of letting random bases align across the founder window; the left
+	// side is aligned reversed so that run is always the query prefix.
 	{
 		rb3_snap_opt_t so = o->sopt;
-		int64_t a = i == 0? q->rst : q->ren - t - F, n = t + F, wlo2, whi2, j;
+		int64_t a = dir? x - t - F : x, n = t + F, wlo2, whi2, j;
 		so.min_frac = 0, so.min_aligned = (int32_t)(F / 2), so.clip5 = so.gap_open + so.gap_ext;
 		qs = RB3_MALLOC(uint8_t, n);
 		memcpy(qs, rs + (a - ra), n);
-		if (i == 0) wlo2 = y - t - o->snap_r1, whi2 = y + F + o->snap_r1;
+		if (!dir) wlo2 = y - t - o->snap_r1, whi2 = y + F + o->snap_r1;
 		else wlo2 = y - F - o->snap_r1, whi2 = y + t + o->snap_r1 + 1;
-		if (i == 1) for (j = 0; j < n>>1; ++j) { uint8_t z = qs[j]; qs[j] = qs[n-1-j]; qs[n-1-j] = z; }
-		status = snap_window(c, q, tsid, sign, wlo2, whi2, qs, (int32_t)n, &so, &res, &wlo, i == 1, ca);
+		if (dir) for (j = 0; j < n>>1; ++j) { uint8_t z = qs[j]; qs[j] = qs[n-1-j]; qs[n-1-j] = z; }
+		status = snap_window(c, q, tsid, sign, wlo2, whi2, qs, (int32_t)n, &so, &res, &wlo, dir, ca);
 		free(qs);
-		if (status == RB3_SNAP_OK) *u_out = i == 0? wlo + res.t_first : wlo + res.t_last;
+		if (status == RB3_SNAP_OK) *u_out = !dir? wlo + res.t_first : wlo + res.t_last;
 	}
 	free(rs);
 	return status;
 }
 
-// Snap one end. i = 0: the reference start (flank [rst, rst+F)), 1: the reference end
-// (flank [ren-F, ren)). *cp (forward founder coordinate of the homologous base of
-// the first/last reference base) is replaced by the aligned founder base of the
-// first/last flank base present in the founder, if the alignment is accepted.
-// Inverted loci (sign < 0) are aligned on the reverse complement of the window, i.e.
-// always in reference orientation; "oriented" coordinates u = L-1-x there.
-static void q_snap_end(const ext_ctx_t *c, ext_query_t *q, int i, int sign, int64_t tsid, int64_t *cp)
+// Snap one side of boundary x: dir = 1 aligns the left flank [x-F, x) and returns the
+// homolog of the last present base before x; dir = 0 aligns the right flank [x, x+F)
+// and returns the homolog of the first present base from x on (*u, oriented). p = the
+// estimated homolog of the flank base next to x. Returns SNAP_SNAP/SNAP_WIDE/SNAP_WALK
+// or the failure label. *edge = 1 if the flank base next to x (x-1 or x) is itself
+// present (aligned), i.e. there is no deletion on that side of x.
+// walk = 0: the +-R1 / +-R2 windows only; walk = 1: only the walk (both windows
+// having given low identity).
+static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x, int dir, int sign, int64_t tsid, int64_t p, int64_t *u, int *edge, int walk)
 {
 	const ext_opt_t *o = c->opt;
-	int64_t L = c->sid->len[tsid], a, b, p, radii[2], r, wlo, u = -1;
+	int64_t L = c->sid->len[tsid], Lr = c->sid->len[rsid], a, b, radii[2], r, wlo;
 	int32_t F = o->snap_flank, nq, k;
+	int lab = SNAP_SHORT;
 	uint8_t *fl;
 	rb3_snap_res_t res;
 	snap_cache_t ca = { 0, 0, 0 };
-	a = i == 0? q->rst : (q->ren - F > q->rst? q->ren - F : q->rst);
-	b = i == 0? (q->rst + F < q->ren? q->rst + F : q->ren) : q->ren;
+	*u = -1, *edge = 0;
+	a = dir? (x - F > 0? x - F : 0) : x;
+	b = dir? x : (x + F < Lr? x + F : Lr);
 	nq = (int32_t)(b - a);
-	q->snap[i] = SNAP_SHORT;
-	if (nq < o->sopt.min_aligned) return;
+	if (nq < o->sopt.min_aligned) return SNAP_SHORT;
 	fl = RB3_MALLOC(uint8_t, nq);
-	if ((r = rb3_isa_extract(&c->f, c->isa, q->rsid * 2, a, b, fl)) < 0) { free(fl); return; }
+	if ((r = rb3_isa_extract(&c->f, c->isa, rsid * 2, a, b, fl)) < 0) { free(fl); return SNAP_SHORT; }
 	q->steps += r;
-	p = sign > 0? *cp : L - 1 - *cp;
 	if (p < 0) p = 0;
 	if (p > L - 1) p = L - 1;
 	radii[0] = o->snap_r1, radii[1] = o->snap_r2;
+	if (walk) { // the flank itself may be deleted
+		lab = SNAP_LOWID;
+		if (o->snap_r2 > 0) {
+			int st;
+			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, &ca);
+			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, &ca);
+			st = snap_walk(c, q, rsid, x, dir, sign, tsid, p, u, &ca); // *edge stays 0: the next base is deleted
+			if (st == RB3_SNAP_OK) lab = SNAP_WALK;
+			else if (st == RB3_SNAP_AMBIG) lab = SNAP_AMBIG;
+		}
+		free(fl); free(ca.buf);
+		return lab;
+	}
 	for (k = 0; k < 2; ++k) {
 		int st;
 		if (k == 1 && radii[1] <= radii[0]) break;
-		if (k == 1) { // one extraction covering the wide window and every walk step (t <= tmax)
-			int64_t tmax = 0, t, ilen = q->ren - q->rst;
-			for (t = F; t + F <= ilen && t <= o->snap_r2; t <<= 1) tmax = t;
-			if (i == 0) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + radii[1] + tmax + 2 * F + 1, &ca);
-			else snap_cache_fill(c, q, tsid, sign, p - radii[1] - tmax - 2 * F, p + radii[1] + F + 1, &ca);
+		if (k == 1) { // one extraction covering the wide window and every walk step (t <= R2)
+			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, &ca);
+			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, &ca);
 		}
 		st = snap_window(c, q, tsid, sign, p - radii[k] - F, p + radii[k] + F + 1, fl, nq, &o->sopt, &res, &wlo, 0, &ca);
 		if (st == RB3_SNAP_OK) {
-			u = wlo + (i == 0? res.t_first : res.t_last);
-			q->snap[i] = k == 0? SNAP_SNAP : SNAP_WIDE;
+			*u = wlo + (dir? res.t_last : res.t_first);
+			*edge = dir? res.q_last == nq - 1 : res.q_first == 0;
+			lab = k == 0? SNAP_SNAP : SNAP_WIDE;
 			break;
 		}
-		q->snap[i] = st == RB3_SNAP_AMBIG? SNAP_AMBIG : st == RB3_SNAP_LOWID? SNAP_LOWID : SNAP_SHORT;
+		lab = st == RB3_SNAP_AMBIG? SNAP_AMBIG : st == RB3_SNAP_LOWID? SNAP_LOWID : SNAP_SHORT;
 		if (st != RB3_SNAP_LOWID) break; // a wider window cannot resolve an ambiguity
 	}
 	free(fl);
-	if (u < 0 && q->snap[i] == SNAP_LOWID && o->snap_r2 > 0) { // the flank itself may be deleted
-		int st = snap_walk(c, q, i, sign, tsid, p, &u, &ca);
-		if (st == RB3_SNAP_OK) q->snap[i] = SNAP_WALK;
-		else if (st == RB3_SNAP_AMBIG) q->snap[i] = SNAP_AMBIG;
-	}
 	free(ca.buf);
-	if (u >= 0) {
-		int64_t x = sign > 0? u : L - 1 - u;
-		q->shift[i] = x - *cp, *cp = x;
+	return lab;
+}
+
+// label of a side placed by the flank on the OTHER side of the boundary than its own
+// (a start placed by its left flank, an end by its right flank)
+static int snap_cross(int lab)
+{
+	return lab == SNAP_SNAP? SNAP_R_SNAP : lab == SNAP_WIDE? SNAP_R_WIDE : SNAP_R_WALK;
+}
+
+// The founder fencepost (oriented) of reference boundary x, between bases x-1 and x.
+// An END at x is one past the homolog of the last reference base before x present in
+// the founder (left flank [x-F, x)); a START at x is the homolog of the first present
+// base from x on (right flank [x, x+F)). Both are derived from the same placements of
+// the two flanks of x, in this order, so the pieces [a,x) and [x,b) always agree:
+//  1. both flanks placed within +-R1/R2, x-1 and x both present (no deletion at x) and
+//     the right flank not overlapping the left: end = after the left, start = the
+//     right; any gap is founder sequence inserted exactly at x (truth convention:
+//     in neither piece);
+//  2. otherwise one flank placed (left preferred): end = start = that junction, so a
+//     deletion containing x maps both pieces to the same founder base, and founder-
+//     only (replacement) bases at x go to the right piece;
+//  3. neither placed: walk the left flank, then the right flank, away from x (the
+//     flank itself deleted); end = start = that junction;
+//  4. otherwise the lift projection (u_raw).
+// Depends only on x (never on the interval). Labels: snap/snap_wide/snap_walk = the
+// side's own flank (start: right, end: left); snap_x* = the flank across the boundary.
+static int snap_boundary(const ext_ctx_t *c, ext_query_t *q, int64_t x, int is_start, int sign, int64_t tsid, int64_t u_raw, int64_t *U)
+{
+	int64_t uL = -1, uR = -1;
+	int labL = SNAP_SHORT, labR = SNAP_SHORT, eL = 0, eR = 0;
+	*U = u_raw;
+	if (x > 0) labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 0);
+	if (is_start || uL < 0) labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 0);
+	if (uL >= 0) {
+		if (is_start && uR >= 0 && eL && eR && uR >= uL + 1) { *U = uR; return labR; }
+		*U = uL + 1;
+		return is_start? snap_cross(labL) : labL;
 	}
+	if (uR >= 0) { *U = uR; return is_start? labR : snap_cross(labR); }
+	if (labL == SNAP_LOWID) {
+		labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 1);
+		if (uL >= 0) { *U = uL + 1; return is_start? snap_cross(labL) : labL; }
+	}
+	if (labR == SNAP_LOWID) {
+		labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 1);
+		if (uR >= 0) { *U = uR; return is_start? labR : snap_cross(labR); }
+	}
+	return labL == SNAP_SHORT? labR : labL;
 }
 
 static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 {
 	const ext_opt_t *o = c->opt;
 	int32_t g = rb3_gtab_find(c->gtab, q->asm_name);
-	int64_t cs[2], cp[2], len;
+	int64_t cs[2], cp[2], len, U[2], x[2];
 	int sg[2], i;
 	if (g == c->gtab->sid2g[q->rsid]) { // the reference itself: identity
 		q->tsid = q->rsid, q->st = q->rst, q->en = q->ren, q->strand = 1, q->meth[0] = q->meth[1] = 5;
 		if (o->snap) q->snap[0] = q->snap[1] = SNAP_IDENTITY;
 		return;
 	}
+	// each boundary x is projected through the base before it (x-1; base 0 for x = 0),
+	// so the end of [a,m) and the start of [m,b) are the same computation
+	x[0] = q->rst, x[1] = q->ren;
 	for (i = 0; i < 2; ++i) {
-		int64_t rp = i == 0? q->rst : q->ren - 1; // first and last reference base
+		int64_t rp = x[i] > 0? x[i] - 1 : 0;
 		if (!rb3_lift_project_inv(c->ridx, km, g, q->rsid, rp, o->lift_win, o->lift_mad, o->min_support, o->lift_k, &cs[i], &cp[i], &sg[i], &q->meth[i])) {
 			q_fail(q, ST_PROJ_FAIL, i == 0? "no confident projection for the start" : "no confident projection for the end");
 			return;
@@ -444,11 +507,20 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	if (cs[0] != cs[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project to different contigs"); q->tsid = -1; return; }
 	if (sg[0] != sg[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project with different orientations"); return; }
 	q->tsid = cs[0], q->strand = sg[0];
-	if (o->snap) for (i = 0; i < 2; ++i) q_snap_end(c, q, i, q->strand, q->tsid, &cp[i]);
-	if (q->strand > 0) q->st = cp[0], q->en = cp[1] + 1;
-	else q->st = cp[1], q->en = cp[0] + 1;
-	if (q->en <= q->st) { q_fail(q, ST_PROJ_FAIL, "projected end precedes projected start"); return; }
 	len = c->sid->len[q->tsid];
+	for (i = 0; i < 2; ++i) { // oriented fenceposts (u = L-1-cp on '-')
+		int64_t uc = q->strand > 0? cp[i] : len - 1 - cp[i], uraw = x[i] > 0? uc + 1 : uc;
+		U[i] = uraw;
+		if (o->snap) {
+			q->snap[i] = snap_boundary(c, q, x[i], i == 0, q->strand, q->tsid, uraw, &U[i]);
+			q->shift[i] = q->strand > 0? U[i] - uraw : uraw - U[i]; // in forward coordinates
+		}
+	}
+	if (q->strand > 0) q->st = U[0], q->en = U[1];
+	else q->st = len - U[1], q->en = len - U[0];
+	if (q->en == q->st) { q_fail(q, ST_PROJ_FAIL, "interval deleted in the founder (empty projection)"); return; }
+	if (q->en < q->st) { q_fail(q, ST_PROJ_FAIL, "projected end precedes projected start"); return; }
+	if (q->st < 0) q->st = 0, q->clamped = 1;
 	if (q->st >= len) { q_fail(q, ST_PROJ_FAIL, "projected start is past the contig end"); return; }
 	if (q->en > len) q->en = len, q->clamped = 1;
 	// sanity: a span far longer than the reference interval is a coarse (wide-median)
