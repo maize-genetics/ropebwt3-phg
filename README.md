@@ -440,6 +440,17 @@ lands on its homologous base (`--lift-k`, default 100 = `lift`'s default; set it
 if the `.lift` was built with another `-k`, it is not stored in the file).
 `--lift-win=0` disables the median fallback entirely (only bracketed projections).
 
+**Span sanity check.** After projection and snapping, a query FAILS when its projected
+span is both more than `--max-span-excess` (50000) bp longer than the reference
+interval AND more than `--max-span-ratio` (3.0) times as long; 0 for either option
+turns the check off. It applies to clamped (`ok_clamped`) results too, and is reported
+like any projection failure (`projection_failed: projected span implausibly long (PRJ bp
+for REF bp)` in the status column and on stderr, no FASTA record, exit status unchanged).
+The rule is shared with the GRITS Python builder. Such spans come from the coarse
+wide-median fallback: on 1,000 random B73 8 kb windows into the maize founders it
+removes 21 of 890 OK projections (19 involve a `median` end), and no OK projection
+more than 50 kb longer than its reference interval remains.
+
 **Snapping projected ends to the homologous base (default; `--no-snap` turns it off).**
 The lift only knows anchors every few hundred bp, so a projected end is interpolated
 and is off by any indel between it and its anchor. Each end is therefore refined by

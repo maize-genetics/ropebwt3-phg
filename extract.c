@@ -40,7 +40,8 @@ typedef struct {
 	int snap[2];        // SNAP_* label of the start / end
 	int64_t shift[2];   // bp the snap moved the founder base of the reference start / end (forward coords)
 	int status;         // ST_*
-	const char *msg;    // failure reason (static string), or 0
+	const char *msg;    // failure reason (static string or msgbuf), or 0
+	char msgbuf[96];
 	char *seq;          // extracted sequence (ACGTN), NUL-terminated
 	int64_t steps;      // LF steps taken
 } ext_query_t;
@@ -52,6 +53,8 @@ typedef struct {
 	rb3_snap_opt_t sopt;
 	char *lift_fn, *ref_prefix, *to_asm, *isa_fn, *tsv_fn;
 	int64_t lift_win, lift_mad, local_win, local_tol;
+	int64_t max_span_excess;   // span check: fail if prj-ref > this AND prj > ratio*ref; 0 = off
+	double max_span_ratio;
 } ext_opt_t;
 
 typedef struct {
@@ -448,6 +451,16 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	len = c->sid->len[q->tsid];
 	if (q->st >= len) { q_fail(q, ST_PROJ_FAIL, "projected start is past the contig end"); return; }
 	if (q->en > len) q->en = len, q->clamped = 1;
+	// sanity: a span far longer than the reference interval is a coarse (wide-median)
+	// projection gone wrong, not a real insertion (same rule as the Python builder)
+	if (o->max_span_excess > 0 && o->max_span_ratio > 0) {
+		int64_t ref_len = q->ren - q->rst, prj_len = q->en - q->st;
+		if (prj_len - ref_len > o->max_span_excess && (double)prj_len > o->max_span_ratio * (double)ref_len) {
+			snprintf(q->msgbuf, sizeof(q->msgbuf), "projected span implausibly long (%ld bp for %ld bp)", (long)prj_len, (long)ref_len);
+			q_fail(q, ST_PROJ_FAIL, q->msgbuf);
+			return;
+		}
+	}
 }
 
 /**************
@@ -562,6 +575,9 @@ static int usage_extract(FILE *fp, const ext_opt_t *o)
 	fprintf(fp, "  --lift-min-support=INT  min anchors for the median fit (refmap uses 4) [%d]\n", o->min_support);
 	fprintf(fp, "  --lift-k=INT   the -k the .lift was built with (not stored in the file); only\n");
 	fprintf(fp, "                 shifts projections onto inverted ('-') loci by k-1 [%d]\n", o->lift_k);
+	fprintf(fp, "  --max-span-excess=NUM, --max-span-ratio=FLOAT  fail a projection (after snapping) whose\n");
+	fprintf(fp, "                 span exceeds the reference interval by > NUM bp AND is > FLOAT x as long;\n");
+	fprintf(fp, "                 0 for either turns the check off [%ld, %.1f]\n", (long)o->max_span_excess, o->max_span_ratio);
 	fprintf(fp, "Snapping projected ends to the homologous base (with --lift):\n");
 	fprintf(fp, "  --no-snap      keep the lift projection as is [snap on]\n");
 	fprintf(fp, "  --snap-flank=INT  reference flank aligned at each end [%d]\n", o->snap_flank);
@@ -605,11 +621,14 @@ int main_extract(int argc, char *argv[])
 		{ "snap-radius2",     ko_required_argument, 416 },
 		{ "snap-min-id",      ko_required_argument, 417 },
 		{ "snap-margin",      ko_required_argument, 418 },
+		{ "max-span-excess",  ko_required_argument, 419 },
+		{ "max-span-ratio",   ko_required_argument, 420 },
 		{ 0, 0, 0 }
 	};
 
 	memset(&opt, 0, sizeof(opt));
 	opt.n_threads = 1, opt.line_width = 0, opt.min_support = 4, opt.lift_k = 100;
+	opt.max_span_excess = 50000, opt.max_span_ratio = 3.0;
 	opt.snap = 1, opt.snap_flank = 64, opt.snap_r1 = 200, opt.snap_r2 = 6000;
 	rb3_snap_opt_init(&opt.sopt);
 	// refmap's projection defaults, except the local bracket is ON (20 kb, the adopted
@@ -640,6 +659,8 @@ int main_extract(int argc, char *argv[])
 		else if (c == 416) opt.snap_r2 = rb3_parse_num(o.arg);
 		else if (c == 417) opt.sopt.min_id = atof(o.arg);
 		else if (c == 418) opt.sopt.margin = atoi(o.arg);
+		else if (c == 419) opt.max_span_excess = rb3_parse_num(o.arg);
+		else if (c == 420) opt.max_span_ratio = atof(o.arg);
 		else if (c == '?' || c == ':') {
 			fprintf(stderr, "ERROR: unknown or incomplete option '%s'\n", argv[o.i - 1]);
 			return 1;
@@ -655,6 +676,10 @@ int main_extract(int argc, char *argv[])
 	if (opt.lift_fn && opt.ref_prefix == 0) { fprintf(stderr, "ERROR: --lift needs --ref-prefix\n"); return 1; }
 	if (opt.n_threads < 1) opt.n_threads = 1;
 	if (opt.lift_fn == 0) opt.snap = 0;
+	if (opt.max_span_excess < 0 || opt.max_span_ratio < 0) {
+		fprintf(stderr, "ERROR: --max-span-excess/--max-span-ratio must be >= 0 (0 = check off)\n");
+		return 1;
+	}
 	if (opt.snap && (opt.snap_flank < opt.sopt.min_aligned || opt.snap_r1 < 0 || opt.snap_r2 < 0)) {
 		fprintf(stderr, "ERROR: --snap-flank must be >= %d and the radii >= 0\n", opt.sopt.min_aligned);
 		return 1;

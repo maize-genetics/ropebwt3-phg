@@ -584,6 +584,35 @@ check_eq "--no-snap: the raw projection (off by k-1 = 30 here), labelled proj" \
 check_eq "--no-snap: still 13 columns" "$(awk -F'\t' 'NR>1{print NF}' "$TMP/inv_k1_nosnap.tsv" | sort -u)" "13"
 "$RB" extract --lift="$TMP/inv.lift" --snap-flank=8 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > /dev/null 2>&1
 check_eq "--snap-flank below the minimum aligned length -> exit 1" "$?" "1"
+# projected-span sanity check (--max-span-excess / --max-span-ratio, after snapping):
+# Ins = B73[0,50k) + 60 kb insertion + B73[50k,100k); Clp = the first 112 kb of Ins
+awk 'BEGIN{srand(5); s=""; for(i=0;i<100000;i++) s=s substr("ACGT",int(rand()*4)+1,1); x=""; for(i=0;i<60000;i++) x=x substr("ACGT",int(rand()*4)+1,1);
+	ins=substr(s,1,50000) x substr(s,50001); print ">B73_chr1"; print s; print ">Ins_chr1"; print ins; print ">Clp_chr1"; print substr(ins,1,112000)}' > "$TMP/span.fa"
+"$RB" build -d -o "$TMP/span.fmd" "$TMP/span.fa" 2>/dev/null && "$RB" ssa -s4 -o "$TMP/span.fmd.ssa" "$TMP/span.fmd" 2>/dev/null
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$TMP/span.fa" | gzip > "$TMP/span.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$TMP/span.lift" "$TMP/span.fmd" "$TMP/span.fa" 2>/dev/null
+"$RB" isa -b 6 "$TMP/span.fmd" 2>/dev/null
+span() { # span <extra options...> -> "status-or-interval" for the two Ins queries and the Clp one
+	"$RB" extract --lift="$TMP/span.lift" --lift-k 31 --ref-prefix=B73 --project-only "$@" \
+		-f "$TMP/span_q.tsv" "$TMP/span.fmd" 2>/dev/null | awk -F'\t' 'NR>1{printf "%s=%s ", $1, ($10 ~ /^ok/? $6":"$7"-"$8":"$10 : $10)}'
+}
+printf 'trip\tB73_chr1\t49000\t51000\tIns\nplausible\tB73_chr1\t30000\t70000\tIns\nclamped\tB73_chr1\t49000\t60000\tClp\n' > "$TMP/span_q.tsv"
+check_eq "span check: 2 kb -> 62 kb fails, 40 kb -> 100 kb (big but plausible insertion) passes, a clamped 63 kb span fails" "$(span)" \
+	"trip=projection_failed: projected span implausibly long (62000 bp for 2000 bp) plausible=Ins_chr1:30000-130000:ok clamped=projection_failed: projected span implausibly long (63000 bp for 11000 bp) "
+check_eq "span check: --max-span-excess=0 turns it off" "$(span --max-span-excess=0)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: --max-span-ratio=0 turns it off" "$(span --max-span-ratio=0)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: BOTH conditions needed (ratios 31/5.7 < 40; excesses 60/52 kb < 70 kb)" "$(span --max-span-ratio=40) $(span --max-span-excess=70000)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped  trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: also applies with --no-snap" "$(span --no-snap | cut -d' ' -f1-2)" \
+	"trip=projection_failed: projected"
+"$RB" extract --lift="$TMP/span.lift" --lift-k 31 --ref-prefix=B73 -f "$TMP/span_q.tsv" "$TMP/span.fmd" > "$TMP/span.fa.out" 2>"$TMP/span.log"
+check_eq "span check: exit status unchanged (0), only the plausible query gets a record" "$?:$(grep '^>' "$TMP/span.fa.out" | cut -d' ' -f1 | tr '\n' ' ')" "0:>plausible "
+check_eq "span check: failures reported on stderr" "$(grep -c 'projection failed: projected span implausibly long' "$TMP/span.log")" "2"
+"$RB" extract --lift="$TMP/span.lift" --ref-prefix=B73 --max-span-ratio=-1 -f "$TMP/span_q.tsv" "$TMP/span.fmd" > /dev/null 2>&1
+check_eq "span check: a negative value is an error" "$?" "1"
+
 "$RB" extract -I "$TMP/inv.fmd.isa" "$IDX" B73_chr1:0-5 > /dev/null 2>"$TMP/ext_wrongisa.log"
 check_eq "extract: an .isa from another index is rejected" "$(grep -c 'not built from this index' "$TMP/ext_wrongisa.log")" "1"
 
