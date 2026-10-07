@@ -524,7 +524,9 @@ thread (6.5 ms per window, ~10.0 M LF steps), 1.5 s with `-t4`; plus 1.6 s to
 load the FMD (5.0 GB RSS; `-M` mmaps it instead) and 0.05 s for the `.isa`. With
 `--lift` (1,000 random B73 windows): 6.4 s without snapping, 27.6 s with (`-t4`: 1.7 s
 vs 7.3 s); the extra time is mostly the LF walks for the flanks and windows (39.6 M vs
-12.2 M steps), concentrated in the ends that fall back to the wide/walk search.
+12.2 M steps), concentrated in the ends that fall back to the wide/walk search. With
+the shared boundary computation (both flanks of a start are placed) the same run takes
+50.6 s (`-t4`: 15.0 s; 65.2 M LF steps).
 
 ### <a name="deprecated"></a>Deprecated
 

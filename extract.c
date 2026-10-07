@@ -380,7 +380,8 @@ static int snap_walk(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x
 // present (aligned), i.e. there is no deletion on that side of x.
 // walk = 0: the +-R1 / +-R2 windows only; walk = 1: only the walk (both windows
 // having given low identity).
-static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x, int dir, int sign, int64_t tsid, int64_t p, int64_t *u, int *edge, int walk)
+static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x, int dir, int sign, int64_t tsid, int64_t p, int64_t *u, int *edge, int walk,
+					 snap_cache_t *ca)
 {
 	const ext_opt_t *o = c->opt;
 	int64_t L = c->sid->len[tsid], Lr = c->sid->len[rsid], a, b, radii[2], r, wlo;
@@ -388,7 +389,6 @@ static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x
 	int lab = SNAP_SHORT;
 	uint8_t *fl;
 	rb3_snap_res_t res;
-	snap_cache_t ca = { 0, 0, 0 };
 	*u = -1, *edge = 0;
 	a = dir? (x - F > 0? x - F : 0) : x;
 	b = dir? x : (x + F < Lr? x + F : Lr);
@@ -404,23 +404,23 @@ static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x
 		lab = SNAP_LOWID;
 		if (o->snap_r2 > 0) {
 			int st;
-			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, &ca);
-			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, &ca);
-			st = snap_walk(c, q, rsid, x, dir, sign, tsid, p, u, &ca); // *edge stays 0: the next base is deleted
+			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, ca);
+			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, ca);
+			st = snap_walk(c, q, rsid, x, dir, sign, tsid, p, u, ca); // *edge stays 0: the next base is deleted
 			if (st == RB3_SNAP_OK) lab = SNAP_WALK;
 			else if (st == RB3_SNAP_AMBIG) lab = SNAP_AMBIG;
 		}
-		free(fl); free(ca.buf);
+		free(fl);
 		return lab;
 	}
 	for (k = 0; k < 2; ++k) {
 		int st;
 		if (k == 1 && radii[1] <= radii[0]) break;
 		if (k == 1) { // one extraction covering the wide window and every walk step (t <= R2)
-			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, &ca);
-			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, &ca);
+			if (!dir) snap_cache_fill(c, q, tsid, sign, p - radii[1] - F, p + 2 * radii[1] + 2 * F + 1, ca);
+			else snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, ca);
 		}
-		st = snap_window(c, q, tsid, sign, p - radii[k] - F, p + radii[k] + F + 1, fl, nq, &o->sopt, &res, &wlo, 0, &ca);
+		st = snap_window(c, q, tsid, sign, p - radii[k] - F, p + radii[k] + F + 1, fl, nq, &o->sopt, &res, &wlo, 0, ca);
 		if (st == RB3_SNAP_OK) {
 			*u = wlo + (dir? res.t_last : res.t_first);
 			*edge = dir? res.q_last == nq - 1 : res.q_first == 0;
@@ -431,7 +431,6 @@ static int snap_side(const ext_ctx_t *c, ext_query_t *q, int64_t rsid, int64_t x
 		if (st != RB3_SNAP_LOWID) break; // a wider window cannot resolve an ambiguity
 	}
 	free(fl);
-	free(ca.buf);
 	return lab;
 }
 
@@ -462,25 +461,30 @@ static int snap_cross(int lab)
 static int snap_boundary(const ext_ctx_t *c, ext_query_t *q, int64_t x, int is_start, int sign, int64_t tsid, int64_t u_raw, int64_t *U)
 {
 	int64_t uL = -1, uR = -1;
-	int labL = SNAP_SHORT, labR = SNAP_SHORT, eL = 0, eR = 0;
+	int labL = SNAP_SHORT, labR = SNAP_SHORT, eL = 0, eR = 0, lab;
+	snap_cache_t caL = { 0, 0, 0 }, caR = { 0, 0, 0 }; // kept for the walks
 	*U = u_raw;
-	if (x > 0) labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 0);
-	if (is_start || uL < 0) labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 0);
+	if (x > 0) labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 0, &caL);
+	if (is_start || uL < 0) labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 0, &caR);
 	if (uL >= 0) {
-		if (is_start && uR >= 0 && eL && eR && uR >= uL + 1) { *U = uR; return labR; }
-		*U = uL + 1;
-		return is_start? snap_cross(labL) : labL;
+		if (is_start && uR >= 0 && eL && eR && uR >= uL + 1) *U = uR, lab = labR;
+		else *U = uL + 1, lab = is_start? snap_cross(labL) : labL;
+	} else if (uR >= 0) {
+		*U = uR, lab = is_start? labR : snap_cross(labR);
+	} else {
+		lab = labL == SNAP_SHORT? labR : labL;
+		if (labL == SNAP_LOWID) {
+			labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 1, &caL);
+			if (uL >= 0) *U = uL + 1, lab = is_start? snap_cross(labL) : labL;
+		}
+		if (uL < 0 && labR == SNAP_LOWID) {
+			labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 1, &caR);
+			if (uR >= 0) *U = uR, lab = is_start? labR : snap_cross(labR);
+		}
+		if (uL < 0 && uR < 0) lab = labL == SNAP_SHORT? labR : labL;
 	}
-	if (uR >= 0) { *U = uR; return is_start? labR : snap_cross(labR); }
-	if (labL == SNAP_LOWID) {
-		labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 1);
-		if (uL >= 0) { *U = uL + 1; return is_start? snap_cross(labL) : labL; }
-	}
-	if (labR == SNAP_LOWID) {
-		labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 1);
-		if (uR >= 0) { *U = uR; return is_start? labR : snap_cross(labR); }
-	}
-	return labL == SNAP_SHORT? labR : labL;
+	free(caL.buf); free(caR.buf);
+	return lab;
 }
 
 static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
