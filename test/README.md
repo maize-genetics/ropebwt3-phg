@@ -66,7 +66,8 @@ sidecar (identical to `refmap`'s), and a numpy check of the ternary definition.
 the FASTA, error reporting/exit status, `--clamp`, `-t4` vs `-t1`, `-w`, in-memory vs
 file entry points, `--lift`/`--project-only` (incl. inverted and split founders), and
 a scaled-down run of the shared simulated pangenome (`simulate_pangenome.py`, checked
-by `check_extract_fixture.py`, and its X->X junctions by `check_extract_junctions.py`;
+by `check_extract_fixture.py`, its X->X junctions by `check_extract_junctions.py` and boundaries inside deletions /
+at insertions by `check_extract_boundaries.py`;
 skipped without numpy), plus a crafted fixture where adjacent pieces `[a,m)`/`[m,b)` must
 meet at m for a deletion, insertion, replacement, low-identity flank and the '-' strand.
 

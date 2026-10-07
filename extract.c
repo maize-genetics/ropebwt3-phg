@@ -38,6 +38,8 @@ typedef struct {
 	int clamped;        // the interval was clamped (input --clamp, or a projected end past the contig end)
 	int meth[2];        // projection method of the start / end
 	int snap[2];        // SNAP_* label of the start / end
+	int raw_ok[2], raw_sign[2]; // raw (unsnapped) lift projection of each reference boundary
+	int64_t raw_tsid[2], raw_pos[2]; // ... contig and forward fencepost (see print_proj_row)
 	int64_t shift[2];   // bp the snap moved the founder base of the reference start / end (forward coords)
 	int status;         // ST_*
 	const char *msg;    // failure reason (static string or msgbuf), or 0
@@ -458,12 +460,75 @@ static int snap_cross(int lab)
 //  4. otherwise the lift projection (u_raw).
 // Depends only on x (never on the interval). Labels: snap/snap_wide/snap_walk = the
 // side's own flank (start: right, end: left); snap_x* = the flank across the boundary.
+// Joint placement of boundary x: align the reference [x-F, x+F) -- both flanks as one
+// query -- around the projection, so a deletion or insertion at x is an INTERNAL gap
+// of an affine alignment and is placed by the whole context, rather than a terminal
+// gap of a one-sided flank (where a flank's deleted tail is cheaper to align as a
+// mismatch plus chance matches than to leave as a gap). Returns 1 on an accepted
+// alignment with *tl = homolog of the last present base before x (-1 if none in the
+// query), *tr = homolog of the first present base from x on (-1 if none), *both = x-1
+// and x are both present (no deletion at x); oriented coordinates. *lab = SNAP_SNAP
+// (+-R1) / SNAP_WIDE (+-R2) on success, else the failure label.
+static int snap_joint(const ext_ctx_t *c, ext_query_t *q, int64_t x, int sign, int64_t tsid, int64_t p,
+					  int64_t *tl, int64_t *tr, int *both, int *lab, snap_cache_t *ca)
+{
+	const ext_opt_t *o = c->opt;
+	int64_t L = c->sid->len[tsid], Lr = c->sid->len[q->rsid], a, b, r, wlo, radii[2];
+	int32_t F = o->snap_flank, nq, k;
+	rb3_snap_opt_t so = o->sopt;
+	rb3_snap_res_t res;
+	uint8_t *fl;
+	int ok = 0;
+	*tl = *tr = -1, *both = 0, *lab = SNAP_SHORT;
+	a = x - F > 0? x - F : 0, b = x + F < Lr? x + F : Lr;
+	nq = (int32_t)(b - a);
+	if (nq < so.min_aligned) return 0;
+	fl = RB3_MALLOC(uint8_t, nq);
+	if ((r = rb3_isa_extract(&c->f, c->isa, q->rsid * 2, a, b, fl)) < 0) { free(fl); return 0; }
+	q->steps += r;
+	so.split = (int32_t)(x - a);
+	if (p < 0) p = 0;
+	if (p > L - 1) p = L - 1;
+	radii[0] = o->snap_r1, radii[1] = o->snap_r2;
+	for (k = 0; k < 2; ++k) {
+		int st;
+		if (k == 1 && radii[1] <= radii[0]) break;
+		if (k == 1) snap_cache_fill(c, q, tsid, sign, p - 2 * radii[1] - 2 * F, p + radii[1] + F + 1, ca);
+		st = snap_window(c, q, tsid, sign, p - radii[k] - F, p + radii[k] + F + 1, fl, nq, &so, &res, &wlo, 0, ca);
+		if (st == RB3_SNAP_OK && (res.t_left >= 0 || res.t_right >= 0)) {
+			if (res.t_left >= 0) *tl = wlo + res.t_left;
+			if (res.t_right >= 0) *tr = wlo + res.t_right;
+			*both = res.q_left == so.split - 1 && res.q_right == so.split;
+			*lab = k == 0? SNAP_SNAP : SNAP_WIDE;
+			ok = 1;
+			break;
+		}
+		*lab = st == RB3_SNAP_AMBIG? SNAP_AMBIG : st == RB3_SNAP_LOWID? SNAP_LOWID : SNAP_SHORT;
+		if (st != RB3_SNAP_LOWID) break;
+	}
+	free(fl);
+	return ok;
+}
+
 static int snap_boundary(const ext_ctx_t *c, ext_query_t *q, int64_t x, int is_start, int sign, int64_t tsid, int64_t u_raw, int64_t *U)
 {
 	int64_t uL = -1, uR = -1;
 	int labL = SNAP_SHORT, labR = SNAP_SHORT, eL = 0, eR = 0, lab;
 	snap_cache_t caL = { 0, 0, 0 }, caR = { 0, 0, 0 }; // kept for the walks
 	*U = u_raw;
+	{ // 0. both flanks as one query (see snap_joint)
+		int64_t tl, tr;
+		int both, jl;
+		// A deletion at x (x-1 or x not present): the junction, for both pieces. With x-1 and
+		// x both present, any founder bases between them are an insertion at x, which the
+		// two one-sided flanks below place exactly (their free target ends leave it out),
+		// whereas in the joint alignment an insertion's I gap can slide by equal bases.
+		if (snap_joint(c, q, x, sign, tsid, u_raw, &tl, &tr, &both, &jl, &caL) && !both) {
+			*U = tl >= 0? tl + 1 : tr;
+			free(caL.buf);
+			return is_start && tl >= 0? snap_cross(jl) : !is_start && tl < 0? snap_cross(jl) : jl;
+		}
+	}
 	if (x > 0) labL = snap_side(c, q, q->rsid, x, 1, sign, tsid, u_raw - 1, &uL, &eL, 0, &caL);
 	if (is_start || uL < 0) labR = snap_side(c, q, q->rsid, x, 0, sign, tsid, u_raw, &uR, &eR, 0, &caR);
 	if (uL >= 0) {
@@ -495,19 +560,27 @@ static void q_project(const ext_ctx_t *c, ext_query_t *q, void *km)
 	int sg[2], i;
 	if (g == c->gtab->sid2g[q->rsid]) { // the reference itself: identity
 		q->tsid = q->rsid, q->st = q->rst, q->en = q->ren, q->strand = 1, q->meth[0] = q->meth[1] = 5;
+		q->raw_ok[0] = q->raw_ok[1] = 1, q->raw_tsid[0] = q->raw_tsid[1] = q->rsid, q->raw_sign[0] = q->raw_sign[1] = 1;
+		q->raw_pos[0] = q->rst, q->raw_pos[1] = q->ren;
 		if (o->snap) q->snap[0] = q->snap[1] = SNAP_IDENTITY;
 		return;
 	}
 	// each boundary x is projected through the base before it (x-1; base 0 for x = 0),
 	// so the end of [a,m) and the start of [m,b) are the same computation
 	x[0] = q->rst, x[1] = q->ren;
-	for (i = 0; i < 2; ++i) {
+	for (i = 0; i < 2; ++i) { // both ends, so that a failed row still reports the raw end that projected
 		int64_t rp = x[i] > 0? x[i] - 1 : 0;
-		if (!rb3_lift_project_inv(c->ridx, km, g, q->rsid, rp, o->lift_win, o->lift_mad, o->min_support, o->lift_k, &cs[i], &cp[i], &sg[i], &q->meth[i])) {
+		if (rb3_lift_project_inv(c->ridx, km, g, q->rsid, rp, o->lift_win, o->lift_mad, o->min_support, o->lift_k, &cs[i], &cp[i], &sg[i], &q->meth[i])) {
+			int64_t Lc = c->sid->len[cs[i]], uc = sg[i] > 0? cp[i] : Lc - 1 - cp[i], u = x[i] > 0? uc + 1 : uc;
+			q->raw_ok[i] = 1, q->raw_tsid[i] = cs[i], q->raw_sign[i] = sg[i];
+			q->raw_pos[i] = sg[i] > 0? u : Lc - u; // forward fencepost
+		}
+	}
+	for (i = 0; i < 2; ++i)
+		if (!q->raw_ok[i]) {
 			q_fail(q, ST_PROJ_FAIL, i == 0? "no confident projection for the start" : "no confident projection for the end");
 			return;
 		}
-	}
 	if (cs[0] != cs[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project to different contigs"); q->tsid = -1; return; }
 	if (sg[0] != sg[1]) { q_fail(q, ST_PROJ_FAIL, "start and end project with different orientations"); return; }
 	q->tsid = cs[0], q->strand = sg[0];
@@ -576,7 +649,20 @@ static void ext_worker(void *data, long i, int tid)
 
 static void print_proj_header(void)
 {
-	printf("qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift\n");
+	printf("qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift\traw_start\traw_end\n");
+}
+
+// raw_start / raw_end: the unsnapped lift projection of the reference boundary
+// ref_start / ref_end, as CONTIG:POS:STRAND, '.' if that end did not project. POS is a
+// forward-strand fencepost on CONTIG: boundary x is projected through reference base
+// x-1 (base 0 for x = 0); on '+' POS = homolog(x-1)+1 (homolog(0) for x = 0), on '-'
+// POS = homolog(x-1) (homolog(0)+1 for x = 0). So with both ends on one contig and
+// strand the raw interval is [raw_start, raw_end) on '+' and [raw_end, raw_start) on
+// '-' -- exactly what --no-snap reports when the row succeeds.
+static void print_raw(const ext_ctx_t *c, const ext_query_t *q, int i)
+{
+	if (q->raw_ok[i]) printf("%s:%ld:%c", c->sid->name[q->raw_tsid[i]], (long)q->raw_pos[i], q->raw_sign[i] > 0? '+' : '-');
+	else putchar('.');
 }
 
 static void print_proj_row(const ext_ctx_t *c, const ext_query_t *q)
@@ -587,12 +673,13 @@ static void print_proj_row(const ext_ctx_t *c, const ext_query_t *q)
 	else printf(".\t.\t");
 	printf("%s\t", q->asm_name && *q->asm_name? q->asm_name : ".");
 	if (q->status == ST_OK)
-		printf("%s\t%ld\t%ld\t%c\t%s\t%s,%s\t%s,%s\t%ld,%ld\n", c->sid->name[q->tsid], (long)q->st, (long)q->en, q->strand > 0? '+' : '-',
+		printf("%s\t%ld\t%ld\t%c\t%s\t%s,%s\t%s,%s\t%ld,%ld\t", c->sid->name[q->tsid], (long)q->st, (long)q->en, q->strand > 0? '+' : '-',
 			   q->clamped? "ok_clamped" : "ok", meth_name(q->meth[0]), meth_name(q->meth[1]),
 			   snap_name(q->snap[0]), snap_name(q->snap[1]), (long)q->shift[0], (long)q->shift[1]);
 	else
-		printf(".\t.\t.\t.\t%s: %s\t%s,%s\t%s,%s\t%ld,%ld\n", q->status == ST_INPUT_ERR? "input_error" : "projection_failed", q->msg,
+		printf(".\t.\t.\t.\t%s: %s\t%s,%s\t%s,%s\t%ld,%ld\t", q->status == ST_INPUT_ERR? "input_error" : "projection_failed", q->msg,
 			   meth_name(q->meth[0]), meth_name(q->meth[1]), snap_name(q->snap[0]), snap_name(q->snap[1]), (long)q->shift[0], (long)q->shift[1]);
+	print_raw(c, q, 0); putchar('\t'); print_raw(c, q, 1); putchar('\n');
 }
 
 static void print_fasta(const ext_ctx_t *c, const ext_query_t *q)

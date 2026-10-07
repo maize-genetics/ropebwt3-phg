@@ -583,6 +583,37 @@ static void test_snap_align(void)
 		}
 		LOOP_CHECK(nbad, n, "snap: seeded alignment on a 5.8 kb window == the full DP (300 random cases)");
 	}
+	// 14. split: the aligned target bases on either side of a query position (the joint
+	// two-flank alignment of a boundary)
+	{
+		char fl2[129], r2[65];
+		rb3_snap_opt_t so = o;
+		rand_bases(r2, 64);
+		sprintf(fl2, "%s%s", fl, r2);           // left flank | right flank, boundary at 64
+		so.split = 64;
+		sprintf(t, "%s%s%s", L, fl2, R);
+		CHECK(snap_str(fl2, t, &so, &r) == RB3_SNAP_OK && r.t_left == 163 && r.t_right == 164 && r.q_left == 63 && r.q_right == 64,
+			  "snap split: no indel at the boundary -> adjacent target bases");
+		{ // 3 bp deleted around the boundary (last base of the left flank + 2 of the right)
+			char d[200];
+			strcpy(tmp, L); tmp[99] = base_not_in(fl + 60, 4);
+			sprintf(d, "%.63s%s", fl, r2 + 2);
+			sprintf(t, "%s%s%s", tmp, d, R);
+			CHECK(snap_str(fl2, t, &so, &r) == RB3_SNAP_OK && r.q_left < 63 && r.q_right > 64 && r.t_left + 1 == r.t_right,
+				  "snap split: a deletion spanning the boundary is an internal gap; both sides meet at the junction");
+		}
+		sprintf(t, "%s%sACGTACGTAC%s%s", L, fl, r2, R); // 10 bp inserted at the boundary
+		CHECK(snap_str(fl2, t, &so, &r) == RB3_SNAP_OK && r.q_left == 63 && r.q_right == 64 && r.t_right - r.t_left == 11,
+			  "snap split: an insertion at the boundary lies between t_left and t_right");
+		so.no_seed = 0; // the seeded path maps t_left/t_right back too
+		{
+			static char big2[6000];
+			rand_bases(big2, 5800);
+			memcpy(big2 + 3000, fl2, 128);
+			CHECK(snap_str(fl2, big2, &so, &r) == RB3_SNAP_OK && r.t_left == 3063 && r.t_right == 3064,
+				  "snap split: seeded wide window reports t_left/t_right in window coordinates");
+		}
+	}
 	// 12. identical flank on a reverse-complemented window (what extract does on '-' loci)
 	{
 		char rc[300]; int n;

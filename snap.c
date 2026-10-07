@@ -11,7 +11,7 @@
 void rb3_snap_opt_init(rb3_snap_opt_t *o)
 {
 	o->match = 1, o->mismatch = 4, o->gap_open = 6, o->gap_ext = 1;
-	o->min_aligned = 16, o->min_frac = 0.5, o->min_id = 0.85, o->margin = 5, o->excl = 8, o->clip5 = -1, o->no_seed = 0;
+	o->min_aligned = 16, o->min_frac = 0.5, o->min_id = 0.85, o->margin = 5, o->excl = 8, o->clip5 = -1, o->no_seed = 0, o->split = -1;
 }
 
 static int snap_align_dp(const uint8_t *q, int32_t n, const uint8_t *t, int32_t m, const rb3_snap_opt_t *o, rb3_snap_res_t *r)
@@ -22,6 +22,7 @@ static int snap_align_dp(const uint8_t *q, int32_t n, const uint8_t *t, int32_t 
 	int32_t n_col = 0, k, first = -1, last = -1, need;
 	memset(r, 0, sizeof(*r));
 	r->second = INT32_MIN, r->score = INT32_MIN, r->q_first = r->t_first = r->q_last = r->t_last = r->t_end = -1;
+	r->t_left = r->t_right = r->q_left = r->q_right = -1;
 	need = (int32_t)(o->min_frac * n);
 	if (need < o->min_aligned) need = o->min_aligned;
 	if (n <= 0 || m <= 0 || n < o->min_aligned || m < need) return (r->status = RB3_SNAP_SHORT);
@@ -67,6 +68,10 @@ static int snap_align_dp(const uint8_t *q, int32_t n, const uint8_t *t, int32_t 
 			uint8_t b = dir[(size_t)i * (m + 1) + j];
 			if (state == 0) {
 				int src = b & 3;
+				if (src == 0 && o->split >= 0) { // traceback runs backwards: the first M seen left of split is the last
+					if (i - 1 >= o->split) r->t_right = j - 1, r->q_right = i - 1;
+					else if (r->t_left < 0) r->t_left = j - 1, r->q_left = i - 1;
+				}
 				if (src == 0 && (b & 16)) { // the alignment starts here; query [0,i-1) clipped
 					col[n_col++] = (q[i-1] == t[j-1] && q[i-1] >= 1 && q[i-1] <= 4)? '=' : 'X';
 					if (last < 0) r->q_last = i - 1, r->t_last = j - 1, last = 1;
@@ -203,8 +208,8 @@ int rb3_snap_align(const uint8_t *q, int32_t n, const uint8_t *t, int32_t m, con
 	free(lo_hi);
 	st = snap_align_dp(q, n, ct, cl, o, r);
 	{ // map concatenated target coordinates back
-		int32_t *f[4];
-		f[0] = &r->t_first, f[1] = &r->t_last, f[2] = &r->t_end, f[3] = 0;
+		int32_t *f[6];
+		f[0] = &r->t_first, f[1] = &r->t_last, f[2] = &r->t_end, f[3] = &r->t_left, f[4] = &r->t_right, f[5] = 0;
 		for (i = 0; f[i]; ++i) {
 			int32_t x = *f[i], s2, off = f[i] == &r->t_end? 1 : 0; // t_end is exclusive
 			if (x < 0) continue;

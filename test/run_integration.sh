@@ -528,16 +528,16 @@ check_eq "get is unchanged: sequence 1 is its reverse complement" "$("$RB" get "
 "$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 --project-only "$IDX" B73_chr1:100-250 B73_chr1:250-400 B73_chr1:350-500 \
 	> "$TMP/proj.tsv" 2>"$TMP/proj.log"
 check_eq "extract --project-only exits 0" "$?" "0"
-check_line_in "project-only: TSV header" "$TMP/proj.tsv" "$(printf 'qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift')"
+check_line_in "project-only: TSV header" "$TMP/proj.tsv" "$(printf 'qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift\traw_start\traw_end')"
 check_line_in "project-only: collinear stretch before the insertion maps 1:1" "$TMP/proj.tsv" \
-	"$(printf 'B73_chr1:100-250\tB73_chr1\t100\t250\tOh43\tOh43_chr1\t100\t250\t+\tok\tlocal,local\tsnap,snap\t0,0')"
+	"$(printf 'B73_chr1:100-250\tB73_chr1\t100\t250\tOh43\tOh43_chr1\t100\t250\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:100:+\tOh43_chr1:250:+')"
 check_line_in "project-only: an interval spanning the 500 bp insertion grows by 500" "$TMP/proj.tsv" \
-	"$(printf 'B73_chr1:250-400\tB73_chr1\t250\t400\tOh43\tOh43_chr1\t250\t900\t+\tok\tlocal,local\tsnap,snap\t0,0')"
+	"$(printf 'B73_chr1:250-400\tB73_chr1\t250\t400\tOh43\tOh43_chr1\t250\t900\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:250:+\tOh43_chr1:900:+')"
 check_line_in "project-only: after the insertion, offset +500" "$TMP/proj.tsv" \
-	"$(printf 'B73_chr1:350-500\tB73_chr1\t350\t500\tOh43\tOh43_chr1\t850\t1000\t+\tok\tlocal,local\tsnap,snap\t0,0')"
+	"$(printf 'B73_chr1:350-500\tB73_chr1\t350\t500\tOh43\tOh43_chr1\t850\t1000\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:850:+\tOh43_chr1:1000:+')"
 "$RB" extract --lift="$LIFT" --ref-prefix=B73 --to B73 --project-only "$IDX" B73_chr1:10-20 > "$TMP/proj_id.tsv" 2>/dev/null
 check_line_in "project-only: the reference itself is the identity" "$TMP/proj_id.tsv" \
-	"$(printf 'B73_chr1:10-20\tB73_chr1\t10\t20\tB73\tB73_chr1\t10\t20\t+\tok\tidentity,identity\tidentity,identity\t0,0')"
+	"$(printf 'B73_chr1:10-20\tB73_chr1\t10\t20\tB73\tB73_chr1\t10\t20\t+\tok\tidentity,identity\tidentity,identity\t0,0\tB73_chr1:10:+\tB73_chr1:20:+')"
 "$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 "$IDX" B73_chr1:250-400 > "$TMP/proj.fa" 2>/dev/null
 check_line_in "extract --lift: FASTA header carries the projected and the reference interval" "$TMP/proj.fa" ">B73_chr1:250-400 Oh43_chr1:250-900:+ ref=B73_chr1:250-400 snap=snap,snap"
 check_eq "extract --lift: sequence = the founder at the projected interval" "$(fa_rec "$TMP/proj.fa" B73_chr1:250-400)" "$(fa_sub "$FA" Oh43_chr1 250 900)"
@@ -565,8 +565,8 @@ awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)
 printf 'qid\tref_contig\tref_start\tref_end\tassembly\nfwd\tB73_chr1\t1000\t1500\tFwd\ninv\tB73_chr1\t1000\t1500\tInv\nsplit\tB73_chr1\t1000\t2000\tSpl\nfar\tB73_chr1\t1000\t1500\tFar\n' > "$TMP/inv_q.tsv"
 "$RB" extract --lift="$TMP/inv.lift" --lift-k 31 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_proj.tsv" 2>"$TMP/inv_proj.log"
 check_eq "extract --project-only: projection failures do not set the exit status" "$?" "0"
-check_line_in "projection: an identical founder maps 1:1" "$TMP/inv_proj.tsv" "$(printf 'fwd\tB73_chr1\t1000\t1500\tFwd\tFwd_chr1\t1000\t1500\t+\tok\tlocal,local\tsnap,snap\t0,0')"
-check_line_in "projection: a reverse-complemented founder maps to [L-end, L-start) on '-'" "$TMP/inv_proj.tsv" "$(printf 'inv\tB73_chr1\t1000\t1500\tInv\tInv_chr1\t1500\t2000\t-\tok\tlocal,local\tsnap,snap\t0,0')"
+check_line_in "projection: an identical founder maps 1:1" "$TMP/inv_proj.tsv" "$(printf 'fwd\tB73_chr1\t1000\t1500\tFwd\tFwd_chr1\t1000\t1500\t+\tok\tlocal,local\tsnap,snap\t0,0\tFwd_chr1:1000:+\tFwd_chr1:1500:+')"
+check_line_in "projection: a reverse-complemented founder maps to [L-end, L-start) on '-'" "$TMP/inv_proj.tsv" "$(printf 'inv\tB73_chr1\t1000\t1500\tInv\tInv_chr1\t1500\t2000\t-\tok\tlocal,local\tsnap,snap\t0,0\tInv_chr1:2000:-\tInv_chr1:1500:-')"
 check_eq "projection: ends on different contigs -> explicit failure, no guess" "$(awk -F'\t' '$1=="split"{print $6"|"$10}' "$TMP/inv_proj.tsv")" ".|projection_failed: start and end project to different contigs"
 check_eq "projection: no anchors -> explicit failure" "$(awk -F'\t' '$1=="far"{print $6"|"$10}' "$TMP/inv_proj.tsv")" ".|projection_failed: no confident projection for the start"
 check_eq "projection failures are also reported on stderr" "$(grep -c 'projection failed' "$TMP/inv_proj.log")" "2"
@@ -581,7 +581,14 @@ check_eq "snap: an inverted locus projected with the wrong k is snapped back to 
 "$RB" extract --lift="$TMP/inv.lift" --lift-k 1 --no-snap --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_k1_nosnap.tsv" 2>/dev/null
 check_eq "--no-snap: the raw projection (off by k-1 = 30 here), labelled proj" \
 	"$(awk -F'\t' '$1=="inv"{print $6":"$7"-"$8":"$9" "$12" "$13}' "$TMP/inv_k1_nosnap.tsv")" "Inv_chr1:1470-1970:- proj,proj 0,0"
-check_eq "--no-snap: still 13 columns" "$(awk -F'\t' 'NR>1{print NF}' "$TMP/inv_k1_nosnap.tsv" | sort -u)" "13"
+check_eq "--no-snap: 15 columns on every row" "$(awk -F'\t' 'NR>1{print NF}' "$TMP/inv_k1_nosnap.tsv" | sort -u)" "15"
+# raw_start / raw_end: the unsnapped per-end projection, also on failed rows
+check_eq "raw: '-' locus, forward fenceposts in reference-end order (interval = [raw_end, raw_start))" \
+	"$(awk -F'\t' '$1=="inv"{print $14" "$15}' "$TMP/inv_k1_nosnap.tsv")" "Inv_chr1:1970:- Inv_chr1:1470:-"
+check_eq "raw: a failed row (ends on different contigs) still reports each end's raw projection" \
+	"$(awk -F'\t' '$1=="split"{print $10" | "$14" "$15}' "$TMP/inv_k1_nosnap.tsv")" "projection_failed: start and end project to different contigs | Spl_a:1000:+ Spl_b:500:+"
+check_eq "raw: an end that did not project is '.'" "$(awk -F'\t' '$1=="far"{print $14" "$15}' "$TMP/inv_k1_nosnap.tsv")" ". ."
+check_eq "raw: snapping does not change the raw columns" "$(cut -f1,14,15 "$TMP/inv_k1.tsv")" "$(cut -f1,14,15 "$TMP/inv_k1_nosnap.tsv")"
 "$RB" extract --lift="$TMP/inv.lift" --snap-flank=8 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > /dev/null 2>&1
 check_eq "--snap-flank below the minimum aligned length -> exit 1" "$?" "1"
 # projected-span sanity check (--max-span-excess / --max-span-ratio, after snapping):
@@ -677,6 +684,8 @@ if [ -n "$NPY_PY" ]; then
 	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --project-only -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj.tsv" 2>/dev/null
 	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --no-snap --project-only -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj_nosnap.tsv" 2>/dev/null
 	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --no-snap -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj_nosnap.fa" 2>/dev/null
+	check_eq "sim: raw_start/raw_end reproduce every successful --no-snap interval" \
+		"$(awk -F'\t' 'NR>1 && $10 ~ /^ok$/{n++; split($14,a,":"); split($15,b,":"); iv=($9=="+")? a[2]"-"b[2] : b[2]"-"a[2]; if(iv != $7"-"$8 || a[1] != $6 || a[3] != $9) bad++} END{print (n>0), bad+0}' "$SIM/proj_nosnap.tsv")" "1 0"
 	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj.fa" 2>/dev/null
 	# hard: every direct query exact; every projected record exact at its projected interval;
 	# without snapping (lift anchor density limits it): >= 85% within 100 bp at both ends;
@@ -697,6 +706,14 @@ if [ -n "$NPY_PY" ]; then
 		pass
 	else
 		fail "simulated fixture junction check failed; see $TMP/sim_junc.log"; cat "$TMP/sim_junc.log" >&2
+	fi
+	# boundaries strictly inside >= 2 bp deletions / exactly at insertions: both pieces must land
+	# on the true junction (or an equivalent placement of the same deletion)
+	if "$NPY_PY" check_extract_boundaries.py "$SIM" "$RB" "$SIM/p.fmd" "$SIM/p.lift" --flank 1500 --min-del 0.9 --min-ins 0.95 \
+		> "$TMP/sim_bound.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture boundary check failed; see $TMP/sim_bound.log"; cat "$TMP/sim_bound.log" >&2
 	fi
 else
 	echo "SKIP: simulated-pangenome extract check needs a python3 with numpy" >&2

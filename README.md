@@ -469,8 +469,17 @@ which catches large indels between x and its anchors.
 As `simulate_pangenome.py` defines the truth, an END at x is one past the founder base
 aligned to the last reference base before x present in the founder (left flank), a
 START at x is the founder base aligned to the first present base from x on (right
-flank). Both come from the same flank placements of x, so two pieces `[a,x)` and `[x,b)`
+flank). Both come from the same placements around x, so two pieces `[a,x)` and `[x,b)`
 projected into the same founder always meet at x:
+0. first, the two flanks are aligned as ONE query `[x-F, x+F)` (+-R1, then +-R2), so a
+   deletion at x is an internal gap of the affine alignment, placed by the whole
+   context. (A one-sided flank must align its deleted tail as a terminal gap, 6+1/bp,
+   which loses to a mismatch plus chance matches: boundaries inside small deletions
+   came out 1-6 bp past the junction.) If x-1 or x is not present there (a deletion
+   at x), end = start = one past the last present base before x (or, with none in the
+   query, the first present base from x on). If both are present, steps 1-4 decide
+   (one-sided flanks leave an insertion at x out exactly; in a joint alignment an
+   insertion's gap can slide over equal bases);
 1. both flanks placed, bases x-1 and x both present (no deletion at x), right not
    overlapping left: end = after the left flank, start = the right flank; anything in
    between is founder sequence inserted exactly at x, which belongs to neither piece;
@@ -487,12 +496,27 @@ Nothing depends on the interval itself, only on x and the founder. An interval w
 two boundaries meet (it lies entirely in a deletion) fails as `interval deleted in the
 founder (empty projection)`.
 
-`--project-only` adds two columns AFTER the existing ones, `snap` (start,end labels:
+`--project-only` adds four columns AFTER the existing ones, `snap` (start,end labels:
 `snap`, `snap_wide`, `snap_walk` = placed by the end's own flank (start: right, end:
 left); `snap_x`, `snap_x_wide`, `snap_x_walk` = placed by the flank across the boundary
 (a junction, or a fallback); `proj_ambiguous`, `proj_lowid`, `proj_short` (flank < 16
-bp) = projection kept; `identity`; `proj` with `--no-snap`) and `snap_shift` (bp each
-end's fencepost moved, forward coordinates); the FASTA header gets ` snap=START,END`.
+bp) = projection kept; `identity`; `proj` with `--no-snap`), `snap_shift` (bp each
+end's fencepost moved, forward coordinates), and `raw_start`, `raw_end`; the FASTA
+header gets ` snap=START,END`.
+
+`raw_start` / `raw_end` are the unsnapped lift projections of the reference boundaries
+ref_start / ref_end, on EVERY row (also failed ones, so another tool can snap or rescue
+them): `CONTIG:POS:STRAND`, or `.` if that end did not project (no confident lift
+projection; also `.` on input errors). Each end carries its own contig and strand,
+since a row can fail exactly because they differ. POS is a fencepost in FORWARD
+coordinates of CONTIG, from projecting reference base x-1 for boundary x (base 0 for
+x = 0) to its homolog h: on `+`, POS = h+1 (h for x = 0); on `-`, POS = h (h+1 for
+x = 0). So when both ends share contig and strand, the raw interval is `[raw_start,
+raw_end)` on `+` and `[raw_end, raw_start)` on `-` -- exactly what `--no-snap` reports
+when the row succeeds (POS is not clamped; it can lie outside the contig, which
+`--no-snap` would report as clamped or past the end). The reference itself gives
+`REF_CONTIG:ref_start:+` / `REF_CONTIG:ref_end:+`. The first 10 columns are unchanged
+(the GRITS TableProvider reads them).
 F = 64 makes a chance hit in a 12 kb window negligible while staying short enough that
 most flanks carry no indel; windows wider than 8F are first cut to the regions sharing
 an exact 10-mer with the flank (the same answer as the full DP; tested), which keeps the
@@ -506,14 +530,17 @@ element; 500 random 8 kb B73 windows) with an `s200` lift:
 |---|---|---|
 | `--lift-local-win=0` (refmap's wide median), no snap | 2.6% | 0.2% |
 | local bracket, `--no-snap` | 65.6% | 44.6% |
-| local bracket + snap (default) | 99.3% | 98.6% |
+| local bracket + snap (default) | 99.4% | 98.8% |
 
-The 7 remaining ends are all deletion-boundary placements: 6 are equivalent alignments
+The 6 remaining ends are all deletion-boundary placements: 6 are equivalent alignments
 (the bases separating the two placements are identical, so the sequence cannot tell
-them apart; 1-3 bp) and 1 is a 2-bp terminal deletion that scores worse than a
-mismatch+match (2 bp). Splitting each window at its midpoint and projecting both
+them apart; 1-3 bp). Splitting each window at its midpoint and projecting both
 halves into the same founder (`test/check_extract_junctions.py`), 500/500 junctions
-equal the truth gap (499 exactly 0, 1 an insertion at the midpoint). On the 25-founder maize index (200 random B73 8 kb windows,
+equal the truth gap (499 exactly 0, 1 an insertion at the midpoint). Boundaries placed
+strictly inside every >= 2 bp deletion of the fixture and exactly at every insertion
+(`test/check_extract_boundaries.py`, pieces of 3 kb either side): deletions 789/1,060 at
+the true junction plus 235 at an equivalent placement of the same deletion (96.6%; the
+one-sided flanks before the joint step: 142 + 178), insertions 1,549/1,554 exact. On the 25-founder maize index (200 random B73 8 kb windows,
 `_v2_s200.lift`) 66% of ends snap (`snap` 198, `snap_wide` 16, `snap_walk` 26 of 364
 projected ends); of the 145 `proj_lowid`, 117 had only the coarse wide-median
 projection (no collinear anchors within 20 kb, i.e. non-syntenic sequence), where the
@@ -525,8 +552,8 @@ load the FMD (5.0 GB RSS; `-M` mmaps it instead) and 0.05 s for the `.isa`. With
 `--lift` (1,000 random B73 windows): 6.4 s without snapping, 27.6 s with (`-t4`: 1.7 s
 vs 7.3 s); the extra time is mostly the LF walks for the flanks and windows (39.6 M vs
 12.2 M steps), concentrated in the ends that fall back to the wide/walk search. With
-the shared boundary computation (both flanks of a start are placed) the same run takes
-50.6 s (`-t4`: 15.0 s; 65.2 M LF steps).
+the shared boundary computation and the joint two-flank step the same run takes 47.0 s
+(`-t4`: 12.5 s; 71.6 M LF steps).
 
 ### <a name="deprecated"></a>Deprecated
 

@@ -37,6 +37,8 @@ typedef struct {
 	int32_t clip5;        // >= 0: the query may instead start anywhere, its skipped prefix
 	                      // costing clip5 flat (a known-deleted stretch); < 0: global query
 	int32_t no_seed;      // 1: always the full DP (no k-mer prefilter on wide windows; for testing)
+	int32_t split;        // >= 0: also report the aligned target base of the last query base
+	                      // before split and of the first from split on (t_left, t_right)
 } rb3_snap_opt_t;
 
 #define RB3_SNAP_OK      0
@@ -50,6 +52,9 @@ typedef struct {
 	int32_t q_first, t_first;  // first aligned (M) column: query index, target index (q_first > 0
 	                           // = that many leading query bases deleted, or clipped with clip5)
 	int32_t q_last, t_last;    // last aligned (M) column
+	int32_t t_left, t_right;   // with opt.split: target index of the last M column with query
+	                           // index < split / the first with query index >= split (-1 if none)
+	int32_t q_left, q_right;   // ... and their query indices
 	int32_t n_aligned, n_match, n_core; // M columns, identical M columns, columns in [first M, last M]
 	double identity;           // n_match / n_core
 	int status;                // RB3_SNAP_*
