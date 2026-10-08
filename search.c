@@ -13,6 +13,13 @@
 
 KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
 
+static int pos_cmp(const void *a, const void *b) // SMEM hits by (sequence/strand id, position)
+{
+	const rb3_pos_t *x = (const rb3_pos_t*)a, *y = (const rb3_pos_t*)b;
+	if (x->sid != y->sid) return x->sid < y->sid? -1 : 1;
+	return x->pos < y->pos? -1 : x->pos > y->pos? 1 : 0;
+}
+
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
 #define RB3_WALK_CONSENSUS  0 // follow the base shared by the most assemblies
@@ -86,6 +93,7 @@ typedef struct {
 	int32_t support_tol;   // chain --support=best: keep assemblies within this many covered bases of the best
 	int64_t support_win;   // chain --support=best --lift: an assembly-only SMEM counts only if it
 	                       // projects within this many bp of the chain's reference span (0 = no check)
+	int8_t dup_count;      // chain: a read named "<name>;x=N" stands for N identical reads (PS4G/npy counts)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -316,6 +324,9 @@ static void worker_for_seq(void *data, long i, int tid)
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *q = &s->mem[i];
 				q->n_pos = rb3_ssa_multi(b->km, &p->fmi, p->fmi.ssa, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
+				// rb3_ssa_multi's hit order depends on the SA sampling rate (ssa -s); chain keeps the
+				// first reference hit and breaks DP ties by order, so sort for an index-independent result
+				qsort(pos, q->n_pos, sizeof(rb3_pos_t), pos_cmp);
 				q->pos = RB3_MALLOC(rb3_pos_t, q->n_pos);
 				memcpy(q->pos, pos, sizeof(rb3_pos_t) * q->n_pos);
 			}
@@ -1105,6 +1116,17 @@ static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_
 // rows (741 full-length, 31 3'-tag) at **0.0%** source recall -- every one named the wrong
 // assembly. 3'-tag libraries generate these by design (polyA priming), so gate on
 // composition, not length. See pav_e1_findings_2026-07-26.md.
+// chain --dup-count: a collapsed duplicate read is named "<name>;x=N" (N identical reads); it adds N
+// to the PS4G/npy counts. Without the option, or without a valid suffix, every read counts once.
+static int32_t chain_read_weight(const pipeline_t *p, const m_seq_t *s)
+{
+	const char *q;
+	long n;
+	if (!p->opt->dup_count || s->name == 0 || (q = strstr(s->name, ";x=")) == 0) return 1;
+	n = strtol(q + 3, 0, 10);
+	return n > 0 && n < INT32_MAX? (int32_t)n : 1;
+}
+
 static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 {
 	int32_t cnt[7], i, c, best = 0, n = qe - qs;
@@ -1266,7 +1288,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			if (!is_insertion) {
 				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
 				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
 					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
 					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 					putchar('\n');
@@ -1284,7 +1306,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 				// explicitly requested.
 				if (p->opt->insertion_rows == 2) goto pav_done;          // drop
 				if (p->opt->insertion_rows == 0) {                       // ordinary row, exact median, no snap
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
 					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
 					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 					putchar('\n');
@@ -1303,7 +1325,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// rb3_ps4g_npy_finalize/ps4g.c time from sid->name), so this shares bins with ordinary
 			// rows on the same contig at the same coarse position. Known gap, not resolved here --
 			// see the design note on --insertion-rows above; --insertion-rows=ordinary avoids it.
-			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, bp, acc, na);
+			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, bp, acc, na, chain_read_weight(p, s));
 			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
 			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
@@ -1482,14 +1504,14 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 				lo = ivlo[0], hi = ivhi[0];
 				for (i = 1; i < nc; ++i) {
 					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
-						if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
+						if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
 						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 						putchar('\n');
 						lo = ivlo[i], hi = ivhi[i];
 					} else if (ivhi[i] > hi) hi = ivhi[i];
 				}
-				if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
+				if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
 				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 				putchar('\n');
@@ -1747,6 +1769,7 @@ static ko_longopt_t long_options[] = {
 	{ "support",             ko_required_argument, 345 },
 	{ "support-tol",         ko_required_argument, 346 },
 	{ "support-win",         ko_required_argument, 347 },
+	{ "dup-count",           ko_no_argument,       348 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1868,6 +1891,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		else if (c == 346) opt.support_tol = atoi(o.arg);            // chain --support=best: coverage tolerance (bases)
 		else if (c == 347) opt.support_win = rb3_parse_num(o.arg);   // chain --support=best: lift proximity window
+		else if (c == 348) opt.dup_count = 1;                        // chain: "<name>;x=N" reads count N times
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1977,6 +2001,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --support-tol=INT --support=best: keep assemblies within INT covered bases of the best [%d]\n", opt.support_tol);
 			fprintf(stderr, "  --support-win=NUM --support=best --lift: an assembly-only SMEM counts only if it\n");
 			fprintf(stderr, "                    projects within NUM bp of the chain's reference span (0 = off) [%ld]\n", (long)opt.support_win);
+			fprintf(stderr, "  --dup-count       a read named <name>;x=N stands for N identical reads: it adds N\n");
+			fprintf(stderr, "                    to the PS4G/npy counts (collapse duplicates first, keep the counts)\n");
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);

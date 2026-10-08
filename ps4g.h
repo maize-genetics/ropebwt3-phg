@@ -27,6 +27,7 @@ typedef struct {
 	int64_t bin_size;
 	int64_t *ev_ref_sid, *ev_bin; // parallel arrays, one entry per event
 	int32_t *ev_goff, *ev_glen;   // offset/length into garena for this event's gamete list
+	int32_t *ev_w;                // event weight (reads it stands for; 1 unless rb3_ps4g_acc_add_w)
 	int64_t n_ev, m_ev;
 	int32_t *garena;
 	int64_t n_garena, m_garena;
@@ -34,6 +35,8 @@ typedef struct {
 
 rb3_ps4g_acc_t *rb3_ps4g_acc_init(int64_t bin_size);
 void rb3_ps4g_acc_add(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes);
+// Same, but the event counts as `weight` reads (chain --dup-count: one collapsed duplicate read)
+void rb3_ps4g_acc_add_w(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes, int32_t weight);
 void rb3_ps4g_acc_destroy(rb3_ps4g_acc_t *acc);
 
 // BED-based diploid training labels: chrom, start, end, sampleA[, sampleB]

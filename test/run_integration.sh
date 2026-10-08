@@ -481,6 +481,39 @@ check_eq "--support-tol larger than the read keeps every assembly with any suppo
 "$RB" $SUPC --support=bogus "$TMP/sup.fmd" "$TMP/sup_q.fa" >/dev/null 2>&1
 check_eq "--support=bogus exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
 
+# --- 9. chain output does not depend on the suffix-array sampling rate (hit order) ---
+# rb3_ssa_multi returns an interval's occurrences in an order that depends on `ssa -s`; chain keeps
+# the first reference hit and breaks ties by order, so the hits are sorted before use. Same index,
+# SA sampled at 1/256 and 1/2: chain output (stdout, PS4G and npy) must be byte-identical.
+cp "$TMP/pangenome.fmd" "$TMP/ss2.fmd"; cp "$IDX.len.gz" "$TMP/ss2.fmd.len.gz"
+"$RB" ssa -s1 -o "$TMP/ss2.fmd.ssa" "$TMP/ss2.fmd" >/dev/null 2>"$TMP/ss2.log"
+for ix in "$IDX" "$TMP/ss2.fmd"; do
+	tag=$(basename "$ix" .fmd)
+	"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --support=best --ps4g "$TMP/ho_$tag.ps4g" --npy "$TMP/ho_$tag.npy" -t1 \
+		"$ix" "$DIR/queries.fa" > "$TMP/ho_$tag.tsv" 2>/dev/null
+done
+check_eq "chain stdout identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.tsv" "$TMP/ho_ss2.tsv" && echo same)" "same"
+check_eq "chain npy identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.npy" "$TMP/ho_ss2.npy" && echo same)" "same"
+check_eq "chain PS4G identical across SA sampling rates (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/ho_pangenome.ps4g") <(grep -v '^#Command' "$TMP/ho_ss2.ps4g") >/dev/null && echo same)" "same"
+
+# --- 10. chain --dup-count: a collapsed duplicate read named <name>;x=N counts N times ---
+# Every query three times (all reads) versus once each named ";x=3": identical PS4G and npy.
+awk '/^>/{n=substr($1,2); next}{s[n]=s[n] $0; o[++k]=n} END{for (i=1;i<=k;++i) if (!(o[i] in d)) {d[o[i]]=1; for (r=0;r<3;++r) print ">" o[i] "_" r "\n" s[o[i]]; print ">" o[i] ";x=3\n" s[o[i]] > "'"$TMP"'/dup_collapsed.fa"}}' \
+	"$DIR/queries.fa" > "$TMP/dup_full.fa"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_full.ps4g" --npy "$TMP/dup_full.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_full.fa" > /dev/null 2>&1
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --dup-count --ps4g "$TMP/dup_coll.ps4g" --npy "$TMP/dup_coll.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "--dup-count: collapsed reads give the same npy as the duplicated input" \
+	"$(cmp -s "$TMP/dup_full.npy" "$TMP/dup_coll.npy" && echo same)" "same"
+check_eq "--dup-count: same PS4G counts (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_coll.ps4g") >/dev/null && echo same)" "same"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_nocount.ps4g" -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "without --dup-count the ;x=N suffix is ignored (counts differ from the duplicated input)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_nocount.ps4g") >/dev/null && echo same || echo differ)" "differ"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
