@@ -81,6 +81,11 @@ typedef struct {
 	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
 	int64_t anchor_dist_thresh; // refmap/chain --anchor-dist-npy: distance (bp) at/under which a
 	                    // non-matching founder reads as diverged rather than deletion
+	int8_t support_best;   // chain: founder set = assemblies best explaining the read (1), or the
+	                       // chain-wide intersection of reference-hitting SMEMs (0, default)
+	int32_t support_tol;   // chain --support=best: keep assemblies within this many covered bases of the best
+	int64_t support_win;   // chain --support=best --lift: an assembly-only SMEM counts only if it
+	                       // projects within this many bp of the chain's reference span (0 = no check)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -118,6 +123,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
 	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
+	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -1313,6 +1319,64 @@ pav_done:
 	free(acc); free(clu); free(cand); free(cs);
 }
 
+// chain --support=best: replace the chain-wide intersection by the assemblies that best explain
+// the read. Placement is unchanged (the reference-hitting colinear chain); support is counted over
+// the chain's SMEMs PLUS the read's assembly-only SMEMs (no reference occurrence -- the ones the
+// intersection rule discards: a donor-allele read with a SNP vs the reference is matched longer by
+// the assembly carrying that allele). An assembly-only SMEM occurrence counts for its gamete only
+// if, with --lift and --support-win > 0, it projects onto the chain's reference contig within
+// support_win bp of the chain's reference span (a paralog elsewhere does not count). Per gamete:
+// the number of read bases covered by the counted SMEMs that occur in it; the set is every gamete
+// within support_tol bases of the best. Non-chain SMEMs that do hit the reference are ignored, as
+// in the default rule. Writes the sorted set to acc (capacity n_gamete) and returns its size.
+static int32_t chain_support_best(const pipeline_t *p, const m_seq_t *s, void *km, const chain_sm_t *cs,
+								  const int32_t *chain, int32_t nc, int64_t rlo, int64_t rhi, int32_t *acc)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t ng = gt->n_gamete, len = s->len, i, k, g, best = 0, na = 0;
+	int32_t rsid0 = cs[chain[0]].rsid;
+	uint8_t *mask;
+	int32_t *cov;
+	if (len <= 0) return 0;
+	mask = RB3_CALLOC(uint8_t, (int64_t)ng * len);
+	cov = RB3_CALLOC(int32_t, ng);
+	for (i = 0; i < nc; ++i) { // the placement chain's SMEMs: every gamete they occur in
+		const chain_sm_t *c = &cs[chain[i]];
+		for (k = 0; k < c->n_gam; ++k)
+			memset(mask + (int64_t)c->gam[k] * len + c->qs, 1, c->qe - c->qs);
+	}
+	for (i = 0; i < s->n_mem; ++i) { // assembly-only SMEMs near the chain locus
+		const m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, nref = 0;
+		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+		for (k = 0; k < r->n_pos; ++k) if (p->is_ref[r->pos[k].sid>>1]) ++nref;
+		if (nref > 0) continue;
+		for (k = 0; k < r->n_pos; ++k) {
+			const rb3_pos_t *t = &r->pos[k];
+			g = gt->sid2g[t->sid>>1];
+			if (g < 0 || g >= ng) continue;
+			if (p->lift && p->opt->support_win > 0) {
+				int64_t rsid, rpos;
+				if (!rb3_lift_project(p->lift, km, (int32_t)(t->sid>>1), pav_fwd_pos(f, t, en - st),
+									  p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos)) continue;
+				if (rsid != rsid0 || rpos < rlo - p->opt->support_win || rpos > rhi + p->opt->support_win) continue;
+			}
+			memset(mask + (int64_t)g * len + st, 1, en - st);
+		}
+	}
+	for (g = 0; g < ng; ++g) {
+		const uint8_t *m = mask + (int64_t)g * len;
+		for (k = 0; k < len; ++k) cov[g] += m[k];
+		if (cov[g] > best) best = cov[g];
+	}
+	if (best > 0)
+		for (g = 0; g < ng; ++g)
+			if (cov[g] > 0 && cov[g] >= best - p->opt->support_tol) acc[na++] = g;
+	free(mask); free(cov);
+	return na;
+}
+
 static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -1400,11 +1464,18 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t *ivlo = RB3_MALLOC(int64_t, nc), *ivhi = RB3_MALLOC(int64_t, nc);
 			memcpy(acc, cs[chain[0]].gam, na * sizeof(int32_t));
 			for (i = 1; i < nc; ++i) na = chain_isect(acc, na, cs[chain[i]].gam, cs[chain[i]].n_gam);
+			for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
+			if (p->opt->support_best) { // founder set = best-explaining assemblies (see chain_support_best)
+				int64_t rlo = ivlo[0], rhi = ivhi[0];
+				for (i = 1; i < nc; ++i) { if (ivlo[i] < rlo) rlo = ivlo[i]; if (ivhi[i] > rhi) rhi = ivhi[i]; }
+				free(acc);
+				acc = RB3_MALLOC(int32_t, gt->n_gamete);
+				na = chain_support_best(p, s, km, cs, chain, nc, rlo, rhi, acc);
+			}
 			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
 				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
 				const char *contig = us? us + 1 : nm;
 				int64_t lo, hi;
-				for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
 				for (i = 0; i < nc - 1; ++i) // insertion sort ascending by start (nc is tiny)
 					for (j = i + 1; j < nc; ++j)
 						if (ivlo[j] < ivlo[i]) { int64_t t0 = ivlo[i], t1 = ivhi[i]; ivlo[i] = ivlo[j], ivhi[i] = ivhi[j], ivlo[j] = t0, ivhi[j] = t1; }
@@ -1440,10 +1511,11 @@ static void write_per_seq(step_t *t)
 	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
-		free(s->seq);
+		if (p->opt->algo != RB3_SA_CHAIN) free(s->seq); // chain's PAV path still reads s->seq (pav_low_complexity)
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
 			chain_emit(p, s, km);
+			free(s->seq);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
@@ -1672,6 +1744,9 @@ static ko_longopt_t long_options[] = {
 	{ "insertion-rows",      ko_required_argument, 342 },
 	{ "anchor-dist-npy",     ko_no_argument,       343 },
 	{ "anchor-dist-thresh",  ko_required_argument, 344 },
+	{ "support",             ko_required_argument, 345 },
+	{ "support-tol",         ko_required_argument, 346 },
+	{ "support-win",         ko_required_argument, 347 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1786,6 +1861,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
 		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
+		else if (c == 345) {                                         // chain: founder-set rule
+			if (strcmp(o.arg, "chain") == 0) opt.support_best = 0;
+			else if (strcmp(o.arg, "best") == 0) opt.support_best = 1;
+			else { fprintf(stderr, "ERROR: --support must be chain or best\n"); return 1; }
+		}
+		else if (c == 346) opt.support_tol = atoi(o.arg);            // chain --support=best: coverage tolerance (bases)
+		else if (c == 347) opt.support_win = rb3_parse_num(o.arg);   // chain --support=best: lift proximity window
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1888,6 +1970,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --support=STR     founder set of a chained read: chain = intersection over the\n");
+			fprintf(stderr, "                    reference-hitting chain's SMEMs (default, unchanged); best = the\n");
+			fprintf(stderr, "                    assemblies covering the most read bases, counting the chain's SMEMs\n");
+			fprintf(stderr, "                    plus assembly-only SMEMs (for diverged / out-of-panel alleles)\n");
+			fprintf(stderr, "  --support-tol=INT --support=best: keep assemblies within INT covered bases of the best [%d]\n", opt.support_tol);
+			fprintf(stderr, "  --support-win=NUM --support=best --lift: an assembly-only SMEM counts only if it\n");
+			fprintf(stderr, "                    projects within NUM bp of the chain's reference span (0 = off) [%ld]\n", (long)opt.support_win);
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);

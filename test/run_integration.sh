@@ -436,6 +436,51 @@ check_line_in "chain: SMEMs on different contigs are not chained (best single-co
 check_eq "chain: no row with the cross-contig intersection {B73} alone" \
 	"$(awk -F'\t' '$1=="xcontig" && $4=="0"' "$TMP/xcontig.tsv" | wc -l | tr -d ' ')" "0"
 
+# --- 8. chain --support=best: founder set = the assemblies that best explain the read ---
+# B73_chr1 and Mo17_chr1 are identical random sequence; Zd_chr1 is the same with SNPs at 1130 and
+# 1160 -- a diverged allele. The donor read is Zd's [1100,1250) with one extra base change at read
+# offset 110 (the donor is a different accession than Zd), so it matches no assembly end to end:
+# SMEMs [0,110) in Zd only and [111,150) in all three (B73's own match [61,110) is contained in the
+# Zd SMEM, so it is not super-maximal). The default rule keeps only reference-hitting SMEMs, so the
+# read is called {B73,Mo17,Zd}; --support=best counts the Zd-only SMEM (150 bases for Zd vs 39) and
+# calls Zd alone, at the same placement. A B73-allele read
+# from the same region stays {B73,Mo17}; a read outside the diverged region stays {all three}.
+awk 'BEGIN{srand(11); split("ACGT", b, ""); s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]
+     z = s; for (p = 1130; p <= 1160; p += 30) { c = substr(z, p+1, 1); n = (c == "A")? "C" : "A"; z = substr(z, 1, p) n substr(z, p+2) }
+     print ">B73_chr1"; print s; print ">Mo17_chr1"; print s; print ">Zd_chr1"; print z
+     d = substr(z, 1101, 150); c = substr(d, 111, 1); n = (c == "G")? "T" : "G"; d = substr(d, 1, 110) n substr(d, 112)
+     print ">donor_read\n" d > "'"$TMP"'/sup_q.fa"
+     print ">b73_read\n" substr(s, 1101, 150) >> "'"$TMP"'/sup_q.fa"
+     print ">shared_read\n" substr(s, 2001, 150) >> "'"$TMP"'/sup_q.fa"}' > "$TMP/sup.fa"
+"$RB" build -d -o "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/sup.fmd.ssa" "$TMP/sup.fmd" >/dev/null 2>>"$TMP/sup_build.log"
+check_eq "support fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/sup.fa" | gzip > "$TMP/sup.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 20 -o "$TMP/sup.lift" "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_lift.log"
+check_eq "support fixture lift builds" "$?" "0"
+SUPC="chain --ref-prefix=B73 -l 19 --lift=$TMP/sup.lift -t1"
+"$RB" $SUPC "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_default.tsv" 2>"$TMP/sup_default.log"
+check_eq "chain (default support) exits 0" "$?" "0"
+"$RB" $SUPC --support=chain "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_chain.tsv" 2>/dev/null
+check_eq "--support=chain is byte-identical to the default" "$(cmp -s "$TMP/sup_default.tsv" "$TMP/sup_chain.tsv" && echo same)" "same"
+check_eq "default rule: the donor read's set includes B73 (the bias --support=best fixes)" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_default.tsv")" "0,1,2"
+"$RB" $SUPC --support=best "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_best.tsv" 2>"$TMP/sup_best.log"
+check_eq "chain --support=best exits 0" "$?" "0"
+check_eq "--support=best: donor read -> Zd alone (gamete 2), same placement as default" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3":"$4}' "$TMP/sup_best.tsv")" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3}' "$TMP/sup_default.tsv"):2"
+check_eq "--support=best: B73-allele read -> B73 + Mo17" \
+	"$(awk -F'\t' '$1=="b73_read"{print $4}' "$TMP/sup_best.tsv")" "0,1"
+check_eq "--support=best: read in shared sequence -> all three" \
+	"$(awk -F'\t' '$1=="shared_read"{print $4}' "$TMP/sup_best.tsv")" "0,1,2"
+"$RB" $SUPC --support=best --support-tol=200 "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_tol.tsv" 2>/dev/null
+check_eq "--support-tol larger than the read keeps every assembly with any support" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_tol.tsv")" "0,1,2"
+"$RB" $SUPC --support=bogus "$TMP/sup.fmd" "$TMP/sup_q.fa" >/dev/null 2>&1
+check_eq "--support=bogus exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -449,6 +494,12 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
 		> /dev/null 2>"$TMP/valgrind_target.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
+
+	# chain --support=best with --lift and the npy accumulator (best-support masks, lift projections)
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" chain --ref-prefix=B73 -l 19 --lift="$TMP/sup.lift" --support=best --npy "$TMP/vg_sup.npy" --anchor-dist-npy -t2 \
+		"$TMP/sup.fmd" "$TMP/sup_q.fa" > /dev/null 2>"$TMP/valgrind_sup.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on chain --support=best; see $TMP/valgrind_sup.log"; cat "$TMP/valgrind_sup.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi
