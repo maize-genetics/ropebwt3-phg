@@ -109,6 +109,11 @@ static int rb3_i32_cmp(const void *a, const void *b)
 
 void rb3_ps4g_acc_add(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes)
 {
+	rb3_ps4g_acc_add_w(acc, ref_sid, pos, gametes, n_gametes, 1);
+}
+
+void rb3_ps4g_acc_add_w(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes, int32_t weight)
+{
 	int32_t tmp[256], n, m, i;
 	int64_t bin, ei, gi;
 	if (ref_sid < 0 || n_gametes <= 0) return;
@@ -125,6 +130,8 @@ void rb3_ps4g_acc_add(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const i
 	acc->ev_bin  = RB3_REALLOC(int64_t, acc->ev_bin,  acc->m_ev);
 	acc->ev_goff = RB3_REALLOC(int32_t, acc->ev_goff, acc->m_ev);
 	acc->ev_glen = RB3_REALLOC(int32_t, acc->ev_glen, acc->m_ev);
+	acc->ev_w    = RB3_REALLOC(int32_t, acc->ev_w,    acc->m_ev);
+	acc->ev_w[ei] = weight > 0? weight : 1;
 	acc->ev_ref_sid[ei] = ref_sid;
 	acc->ev_bin[ei] = bin;
 	acc->ev_goff[ei] = (int32_t)acc->n_garena;
@@ -141,7 +148,7 @@ void rb3_ps4g_acc_destroy(rb3_ps4g_acc_t *acc)
 {
 	if (acc == 0) return;
 	free(acc->ev_ref_sid); free(acc->ev_bin);
-	free(acc->ev_goff); free(acc->ev_glen);
+	free(acc->ev_goff); free(acc->ev_glen); free(acc->ev_w);
 	free(acc->garena);
 	free(acc);
 }
@@ -264,7 +271,7 @@ static int bed_lookup(const rb3_bed_t *bed, int64_t ref_sid, int64_t pos, int32_
  * finalize: sort + write PS4G / npy *
  *******************/
 
-typedef struct { int64_t ref_sid, bin; int32_t goff, glen; } ev_t;
+typedef struct { int64_t ref_sid, bin; int32_t goff, glen, w; } ev_t;
 
 static const int32_t *g_sort_arena; // scratch for ev_cmp during the single-threaded finalize sort
 
@@ -323,6 +330,7 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		ev[i].bin = acc->ev_bin[i];
 		ev[i].goff = acc->ev_goff[i];
 		ev[i].glen = acc->ev_glen[i];
+		ev[i].w = acc->ev_w[i];
 	}
 	g_sort_arena = acc->garena;
 	qsort(ev, acc->n_ev, sizeof(ev_t), ev_cmp);
@@ -332,12 +340,12 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		if (n_row > 0 && row[n_row-1].ref_sid == ev[i].ref_sid && row[n_row-1].bin == ev[i].bin &&
 			row[n_row-1].glen == ev[i].glen &&
 			memcmp(acc->garena + row[n_row-1].goff, acc->garena + ev[i].goff, ev[i].glen * sizeof(int32_t)) == 0) {
-			row[n_row-1].count++;
+			row[n_row-1].count += ev[i].w;
 		} else {
 			RB3_GROW(row_t, row, n_row, m_row);
 			row[n_row].ref_sid = ev[i].ref_sid, row[n_row].bin = ev[i].bin;
 			row[n_row].goff = ev[i].goff, row[n_row].glen = ev[i].glen;
-			row[n_row].count = 1;
+			row[n_row].count = ev[i].w;
 			++n_row;
 		}
 	}

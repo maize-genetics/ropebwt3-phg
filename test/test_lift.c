@@ -188,6 +188,46 @@ static void test_ternary_state(void)
  * rb3_ps4g_npy_finalize: ref_gamete column *
  *******************************************/
 
+// `chain --anchor-dist-npy`: a spliced read is emitted as one accumulator event per exon
+// segment -- same founder set (the chain-wide intersection), each at its own segment start.
+// The ternary/distance block must then judge each segment against the founders' anchors at
+// THAT segment's own bin, so one founder can read diverged(0) at one exon and deletion(-1) at
+// another of the same read. Exon 1 @1000 (A's anchor at 1000 -> 0 bp; B's nearest 1500 ->
+// 500 bp), exon 2 @3600 (A's nearest 3000 -> 600 bp; B's nearest 2500 -> 1100 bp), thresh 300.
+static void test_finalize_spliced_segments(const rb3_sid_t *sid, const rb3_gtab_t *gtab,
+										   const rb3_lift_ridx_t *ridx, const char *outdir)
+{
+	rb3_ps4g_acc_t *acc = rb3_ps4g_acc_init(100);
+	char npy_fn[512];
+	int32_t gset[] = { G_B73 }; // a reference-anchored chained read carried only by the reference
+	int32_t *mat;
+	int64_t rows = 0, cols = 0, n_g = gtab->n_gamete;
+
+	snprintf(npy_fn, sizeof(npy_fn), "%s/spliced_segments.npy", outdir);
+	rb3_ps4g_acc_add(acc, RSID_CHR1, 1000, gset, 1); // exon segment 1
+	rb3_ps4g_acc_add(acc, RSID_CHR1, 3600, gset, 1); // exon segment 2, same read, same founder set
+	rb3_ps4g_npy_finalize(acc, gtab, sid, /*bed=*/0, /*npy_binary=*/0, ridx,
+						   /*anchor_thresh=*/300, /*ref_gamete=*/G_B73,
+						   /*ps4g_fn=*/0, npy_fn, "unit-test-cmd");
+
+	mat = read_npy_i4(npy_fn, &rows, &cols);
+	CHECK(mat != 0, "finalize(spliced): npy file parsed");
+	CHECK(rows == 2, "finalize(spliced): one row per exon segment, not one per read");
+	CHECK(cols == 3 * n_g + 2, "finalize(spliced): 3*n_gamete+2 columns");
+	if (mat && rows == 2 && cols == 3 * n_g + 2) {
+		int32_t *r0 = mat, *r1 = mat + cols;
+		CHECK(r0[G_B73] == 1 && r1[G_B73] == 1, "finalize(spliced): each segment row counts the read once");
+		CHECK(r0[n_g + G_B73] == 1 && r1[n_g + G_B73] == 1, "finalize(spliced): the read's founder set is match(1) at every segment");
+		CHECK(r0[2 * n_g + G_A] == 0 && r1[2 * n_g + G_A] == 600, "finalize(spliced): A's distance is taken at each segment's own bin (0, 600)");
+		CHECK(r0[n_g + G_A] == 0 && r1[n_g + G_A] == -1,
+			  "finalize(spliced): A is diverged(0) at exon 1 but deletion(-1) at exon 2 of the same read");
+		CHECK(r0[2 * n_g + G_B] == 500 && r1[2 * n_g + G_B] == 1100, "finalize(spliced): B's distance per segment (500, 1100)");
+		CHECK(r0[n_g + G_B] == -1 && r1[n_g + G_B] == -1, "finalize(spliced): B is deletion(-1) at both segments (both > thresh)");
+	}
+	free(mat);
+	rb3_ps4g_acc_destroy(acc);
+}
+
 // Regression test for the ps4g.c:409-412 fix: the reference gamete's ternary
 // column must reflect whether THIS row's read genuinely carries the reference
 // gamete (in_set) -- not be hardcoded to match(1) regardless of gameteSet
@@ -255,6 +295,7 @@ int main(int argc, char *argv[])
 	CHECK(ridx != 0, "ridx_build: built successfully from the fixture");
 	test_nearest_ref(ridx);
 	test_finalize_ref_gamete_ternary(sid, gtab, ridx, outdir);
+	test_finalize_spliced_segments(sid, gtab, ridx, outdir);
 	rb3_lift_ridx_destroy(ridx); // must not crash
 
 	test_ternary_state();

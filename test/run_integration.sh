@@ -344,6 +344,176 @@ check_eq "--diverged-rows=drop leaves the all-insertion output unchanged" \
 	>/dev/null 2>"$TMP/badarg.log"
 check_eq "--diverged-rows rejects an invalid value" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
 
+# --- 6. chain --anchor-dist-npy: the same ternary + distance block refmap writes ---
+# chain feeds the same PS4G/npy accumulator as refmap, so --anchor-dist-npy must give the same
+# (3*n_gamete+2)-column layout and sidecars. A synthetic spliced read (B73[0,60) + B73[400,460),
+# a 340 bp "intron") checks that each exon segment becomes its own row at its own start bin,
+# carrying the read's chain-wide founder set.
+B73_SEQ=$(awk '/^>B73_chr1/{f=1;next}/^>/{f=0}f' "$DIR/pangenome.fa" | tr -d '\n')
+{ cat "$DIR/queries.fa"; printf '>spliced_query\n%s%s\n' "${B73_SEQ:0:60}" "${B73_SEQ:400:60}"; } > "$TMP/chain_q.fa"
+
+"$RB" chain --ref-prefix=B73 --npy "$TMP/cad_nolift.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>"$TMP/cad_nolift.log"
+check_eq "chain --anchor-dist-npy without --lift exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+check_line_in "chain --anchor-dist-npy without --lift names the missing option (same error as refmap)" \
+	"$TMP/cad_nolift.log" "ERROR: --anchor-dist-npy requires --lift=FILE"
+
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad_plain.ps4g" --npy "$TMP/cad_plain.npy" \
+	-t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad_plain.tsv" 2>/dev/null
+check_eq "chain --npy (plain) exits 0" "$?" "0"
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad.ps4g" --npy "$TMP/cad.npy" \
+	--anchor-dist-npy --anchor-dist-thresh=2000 -t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad.tsv" 2>/dev/null
+check_eq "chain --anchor-dist-npy exits 0" "$?" "0"
+check_eq "chain --anchor-dist-npy leaves stdout unchanged" \
+	"$(cmp -s "$TMP/cad_plain.tsv" "$TMP/cad.tsv" && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves the PS4G file unchanged (modulo #Command)" \
+	"$(cmp -s <(grep -v '^#Command' "$TMP/cad_plain.ps4g") <(grep -v '^#Command' "$TMP/cad.ps4g") && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves bins.tsv unchanged" \
+	"$(cmp -s "$TMP/cad_plain.npy.bins.tsv" "$TMP/cad.npy.bins.tsv" && echo same || echo differ)" "same"
+check_line_in "chain spliced read: exon 1 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t0\t0,1,2,3,4,5,6')"
+check_line_in "chain spliced read: exon 2 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t400\t0,1,2,3,4,5,6')"
+cad_header=$(head -c 200 "$TMP/cad.npy" | tr -d '\0')
+cad_shape=$(echo "$cad_header" | grep -oE "'shape': \([0-9]+, [0-9]+\)" | grep -oE '[0-9]+' | tr '\n' ' ')
+check_eq "chain --anchor-dist-npy: 4 rows x 23 columns (3*7 gametes + 2 labels)" "$cad_shape" "4 23 "
+check_line_in "chain --anchor-dist-npy writes the layout sidecar (ternary block)" "$TMP/cad.npy.layout.tsv" \
+	"$(printf 'ternary\t7\t14\tmatch(1)/diverged(0)/deletion(-1) per founder')"
+check_eq "plain chain --npy writes no layout sidecar" "$([ -e "$TMP/cad_plain.npy.layout.tsv" ] && echo yes || echo no)" "no"
+
+"$RB" refmap --ref-prefix=B73 --lift="$LIFT" --npy "$TMP/rad.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>/dev/null
+check_eq "refmap --anchor-dist-npy exits 0 on the same input" "$?" "0"
+check_eq "chain and refmap write the same layout sidecar" \
+	"$(cmp -s "$TMP/rad.npy.layout.tsv" "$TMP/cad.npy.layout.tsv" && echo same || echo differ)" "same"
+
+if [ -n "$NPY_PY" ]; then
+	"$NPY_PY" - "$TMP/cad_plain.npy" "$TMP/cad.npy" "$TMP/rad.npy" <<'EOF'
+import sys, numpy as np
+plain, wide, rwide = (np.load(f) for f in sys.argv[1:4])
+K = 7
+assert wide.dtype == np.int32 and wide.shape == (4, 3 * K + 2), wide.shape
+assert rwide.dtype == wide.dtype and rwide.shape[1] == wide.shape[1], (rwide.shape, wide.shape)
+# the count block and the label columns are exactly the plain --npy output
+assert (wide[:, :K] == plain[:, :K]).all() and (wide[:, -2:] == plain[:, -2:]).all()
+for a in (wide, rwide):  # refmap's definition, applied cell by cell, holds for both commands
+    cnt, tern, dist = a[:, :K], a[:, K:2*K], a[:, 2*K:3*K]
+    assert set(np.unique(tern)) <= {-1, 0, 1}
+    assert ((tern == 1) == (cnt > 0)).all(), "ternary match must be exactly the row's founder set"
+    off = tern != 1
+    assert ((tern == 0) == (off & (dist >= 0) & (dist <= 2000))).all()
+    assert ((tern == -1) == (off & ((dist < 0) | (dist > 2000)))).all()
+    assert (dist[:, 0] == 0).all(), "reference gamete distance is 0 by construction"
+# rows: bin0 {B73} (ref_query), bin0 {1..6} (insertion reads), bin0 {all} and bin1 {all} (spliced read)
+assert wide[:, K:2*K].tolist() == [[1,0,0,0,0,0,0], [0,1,1,1,1,1,1], [1]*7, [1]*7], wide[:, K:2*K].tolist()
+assert wide[2, :K].tolist() == [1]*7 and wide[3, :K].tolist() == [1]*7, "one count per exon segment"
+print("CHAIN_ANCHOR_DIST_OK")
+EOF
+	if [ $? -eq 0 ]; then pass; else fail "chain --anchor-dist-npy numpy check raised an assertion"; fi
+else
+	echo "SKIP: chain --anchor-dist-npy numpy check needs a python3 with numpy" >&2
+fi
+
+# --- 7. chain never links SMEMs on different reference contigs ---
+# Two unrelated reference contigs: B73_chr1 (copied into Oh43) and B73_chr2 (copied into Mo17). The
+# read is 80 bp of chr1 at 1000 followed by 80 bp of chr2 at 1020, so the two SMEMs sit at
+# similar coordinates on different contigs. Linking them would emit one chr1 row whose founder set is
+# {B73,Oh43} ∩ {B73,Mo17} = {B73}; the colinear DP must instead keep them apart, leaving the best
+# single-contig chain. With this seed the chr2 SMEM extends 2 bp left into the chr1 half (the random
+# sequences share those bases), so it is the longer one and wins: chr2 at 1018, B73 + Mo17 = 0,1.
+awk 'BEGIN{srand(7); split("ACGT", b, ""); for (c = 1; c <= 2; ++c) { s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]; seq[c] = s }
+     print ">B73_chr1"; print seq[1]; print ">B73_chr2"; print seq[2]; print ">Oh43_chr1"; print seq[1]; print ">Mo17_chr2"; print seq[2]
+     print substr(seq[1], 1001, 80) substr(seq[2], 1021, 80) > "'"$TMP"'/xcontig_query.seq"}' > "$TMP/xcontig.fa"
+printf '>xcontig\n%s\n' "$(cat "$TMP/xcontig_query.seq")" > "$TMP/xcontig_query.fa"
+"$RB" build -d -o "$TMP/xcontig.fmd" "$TMP/xcontig.fa" >/dev/null 2>"$TMP/xcontig_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/xcontig.fmd.ssa" "$TMP/xcontig.fmd" >/dev/null 2>>"$TMP/xcontig_build.log"
+check_eq "cross-contig fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/xcontig.fa" | gzip > "$TMP/xcontig.fmd.len.gz"
+"$RB" chain --ref-prefix=B73 -t1 "$TMP/xcontig.fmd" "$TMP/xcontig_query.fa" > "$TMP/xcontig.tsv" 2>"$TMP/xcontig.log"
+check_eq "chain exits 0 (cross-contig read)" "$?" "0"
+check_eq "chain: one row for the cross-contig read" "$(grep -c '^xcontig' "$TMP/xcontig.tsv")" "1"
+check_line_in "chain: SMEMs on different contigs are not chained (best single-contig chain, B73 + Mo17)" \
+	"$TMP/xcontig.tsv" "$(printf 'xcontig\tchr2\t1018\t0,1')"
+check_eq "chain: no row with the cross-contig intersection {B73} alone" \
+	"$(awk -F'\t' '$1=="xcontig" && $4=="0"' "$TMP/xcontig.tsv" | wc -l | tr -d ' ')" "0"
+
+# --- 8. chain --support=best: founder set = the assemblies that best explain the read ---
+# B73_chr1 and Mo17_chr1 are identical random sequence; Zd_chr1 is the same with SNPs at 1130 and
+# 1160 -- a diverged allele. The donor read is Zd's [1100,1250) with one extra base change at read
+# offset 110 (the donor is a different accession than Zd), so it matches no assembly end to end:
+# SMEMs [0,110) in Zd only and [111,150) in all three (B73's own match [61,110) is contained in the
+# Zd SMEM, so it is not super-maximal). The default rule keeps only reference-hitting SMEMs, so the
+# read is called {B73,Mo17,Zd}; --support=best counts the Zd-only SMEM (150 bases for Zd vs 39) and
+# calls Zd alone, at the same placement. A B73-allele read
+# from the same region stays {B73,Mo17}; a read outside the diverged region stays {all three}.
+awk 'BEGIN{srand(11); split("ACGT", b, ""); s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]
+     z = s; for (p = 1130; p <= 1160; p += 30) { c = substr(z, p+1, 1); n = (c == "A")? "C" : "A"; z = substr(z, 1, p) n substr(z, p+2) }
+     print ">B73_chr1"; print s; print ">Mo17_chr1"; print s; print ">Zd_chr1"; print z
+     d = substr(z, 1101, 150); c = substr(d, 111, 1); n = (c == "G")? "T" : "G"; d = substr(d, 1, 110) n substr(d, 112)
+     print ">donor_read\n" d > "'"$TMP"'/sup_q.fa"
+     print ">b73_read\n" substr(s, 1101, 150) >> "'"$TMP"'/sup_q.fa"
+     print ">shared_read\n" substr(s, 2001, 150) >> "'"$TMP"'/sup_q.fa"}' > "$TMP/sup.fa"
+"$RB" build -d -o "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/sup.fmd.ssa" "$TMP/sup.fmd" >/dev/null 2>>"$TMP/sup_build.log"
+check_eq "support fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/sup.fa" | gzip > "$TMP/sup.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 20 -o "$TMP/sup.lift" "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_lift.log"
+check_eq "support fixture lift builds" "$?" "0"
+SUPC="chain --ref-prefix=B73 -l 19 --lift=$TMP/sup.lift -t1"
+"$RB" $SUPC "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_default.tsv" 2>"$TMP/sup_default.log"
+check_eq "chain (default support) exits 0" "$?" "0"
+"$RB" $SUPC --support=chain "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_chain.tsv" 2>/dev/null
+check_eq "--support=chain is byte-identical to the default" "$(cmp -s "$TMP/sup_default.tsv" "$TMP/sup_chain.tsv" && echo same)" "same"
+check_eq "default rule: the donor read's set includes B73 (the bias --support=best fixes)" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_default.tsv")" "0,1,2"
+"$RB" $SUPC --support=best "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_best.tsv" 2>"$TMP/sup_best.log"
+check_eq "chain --support=best exits 0" "$?" "0"
+check_eq "--support=best: donor read -> Zd alone (gamete 2), same placement as default" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3":"$4}' "$TMP/sup_best.tsv")" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3}' "$TMP/sup_default.tsv"):2"
+check_eq "--support=best: B73-allele read -> B73 + Mo17" \
+	"$(awk -F'\t' '$1=="b73_read"{print $4}' "$TMP/sup_best.tsv")" "0,1"
+check_eq "--support=best: read in shared sequence -> all three" \
+	"$(awk -F'\t' '$1=="shared_read"{print $4}' "$TMP/sup_best.tsv")" "0,1,2"
+"$RB" $SUPC --support=best --support-tol=200 "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_tol.tsv" 2>/dev/null
+check_eq "--support-tol larger than the read keeps every assembly with any support" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_tol.tsv")" "0,1,2"
+"$RB" $SUPC --support=bogus "$TMP/sup.fmd" "$TMP/sup_q.fa" >/dev/null 2>&1
+check_eq "--support=bogus exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+
+# --- 9. chain output does not depend on the suffix-array sampling rate (hit order) ---
+# rb3_ssa_multi returns an interval's occurrences in an order that depends on `ssa -s`; chain keeps
+# the first reference hit and breaks ties by order, so the hits are sorted before use. Same index,
+# SA sampled at 1/256 and 1/2: chain output (stdout, PS4G and npy) must be byte-identical.
+cp "$TMP/pangenome.fmd" "$TMP/ss2.fmd"; cp "$IDX.len.gz" "$TMP/ss2.fmd.len.gz"
+"$RB" ssa -s1 -o "$TMP/ss2.fmd.ssa" "$TMP/ss2.fmd" >/dev/null 2>"$TMP/ss2.log"
+for ix in "$IDX" "$TMP/ss2.fmd"; do
+	tag=$(basename "$ix" .fmd)
+	"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --support=best --ps4g "$TMP/ho_$tag.ps4g" --npy "$TMP/ho_$tag.npy" -t1 \
+		"$ix" "$DIR/queries.fa" > "$TMP/ho_$tag.tsv" 2>/dev/null
+done
+check_eq "chain stdout identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.tsv" "$TMP/ho_ss2.tsv" && echo same)" "same"
+check_eq "chain npy identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.npy" "$TMP/ho_ss2.npy" && echo same)" "same"
+check_eq "chain PS4G identical across SA sampling rates (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/ho_pangenome.ps4g") <(grep -v '^#Command' "$TMP/ho_ss2.ps4g") >/dev/null && echo same)" "same"
+
+# --- 10. chain --dup-count: a collapsed duplicate read named <name>;x=N counts N times ---
+# Every query three times (all reads) versus once each named ";x=3": identical PS4G and npy.
+awk '/^>/{n=substr($1,2); next}{s[n]=s[n] $0; o[++k]=n} END{for (i=1;i<=k;++i) if (!(o[i] in d)) {d[o[i]]=1; for (r=0;r<3;++r) print ">" o[i] "_" r "\n" s[o[i]]; print ">" o[i] ";x=3\n" s[o[i]] > "'"$TMP"'/dup_collapsed.fa"}}' \
+	"$DIR/queries.fa" > "$TMP/dup_full.fa"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_full.ps4g" --npy "$TMP/dup_full.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_full.fa" > /dev/null 2>&1
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --dup-count --ps4g "$TMP/dup_coll.ps4g" --npy "$TMP/dup_coll.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "--dup-count: collapsed reads give the same npy as the duplicated input" \
+	"$(cmp -s "$TMP/dup_full.npy" "$TMP/dup_coll.npy" && echo same)" "same"
+check_eq "--dup-count: same PS4G counts (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_coll.ps4g") >/dev/null && echo same)" "same"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_nocount.ps4g" -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "without --dup-count the ;x=N suffix is ignored (counts differ from the duplicated input)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_nocount.ps4g") >/dev/null && echo same || echo differ)" "differ"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -357,6 +527,12 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
 		> /dev/null 2>"$TMP/valgrind_target.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
+
+	# chain --support=best with --lift and the npy accumulator (best-support masks, lift projections)
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" chain --ref-prefix=B73 -l 19 --lift="$TMP/sup.lift" --support=best --npy "$TMP/vg_sup.npy" --anchor-dist-npy -t2 \
+		"$TMP/sup.fmd" "$TMP/sup_q.fa" > /dev/null 2>"$TMP/valgrind_sup.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on chain --support=best; see $TMP/valgrind_sup.log"; cat "$TMP/valgrind_sup.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi

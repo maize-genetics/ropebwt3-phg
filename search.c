@@ -13,6 +13,13 @@
 
 KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
 
+static int pos_cmp(const void *a, const void *b) // SMEM hits by (sequence/strand id, position)
+{
+	const rb3_pos_t *x = (const rb3_pos_t*)a, *y = (const rb3_pos_t*)b;
+	if (x->sid != y->sid) return x->sid < y->sid? -1 : 1;
+	return x->pos < y->pos? -1 : x->pos > y->pos? 1 : 0;
+}
+
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
 #define RB3_WALK_CONSENSUS  0 // follow the base shared by the most assemblies
@@ -75,12 +82,18 @@ typedef struct {
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
 	                    // extra output column (0 = off, opt-in -- see --report-occ)
-	int8_t anchor_dist_npy; // refmap --npy: also write a per-founder ternary read-sharing block
+	int8_t anchor_dist_npy; // refmap/chain --npy: also write a per-founder ternary read-sharing block
 	                    // (match/diverged/deletion) and a per-founder distance-to-nearest-lift-anchor
 	                    // block, widening --npy from (bin x gamete+2) to (bin x 3*gamete+2)
 	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
-	int64_t anchor_dist_thresh; // refmap --anchor-dist-npy: distance (bp) at/under which a
+	int64_t anchor_dist_thresh; // refmap/chain --anchor-dist-npy: distance (bp) at/under which a
 	                    // non-matching founder reads as diverged rather than deletion
+	int8_t support_best;   // chain: founder set = assemblies best explaining the read (1), or the
+	                       // chain-wide intersection of reference-hitting SMEMs (0, default)
+	int32_t support_tol;   // chain --support=best: keep assemblies within this many covered bases of the best
+	int64_t support_win;   // chain --support=best --lift: an assembly-only SMEM counts only if it
+	                       // projects within this many bp of the chain's reference span (0 = no check)
+	int8_t dup_count;      // chain: a read named "<name>;x=N" stands for N identical reads (PS4G/npy counts)
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -118,6 +131,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
 	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
+	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -152,9 +166,9 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
-	rb3_lift_ridx_t *lift_ridx; // refmap --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
-	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
-	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
+	rb3_lift_ridx_t *lift_ridx; // refmap/chain --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
+	rb3_gtab_t *gtab;      // refmap/chain --ps4g/--npy: sample (gamete) table, NULL unless requested
+	rb3_ps4g_acc_t *ps4g_acc; // refmap/chain --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
@@ -311,6 +325,9 @@ static void worker_for_seq(void *data, long i, int tid)
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *q = &s->mem[i];
 				q->n_pos = rb3_ssa_multi(b->km, &p->fmi, p->fmi.ssa, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
+				// rb3_ssa_multi's hit order depends on the SA sampling rate (ssa -s); chain keeps the
+				// first reference hit and breaks DP ties by order, so sort for an index-independent result
+				qsort(pos, q->n_pos, sizeof(rb3_pos_t), pos_cmp);
 				q->pos = RB3_MALLOC(rb3_pos_t, q->n_pos);
 				memcpy(q->pos, pos, sizeof(rb3_pos_t) * q->n_pos);
 			}
@@ -1108,6 +1125,17 @@ static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_
 // rows (741 full-length, 31 3'-tag) at **0.0%** source recall -- every one named the wrong
 // assembly. 3'-tag libraries generate these by design (polyA priming), so gate on
 // composition, not length. See pav_e1_findings_2026-07-26.md.
+// chain --dup-count: a collapsed duplicate read is named "<name>;x=N" (N identical reads); it adds N
+// to the PS4G/npy counts. Without the option, or without a valid suffix, every read counts once.
+static int32_t chain_read_weight(const pipeline_t *p, const m_seq_t *s)
+{
+	const char *q;
+	long n;
+	if (!p->opt->dup_count || s->name == 0 || (q = strstr(s->name, ";x=")) == 0) return 1;
+	n = strtol(q + 3, 0, 10);
+	return n > 0 && n < INT32_MAX? (int32_t)n : 1;
+}
+
 static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 {
 	int32_t cnt[7], i, c, best = 0, n = qe - qs;
@@ -1269,7 +1297,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			if (!is_insertion) {
 				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
 				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
 					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
 					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 					putchar('\n');
@@ -1287,7 +1315,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 				// explicitly requested.
 				if (p->opt->insertion_rows == 2) goto pav_done;          // drop
 				if (p->opt->insertion_rows == 0) {                       // ordinary row, exact median, no snap
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, med, acc, na);
+					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
 					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
 					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 					putchar('\n');
@@ -1306,7 +1334,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// rb3_ps4g_npy_finalize/ps4g.c time from sid->name), so this shares bins with ordinary
 			// rows on the same contig at the same coarse position. Known gap, not resolved here --
 			// see the design note on --insertion-rows above; --insertion-rows=ordinary avoids it.
-			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add(p->ps4g_acc, best_rsid, bp, acc, na);
+			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, bp, acc, na, chain_read_weight(p, s));
 			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
 			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
@@ -1320,6 +1348,64 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 pav_done:
 	for (i = 0; i < n; ++i) free(cs[i].gam);
 	free(acc); free(clu); free(cand); free(cs);
+}
+
+// chain --support=best: replace the chain-wide intersection by the assemblies that best explain
+// the read. Placement is unchanged (the reference-hitting colinear chain); support is counted over
+// the chain's SMEMs PLUS the read's assembly-only SMEMs (no reference occurrence -- the ones the
+// intersection rule discards: a donor-allele read with a SNP vs the reference is matched longer by
+// the assembly carrying that allele). An assembly-only SMEM occurrence counts for its gamete only
+// if, with --lift and --support-win > 0, it projects onto the chain's reference contig within
+// support_win bp of the chain's reference span (a paralog elsewhere does not count). Per gamete:
+// the number of read bases covered by the counted SMEMs that occur in it; the set is every gamete
+// within support_tol bases of the best. Non-chain SMEMs that do hit the reference are ignored, as
+// in the default rule. Writes the sorted set to acc (capacity n_gamete) and returns its size.
+static int32_t chain_support_best(const pipeline_t *p, const m_seq_t *s, void *km, const chain_sm_t *cs,
+								  const int32_t *chain, int32_t nc, int64_t rlo, int64_t rhi, int32_t *acc)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t ng = gt->n_gamete, len = s->len, i, k, g, best = 0, na = 0;
+	int32_t rsid0 = cs[chain[0]].rsid;
+	uint8_t *mask;
+	int32_t *cov;
+	if (len <= 0) return 0;
+	mask = RB3_CALLOC(uint8_t, (int64_t)ng * len);
+	cov = RB3_CALLOC(int32_t, ng);
+	for (i = 0; i < nc; ++i) { // the placement chain's SMEMs: every gamete they occur in
+		const chain_sm_t *c = &cs[chain[i]];
+		for (k = 0; k < c->n_gam; ++k)
+			memset(mask + (int64_t)c->gam[k] * len + c->qs, 1, c->qe - c->qs);
+	}
+	for (i = 0; i < s->n_mem; ++i) { // assembly-only SMEMs near the chain locus
+		const m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, nref = 0;
+		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+		for (k = 0; k < r->n_pos; ++k) if (p->is_ref[r->pos[k].sid>>1]) ++nref;
+		if (nref > 0) continue;
+		for (k = 0; k < r->n_pos; ++k) {
+			const rb3_pos_t *t = &r->pos[k];
+			g = gt->sid2g[t->sid>>1];
+			if (g < 0 || g >= ng) continue;
+			if (p->lift && p->opt->support_win > 0) {
+				int64_t rsid, rpos;
+				if (!rb3_lift_project(p->lift, km, (int32_t)(t->sid>>1), pav_fwd_pos(f, t, en - st),
+									  p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos)) continue;
+				if (rsid != rsid0 || rpos < rlo - p->opt->support_win || rpos > rhi + p->opt->support_win) continue;
+			}
+			memset(mask + (int64_t)g * len + st, 1, en - st);
+		}
+	}
+	for (g = 0; g < ng; ++g) {
+		const uint8_t *m = mask + (int64_t)g * len;
+		for (k = 0; k < len; ++k) cov[g] += m[k];
+		if (cov[g] > best) best = cov[g];
+	}
+	if (best > 0)
+		for (g = 0; g < ng; ++g)
+			if (cov[g] > 0 && cov[g] >= best - p->opt->support_tol) acc[na++] = g;
+	free(mask); free(cov);
+	return na;
 }
 
 static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
@@ -1376,6 +1462,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t rj = cs[j].rpos, dr = strand? rj - ri : ri - rj;
 			int64_t dq = cs[i].qs - cs[j].qe, unexp;
 			int32_t anch; int64_t sc;
+			if (cs[j].rsid != cs[i].rsid) continue;       // different contigs: positions are not comparable
 			if (dr < 0 || cs[j].qs > cs[i].qs) continue;  // out of order -> not colinear
 			if (dq < 0) dq = 0;
 			unexp = dr - dq; if (unexp < 0) unexp = 0;    // intron length / paralog jump
@@ -1408,25 +1495,32 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t *ivlo = RB3_MALLOC(int64_t, nc), *ivhi = RB3_MALLOC(int64_t, nc);
 			memcpy(acc, cs[chain[0]].gam, na * sizeof(int32_t));
 			for (i = 1; i < nc; ++i) na = chain_isect(acc, na, cs[chain[i]].gam, cs[chain[i]].n_gam);
+			for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
+			if (p->opt->support_best) { // founder set = best-explaining assemblies (see chain_support_best)
+				int64_t rlo = ivlo[0], rhi = ivhi[0];
+				for (i = 1; i < nc; ++i) { if (ivlo[i] < rlo) rlo = ivlo[i]; if (ivhi[i] > rhi) rhi = ivhi[i]; }
+				free(acc);
+				acc = RB3_MALLOC(int32_t, gt->n_gamete);
+				na = chain_support_best(p, s, km, cs, chain, nc, rlo, rhi, acc);
+			}
 			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
 				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
 				const char *contig = us? us + 1 : nm;
 				int64_t lo, hi;
-				for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
 				for (i = 0; i < nc - 1; ++i) // insertion sort ascending by start (nc is tiny)
 					for (j = i + 1; j < nc; ++j)
 						if (ivlo[j] < ivlo[i]) { int64_t t0 = ivlo[i], t1 = ivhi[i]; ivlo[i] = ivlo[j], ivhi[i] = ivhi[j], ivlo[j] = t0, ivhi[j] = t1; }
 				lo = ivlo[0], hi = ivhi[0];
 				for (i = 1; i < nc; ++i) {
 					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
-						if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
+						if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
 						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 						putchar('\n');
 						lo = ivlo[i], hi = ivhi[i];
 					} else if (ivhi[i] > hi) hi = ivhi[i];
 				}
-				if (p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na);
+				if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
 				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
 				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
 				putchar('\n');
@@ -1448,10 +1542,11 @@ static void write_per_seq(step_t *t)
 	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
-		free(s->seq);
+		if (p->opt->algo != RB3_SA_CHAIN) free(s->seq); // chain's PAV path still reads s->seq (pav_low_complexity)
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
 			chain_emit(p, s, km);
+			free(s->seq);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
@@ -1682,6 +1777,10 @@ static ko_longopt_t long_options[] = {
 	{ "insertion-rows",      ko_required_argument, 342 },
 	{ "anchor-dist-npy",     ko_no_argument,       343 },
 	{ "anchor-dist-thresh",  ko_required_argument, 344 },
+	{ "support",             ko_required_argument, 345 },
+	{ "support-tol",         ko_required_argument, 346 },
+	{ "support-win",         ko_required_argument, 347 },
+	{ "dup-count",           ko_no_argument,       348 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1689,6 +1788,19 @@ static ko_longopt_t long_options[] = {
 	{ "dbg-bt",          ko_no_argument,       505 },
 	{ 0, 0, 0 }
 };
+
+// --anchor-dist-npy/--anchor-dist-thresh usage, shared verbatim by refmap and chain: both
+// commands feed the same PS4G/npy accumulator and rb3_ps4g_npy_finalize builds the block.
+static void usage_anchor_dist(const rb3_mopt_t *opt)
+{
+	fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
+	fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
+	fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
+	fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
+	fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
+	fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
+	fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt->anchor_dist_thresh);
+}
 
 int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 {
@@ -1787,6 +1899,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
 		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
+		else if (c == 345) {                                         // chain: founder-set rule
+			if (strcmp(o.arg, "chain") == 0) opt.support_best = 0;
+			else if (strcmp(o.arg, "best") == 0) opt.support_best = 1;
+			else { fprintf(stderr, "ERROR: --support must be chain or best\n"); return 1; }
+		}
+		else if (c == 346) opt.support_tol = atoi(o.arg);            // chain --support=best: coverage tolerance (bases)
+		else if (c == 347) opt.support_win = rb3_parse_num(o.arg);   // chain --support=best: lift proximity window
+		else if (c == 348) opt.dup_count = 1;                        // chain: "<name>;x=N" reads count N times
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1861,13 +1981,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
-			fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
-			fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
-			fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
-			fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
-			fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
-			fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
-			fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt.anchor_dist_thresh);
+			usage_anchor_dist(&opt);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1899,6 +2013,15 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --support=STR     founder set of a chained read: chain = intersection over the\n");
+			fprintf(stderr, "                    reference-hitting chain's SMEMs (default, unchanged); best = the\n");
+			fprintf(stderr, "                    assemblies covering the most read bases, counting the chain's SMEMs\n");
+			fprintf(stderr, "                    plus assembly-only SMEMs (for diverged / out-of-panel alleles)\n");
+			fprintf(stderr, "  --support-tol=INT --support=best: keep assemblies within INT covered bases of the best [%d]\n", opt.support_tol);
+			fprintf(stderr, "  --support-win=NUM --support=best --lift: an assembly-only SMEM counts only if it\n");
+			fprintf(stderr, "                    projects within NUM bp of the chain's reference span (0 = off) [%ld]\n", (long)opt.support_win);
+			fprintf(stderr, "  --dup-count       a read named <name>;x=N stands for N identical reads: it adds N\n");
+			fprintf(stderr, "                    to the PS4G/npy counts (collapse duplicates first, keep the counts)\n");
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
@@ -1908,6 +2031,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
 			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
 			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
+			fprintf(stderr, "  --lift-local-win=NUM  --lift projection: nearest collinear flanking anchors within\n"
+			                "                    NUM bp first (0 = off) [0]; --lift-local-tol=NUM tolerance [1000]\n");
+			usage_anchor_dist(&opt);
+			fprintf(stderr, "                    chain: a row's founder set is the read's chain-wide intersection;\n");
+			fprintf(stderr, "                    a spliced read gives one row per exon segment, each judged at\n");
+			fprintf(stderr, "                    its own start; use --insertion-rows=ordinary so insertion rows\n");
+			fprintf(stderr, "                    are not --pav-grid snapped before the anchor-distance lookup\n");
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -2050,6 +2180,17 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
 				if (rb3_verbose >= 3)
 					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
+				// chain shares this block unchanged: chain_emit/chain_emit_pav feed the same accumulator
+				// (one event per emitted row: reference sequence, row start, the read's founder set) and
+				// rb3_ps4g_npy_finalize derives the ternary/distance columns per (contig,bin,gameteSet)
+				// row exactly as for refmap. So for a chained read: 1 = founder carries EVERY SMEM of the
+				// winning chain (the chain-wide intersection, the same set stdout/PS4G report); each exon
+				// segment is its own row, judged against that founder's lift anchors at the segment's own
+				// start bin. Grid-snapped insertion rows (--insertion-rows=pav, the chain default) are
+				// looked up at the snapped coordinate, up to --pav-grid bp from the real breakpoint.
+				if (opt.algo == RB3_SA_CHAIN && opt.insertion_rows == 1 && opt.pav_grid > 0 && rb3_verbose >= 2)
+					fprintf(stderr, "WARNING: chain --anchor-dist-npy with --insertion-rows=pav: insertion rows are snapped to "
+									"--pav-grid=%d before the anchor-distance lookup; --insertion-rows=ordinary keeps them exact\n", opt.pav_grid);
 			}
 			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
 				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);
