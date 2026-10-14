@@ -247,7 +247,10 @@ the whole fragment. It falls back to the anchor mate's set when the intersection
 `MOVED` mate keeps only the founders whose own copy projected near its mate, so a TE/paralog copy
 elsewhere does not count. `max_ins` comes from a per-batch, bwa-style estimate over EXACT/EXACT
 pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defaults to 2000 bp,
-the lift-projection error scale. The PS4G/npy layout is unchanged. `--paired` is refmap-only for
+the lift-projection error scale. An EXACT mate's other reference copies count as
+alternative positions too, so pairing also picks the right copy of a duplicated sequence.
+`--pe-trust-exact` (opt-in) moves the PLACED mate of an unrescuable EXACT + PLACED pair onto the
+EXACT mate. The PS4G/npy layout is unchanged. `--paired` is refmap-only for
 now; chain and mem/sw reject it.
 
 ```sh
