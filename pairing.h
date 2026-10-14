@@ -15,7 +15,7 @@ extern "C" {
 #define RB3_PE_NONE 0 // neither mate has a confident reference position: no event
 #define RB3_PE_SOLO 1 // exactly one mate placed: one event at that mate
 #define RB3_PE_CONC 2 // both placed, same contig, within max_dist: one event at the anchor mate
-#define RB3_PE_RESC 3 // discordant, but the weaker mate has a lift projection near the anchor: moved there, one event
+#define RB3_PE_RESC 3 // discordant, but one mate has an alternative position near the other: moved there, one event
 #define RB3_PE_DISC 4 // discordant and not rescuable: each mate is its own single-end event
 
 extern const char *rb3_pe_class_str[5];
@@ -32,7 +32,8 @@ typedef struct {
 typedef struct {
 	int8_t rank;             // 2 = exact reference hit, 1 = projected (PLACED), 0 = no confident position
 	int64_t rsid, pos;       // reference sequence id and position; ignored when rank == 0
-	int32_t n_proj;          // per-assembly reference projections of this mate (lift PLACED only), may be 0
+	int32_t n_proj;          // alternative positions: per-assembly lift projections (PLACED) or all
+	                         // reference copies (EXACT); may be 0
 	const int64_t *proj_rsid, *proj_pos;
 	const int32_t *proj_gid; // gamete (founder) of each projection; may be NULL
 } rb3_pe_mate_t;
@@ -57,7 +58,10 @@ int rb3_pe_names_match(const char *a, const char *b);
 int rb3_pe_isize_estimate(int64_t *span, int32_t n, int32_t min_n, rb3_isize_t *out);
 
 // Classify a pair. max_dist: largest |pos0 - pos1| on one contig that is still concordant.
-void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, rb3_pe_res_t *res);
+// Discordant pairs are rescued by moving one mate to the median of its alternative positions
+// within max_dist of the other mate, preferring to move the less confident mate. trust_exact:
+// an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one (support 0).
+void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, int trust_exact, rb3_pe_res_t *res);
 
 // Founders of mate b whose own projection lies on contig rsid within max_dist of pos: sorted,
 // deduplicated, into out (size >= b->n_proj). A rescued mate keeps only these, so an assembly

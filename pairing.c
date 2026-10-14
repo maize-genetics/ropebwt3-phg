@@ -84,7 +84,7 @@ static int32_t pe_near_proj(const rb3_pe_mate_t *a, const rb3_pe_mate_t *b, int6
 	return tot;
 }
 
-void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, rb3_pe_res_t *res)
+void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, int trust_exact, rb3_pe_res_t *res)
 {
 	int k, best_a = -1;
 	int32_t best_sup = 0;
@@ -97,16 +97,21 @@ void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, rb3_pe_res_t *re
 		res->cls = RB3_PE_CONC, res->anchor = m[1].rank > m[0].rank? 1 : 0;
 		return;
 	}
-	// discordant: try moving a projected mate b next to an anchor a at least as confident.
-	// An exact anchor beats a projected one; then more agreeing projections; then mate 0.
+	// discordant: try moving mate b to one of its alternative positions (lift projections of a
+	// PLACED read, other reference copies of an EXACT read) next to mate a. Prefer moving the
+	// less confident mate (rank[a] - rank[b] larger), then more agreeing alternatives, then mate 0.
 	for (k = 0; k < 2; ++k) {
 		const rb3_pe_mate_t *a = &m[k], *b = &m[k^1];
 		int64_t med;
 		int32_t sup;
-		if (b->rank != 1 || a->rank < b->rank) continue;
 		if ((sup = pe_near_proj(a, b, max_dist, &med)) == 0) continue;
-		if (best_a < 0 || a->rank > m[best_a].rank || (a->rank == m[best_a].rank && sup > best_sup))
+		if (best_a < 0 || a->rank - b->rank > m[best_a].rank - m[best_a^1].rank
+			|| (a->rank - b->rank == m[best_a].rank - m[best_a^1].rank && sup > best_sup))
 			best_a = k, best_sup = sup, best_pos = med;
+	}
+	if (best_a < 0 && trust_exact && m[0].rank != m[1].rank) { // EXACT + PLACED: the fragment is where the exact mate is
+		best_a = m[0].rank > m[1].rank? 0 : 1;
+		best_sup = 0, best_pos = m[best_a].pos;
 	}
 	if (best_a < 0) { res->cls = RB3_PE_DISC; return; }
 	res->cls = RB3_PE_RESC, res->anchor = best_a, res->rescued = best_a ^ 1;

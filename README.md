@@ -227,6 +227,34 @@ See [docs/usage.md](docs/usage.md) for a full guide (§7 PS4G/numpy output,
 §8 `--target-hits`) and a runnable example ([docs/examples/](docs/examples/),
 `sh docs/examples/run.sh`).
 
+#### Paired-end reads (`--paired`)
+
+`refmap --paired` reads mate pairs, from two files (`R1.fq R2.fq`) or from one interleaved file
+whose mates sit next to each other. Mate names must match up to a trailing `/1` or `/2`. Each
+mate is placed exactly as in single-end mode. Then each pair is classified, and the class is
+appended to both mates' stdout rows as one extra column:
+
+| class | meaning | PS4G/npy |
+|---|---|---|
+| `CONC` | both mates placed on one contig within `max_ins + --pe-slack` | one event, at the more confident mate |
+| `RESC` / `MOVED` | discordant, but a PLACED mate has a lift projection near the other mate; the `MOVED` mate is re-placed there | one event |
+| `SOLO` | only one mate placed | one event |
+| `DISC` | discordant, not rescuable | each mate is its own event, as in single-end mode |
+| `NONE` | neither mate placed | none |
+
+A pair event's founder set is the intersection of the two mates' sets: the founders that carry
+the whole fragment. It falls back to the anchor mate's set when the intersection is empty. A
+`MOVED` mate keeps only the founders whose own copy projected near its mate, so a TE/paralog copy
+elsewhere does not count. `max_ins` comes from a per-batch, bwa-style estimate over EXACT/EXACT
+pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defaults to 2000 bp,
+the lift-projection error scale. The PS4G/npy layout is unchanged. `--paired` is refmap-only for
+now; chain and mem/sw reject it.
+
+```sh
+ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=pe.npy \
+  pan.fmd R1.fq R2.fq > pe.tsv
+```
+
 ### <a name="chain"></a>RNAseq: chaining and PAV placement
 
 `refmap` places a read as a whole, which suits DNA. An RNAseq read is different:

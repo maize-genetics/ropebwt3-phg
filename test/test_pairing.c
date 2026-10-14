@@ -80,30 +80,30 @@ static void test_resolve(void)
 	int64_t prs[4], ppos[4], prs2[2], ppos2[2];
 
 	m[0] = mate(0, -1, -1), m[1] = mate(0, -1, -1);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_NONE && r.anchor == -1 && r.rescued == -1, "resolve: both unplaced -> NONE");
 
 	m[0] = mate(0, -1, -1), m[1] = mate(1, 3, 5000);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_SOLO && r.anchor == 1, "resolve: only mate 1 placed -> SOLO anchored on 1");
 	m[0] = mate(2, 3, 5000), m[1] = mate(0, -1, -1);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_SOLO && r.anchor == 0, "resolve: only mate 0 placed -> SOLO anchored on 0");
 
 	m[0] = mate(2, 3, 5000), m[1] = mate(2, 3, 5900);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_CONC && r.anchor == 0, "resolve: exact+exact within max_dist -> CONC anchored on mate 0");
 	m[0] = mate(2, 3, 5000), m[1] = mate(2, 3, 6000);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_CONC, "resolve: distance == max_dist is concordant");
 	m[0] = mate(2, 3, 5000), m[1] = mate(2, 3, 6001);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_DISC, "resolve: exact+exact one past max_dist -> DISC (no projections)");
 	m[0] = mate(1, 3, 5000), m[1] = mate(2, 3, 4200);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_CONC && r.anchor == 1, "resolve: CONC anchors on the exact mate");
 	m[0] = mate(2, 3, 5000), m[1] = mate(2, 4, 5000);
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_DISC, "resolve: different contigs -> DISC");
 
 	// projected mate 1 lands 80kb away, but 2 of its 4 assembly projections are near the exact mate
@@ -113,28 +113,60 @@ static void test_resolve(void)
 	prs[2] = 3, ppos[2] = 100300;
 	prs[3] = 5, ppos[3] = 100500; // right position, wrong contig: not counted
 	m[1].n_proj = 4, m[1].proj_rsid = prs, m[1].proj_pos = ppos;
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_RESC && r.anchor == 0 && r.rescued == 1, "resolve: projected mate rescued next to exact mate");
 	CHECK(r.resc_rsid == 3 && r.resc_support == 2, "resolve: rescue counts only same-contig projections in range");
 	CHECK(r.resc_pos == 100700, "resolve: rescued position = upper median of the near projections");
 
-	// an exact mate is never moved, even when the projected mate's projections are near it
+	// projected mate 0 has nothing near exact mate 1 -> DISC; with trust_exact it moves onto mate 1
 	m[0] = mate(1, 3, 100000), m[1] = mate(2, 3, 300000);
 	m[0].n_proj = 4, m[0].proj_rsid = prs, m[0].proj_pos = ppos; // none near 300000
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_DISC, "resolve: projected mate without projections near the exact mate -> DISC");
+	rb3_pe_resolve(m, 1000, 1, &r);
+	CHECK(r.cls == RB3_PE_RESC && r.anchor == 1 && r.rescued == 0 && r.resc_pos == 300000 && r.resc_support == 0,
+		  "resolve: trust_exact moves the projected mate onto the exact mate");
+	{ // trust_exact never applies to two exact or two projected mates
+		rb3_pe_mate_t e[2];
+		e[0] = mate(2, 3, 5000), e[1] = mate(2, 3, 90000);
+		rb3_pe_resolve(e, 1000, 1, &r);
+		CHECK(r.cls == RB3_PE_DISC, "resolve: trust_exact leaves EXACT/EXACT discordant pairs alone");
+		e[0] = mate(1, 3, 5000), e[1] = mate(1, 3, 90000);
+		rb3_pe_resolve(e, 1000, 1, &r);
+		CHECK(r.cls == RB3_PE_DISC, "resolve: trust_exact leaves PLACED/PLACED discordant pairs alone");
+	}
+	{ // tie-break among an exact read's reference copies: the copy next to the projected mate wins
+		rb3_pe_mate_t e[2];
+		int64_t crs[3] = { 3, 3, 4 }, cpos[3] = { 300000, 100400, 100000 };
+		e[0] = mate(1, 3, 100000), e[1] = mate(2, 3, 300000); // exact mate reported at its first copy
+		e[1].n_proj = 3, e[1].proj_rsid = crs, e[1].proj_pos = cpos;
+		rb3_pe_resolve(e, 1000, 0, &r);
+		CHECK(r.cls == RB3_PE_RESC && r.anchor == 0 && r.rescued == 1 && r.resc_pos == 100400 && r.resc_support == 1,
+			  "resolve: exact mate moved to its reference copy next to the projected mate");
+		// if the projected mate ALSO has a projection near the exact copy, moving the projected mate wins
+		e[0].n_proj = 4, e[0].proj_rsid = prs, e[0].proj_pos = ppos; ppos[0] = 300200;
+		rb3_pe_resolve(e, 1000, 0, &r);
+		CHECK(r.cls == RB3_PE_RESC && r.anchor == 1 && r.rescued == 0 && r.resc_pos == 300200,
+			  "resolve: moving the less confident mate is preferred over moving the exact one");
+		ppos[0] = 180000;
+		// two exact mates: one of them has a copy near the other -> moved (tie on rank, support decides)
+		e[0] = mate(2, 3, 5000), e[1] = mate(2, 3, 300000);
+		e[1].n_proj = 3, e[1].proj_rsid = crs, e[1].proj_pos = cpos; cpos[1] = 5300;
+		rb3_pe_resolve(e, 1000, 0, &r);
+		CHECK(r.cls == RB3_PE_RESC && r.anchor == 0 && r.rescued == 1 && r.resc_pos == 5300, "resolve: EXACT/EXACT tie-break between copies");
+	}
 	m[1].pos = 180500; // now projection 180000 of mate 0 is near the exact mate 1
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_RESC && r.anchor == 1 && r.rescued == 0 && r.resc_pos == 180000, "resolve: rescue toward the exact mate 1");
 
 	// both projected and discordant: the mate with more agreeing projections is moved
 	m[0] = mate(1, 3, 100000), m[1] = mate(1, 3, 180000);
 	m[0].n_proj = 1, prs2[0] = 3, ppos2[0] = 179500, m[0].proj_rsid = prs2, m[0].proj_pos = ppos2; // 1 near mate 1
 	m[1].n_proj = 4, m[1].proj_rsid = prs, m[1].proj_pos = ppos; // 2 near mate 0
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_RESC && r.anchor == 0 && r.rescued == 1 && r.resc_support == 2, "resolve: projected pair -> move the better-supported mate");
 	m[1].n_proj = 2; // now mate 1 has only projection 180000 + 100700 -> 1 near mate 0: tie -> anchor 0
-	rb3_pe_resolve(m, 1000, &r);
+	rb3_pe_resolve(m, 1000, 0, &r);
 	CHECK(r.cls == RB3_PE_RESC && r.anchor == 0 && r.resc_support == 1 && r.resc_pos == 100700, "resolve: support tie -> anchor on mate 0");
 }
 

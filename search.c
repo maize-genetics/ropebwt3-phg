@@ -98,6 +98,7 @@ typedef struct {
 	int8_t paired;         // --paired: reads are mate pairs (two files R1/R2, or one interleaved file); 0 = single-end
 	double pe_mean, pe_sd; // --pe-isize=MEAN,SD: fixed insert-size distribution (pe_mean <= 0: estimate per batch)
 	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
+	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -213,9 +214,11 @@ typedef struct refmap_rst_s {
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
 	int32_t core_len; // length of the exact interval used (s->len, or the SMEM core)
 	int8_t capped;    // the occurrence sample hit RB3_RM_MAX_ASSEMBLY: gametes may be incomplete
-	int32_t n_proj;   // --paired + --lift: this read's per-assembly reference projections (for mate rescue)
+	int32_t n_proj;   // --paired: alternative reference positions for mate rescue -- per-assembly lift
+	                  // projections (PLACED) or every reference copy (EXACT)
 	int64_t *proj_rsid, *proj_pos; // allocated with RB3_MALLOC; NULL when n_proj == 0
-	int32_t *proj_gid; // gamete of each projection (NULL without --ps4g/--npy)
+	int32_t *proj_gid; // PLACED: gamete of each projection (NULL without --ps4g/--npy, and for EXACT)
+	int8_t *proj_strand; // EXACT: strand of each reference copy (NULL for PLACED)
 	int64_t occ; // --report-occ: raw FM-index interval size for the matched query (whole read, or the
 	             // matched SMEM core if there was no end-to-end match) -- 0 for UNPLACED and for
 	             // --kmer-mode results (no single whole-query interval exists there). Pangenome-wide:
@@ -773,6 +776,17 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 				ref_found = 1; // keep scanning: PS4G/npy need every sample sharing this exact sequence
 			}
 		}
+		if (ref_found && p->opt->paired) { // every reference copy: a mate can pick the right one
+			int32_t m = 0;
+			r->proj_rsid = RB3_MALLOC(int64_t, np), r->proj_pos = RB3_MALLOC(int64_t, np), r->proj_strand = RB3_MALLOC(int8_t, np);
+			for (i = 0; i < np; ++i) {
+				int64_t clen, st, en;
+				if (!p->is_ref[pos[i].sid>>1]) continue;
+				pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+				r->proj_rsid[m] = pos[i].sid>>1, r->proj_pos[m] = st, r->proj_strand[m++] = pos[i].sid&1;
+			}
+			r->n_proj = m;
+		}
 		if (ref_found) {
 			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
 				int32_t tmp[RB3_RM_MAX_ASSEMBLY], m;
@@ -1030,6 +1044,7 @@ static void write_refmap(step_t *t)
 		free(r->proj_rsid);
 		free(r->proj_pos);
 		free(r->proj_gid);
+		free(r->proj_strand);
 		free(t->seq[j].seq);
 		free(t->seq[j].name);
 	}
@@ -1090,7 +1105,7 @@ static void refmap_pair_batch(pipeline_t *p, step_t *t)
 			m[k].n_proj = r[k]->n_proj, m[k].proj_rsid = r[k]->proj_rsid, m[k].proj_pos = r[k]->proj_pos;
 			m[k].proj_gid = r[k]->proj_gid;
 		}
-		rb3_pe_resolve(m, max_dist, &t->pe[i]);
+		rb3_pe_resolve(m, max_dist, p->opt->pe_trust_exact, &t->pe[i]);
 		if (t->pe[i].cls == RB3_PE_RESC) { // move the mate; keep only founders whose own copy projected there
 			const rb3_pe_res_t *e = &t->pe[i];
 			refmap_rst_t *q = r[(int)e->rescued];
@@ -1099,7 +1114,12 @@ static void refmap_pair_batch(pipeline_t *p, step_t *t)
 				int32_t ng = rb3_pe_near_gametes(&m[(int)e->rescued], a->rsid, a->pos, max_dist, q->gametes);
 				if (ng > 0) q->n_gametes = ng; // q->gametes holds n_asm >= n_proj entries
 			}
-			q->ref_sid = e->resc_rsid, q->cL = q->cR = e->resc_pos;
+			if (q->status == RB3_RM_EXACT) { // moved to another reference copy: keep its length, take its strand
+				int32_t c;
+				for (c = 0; c < q->n_proj; ++c)
+					if (q->proj_rsid[c] == e->resc_rsid && q->proj_pos[c] == e->resc_pos) { q->strand = q->proj_strand[c]; break; }
+				q->cR = e->resc_pos + (q->cR - q->cL), q->cL = e->resc_pos, q->ref_sid = e->resc_rsid;
+			} else q->ref_sid = e->resc_rsid, q->cL = q->cR = e->resc_pos;
 		}
 		++p->pe_cnt[(int)t->pe[i].cls];
 	}
@@ -1933,6 +1953,7 @@ static ko_longopt_t long_options[] = {
 	{ "paired",              ko_no_argument,       370 },
 	{ "pe-isize",            ko_required_argument, 371 },
 	{ "pe-slack",            ko_required_argument, 372 },
+	{ "pe-trust-exact",      ko_no_argument,       373 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -2067,6 +2088,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg);      // --paired: discordance slack (bp)
+		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -2149,6 +2171,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC)\n");
 			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
 			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
+			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
+			fprintf(stderr, "                    PLACED mate onto the EXACT one (default: keep them as two events)\n");
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -2253,8 +2277,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
 		}
-	} else if (opt.pe_mean > 0) {
-		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize needs --paired\n");
+	} else if (opt.pe_mean > 0 || opt.pe_trust_exact) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact need --paired\n");
 		return 1;
 	}
 
