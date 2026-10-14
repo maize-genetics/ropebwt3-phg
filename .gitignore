@@ -38,3 +38,4 @@ experiments/ref-sensitivity/e4/*.log
 /test/test_lift
 /test/output/
 /test/tmp/
+test/test_pairing
