@@ -186,6 +186,7 @@ typedef struct refmap_rst_s {
 	struct refmap_rst_s *sub; // per-assembly mode: one placement per assembly
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
+	int32_t core_len; // length of the exact interval used (s->len, or the SMEM core)
 	int64_t occ; // --report-occ: raw FM-index interval size for the matched query (whole read, or the
 	             // matched SMEM core if there was no end-to-end match) -- 0 for UNPLACED and for
 	             // --kmer-mode results (no single whole-query interval exists there). Pangenome-wide:
@@ -527,6 +528,8 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 // the liftover (the E4 "second SSA"), instead of walking outward. The majority
 // reference sequence among the per-assembly projections wins; NULL projections
 // (no confident collinear support) are dropped, and if none survive -> UNPLACED.
+static int refmap_place_debug = 0; // RB3_PLACE_DEBUG=1: per-assembly projection trace (PLD lines) on stderr
+
 static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -538,6 +541,11 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 		if (rb3_lift_project(p->lift, km, (int32_t)(r->assemblies[k].sid >> 1), st,
 							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
 			rsids[n] = rsid, rposs[n] = rpos, ++n;
+		else rsid = -1, rpos = -1;
+		if (refmap_place_debug)
+			fprintf(stderr, "PLD\t%s\t%d\t%ld\t%s\t%ld\t%d\t%s\t%ld\n", s->name, r->core_len, (long)r->occ,
+					f->sid->name[r->assemblies[k].sid >> 1], (long)st, rb3_lift_last_path,
+					rsid >= 0? f->sid->name[rsid] : ".", (long)rpos);
 	}
 	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
 	for (k = 0, bestn = 0; k < n; ++k) {           // majority reference sequence
@@ -699,7 +707,8 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		kfree(km, mem.a);
 		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
-	}
+		r->core_len = bestlen;
+	} else r->core_len = s->len;
 	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/assembly-cap truncation
 	                  // below, so MULTI/EXACT/PLACED rows all carry the true occurrence count
 
@@ -1645,6 +1654,7 @@ static ko_longopt_t long_options[] = {
 	{ "lift-mad",        ko_required_argument, 315 },
 	{ "lift-local-win",  ko_required_argument, 360 },
 	{ "lift-local-tol",  ko_required_argument, 361 },
+	{ "lift-chain-nb",   ko_required_argument, 362 },
 	{ "kmer",            ko_required_argument, 316 },
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
@@ -1686,8 +1696,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
 	int64_t lift_local_win_opt = 0, lift_local_tol_opt = 1000; // --lift-local-win/--lift-local-tol
+	int32_t lift_chain_nb_opt = 0; // --lift-chain-nb
 
 	rb3_mopt_init(&opt);
+	if (getenv("RB3_PLACE_DEBUG")) refmap_place_debug = atoi(getenv("RB3_PLACE_DEBUG"));
 	p.opt = &opt, p.id = 0;
 	while ((c = ketopt(&o, argc, argv, 1, "Ll:c:t:K:MdN:A:B:O:E:C:m:k:uj:ey:a:w:p:bg:", long_options)) >= 0) {
 		if (c == 'L') is_line = 1;
@@ -1736,6 +1748,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 315) opt.lift_mad = rb3_parse_num(o.arg);
 		else if (c == 360) lift_local_win_opt = rb3_parse_num(o.arg);
 		else if (c == 361) lift_local_tol_opt = rb3_parse_num(o.arg);
+		else if (c == 362) lift_chain_nb_opt = atoi(o.arg);
 		else if (c == 316) opt.kmer_len = atoi(o.arg);    // k-mer-agreement placement (0 = off)
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
@@ -1827,6 +1840,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --lift-local-win=NUM  project via nearest collinear flanking anchors within NUM bp first,\n"
 			                "                    falling back to the --lift-win median (0 = off) [0]\n");
 			fprintf(stderr, "  --lift-local-tol=NUM  collinearity tolerance for --lift-local-win [1000]\n");
+			fprintf(stderr, "  --lift-chain-nb=INT   with --lift-local-win: drop anchors not collinear with one of their next\n"
+			                "                    INT anchors, project via the nearest kept anchors (0 = off) [0]\n");
 			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
 			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
@@ -2007,6 +2022,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.lift_fn) { // E4: load the assembly->reference liftover
 			rb3_lift_set_local(lift_local_win_opt, lift_local_tol_opt);
+			rb3_lift_set_chain(lift_chain_nb_opt);
 			p.lift = rb3_lift_restore(opt.lift_fn);
 			if (p.lift == 0) {
 				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);

@@ -21,6 +21,11 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 // collinearity tolerance local_tol bp) before the wide-window median. 0 = off.
 void rb3_lift_set_local(int64_t local_win, int64_t local_tol);
 
+// With local projection on, replace the flanking-pair rule by a chain-filtered one: keep
+// anchors collinear with one of their next nb anchors, interpolate between the nearest
+// kept anchors of the dominant reference/strand. 0 = off (flanking pair).
+void rb3_lift_set_chain(int32_t nb);
+
 // Like rb3_lift_project, but when the locus is not colinear (a PAV/insertion between
 // the flanking anchors) it returns the nearest reference anchor = the closest
 // breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0).
@@ -57,5 +62,7 @@ int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_
 int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh);
 
 int main_lift(int argc, char *argv[]);
+
+extern __thread int rb3_lift_last_path;
 
 #endif

@@ -232,6 +232,7 @@ static int64_t i64_median(int64_t *a, int64_t n)
 // lift_local_win are used directly if they are collinear with each other; otherwise
 // the wide median runs unchanged, so no read that projected before fails now.
 static int64_t lift_local_win = 0, lift_local_tol = 1000;
+__thread int rb3_lift_last_path; // debug: 0 fail, 1 local, 2 wide median, 3 breakpoint
 
 void rb3_lift_set_local(int64_t local_win, int64_t local_tol)
 {
@@ -281,6 +282,107 @@ static int lift_project_local(const rb3_lift_t *lf, int32_t csid, int64_t cpos,
 	return 0;
 }
 
+// Optional ROBUST local projection (lift_chain_nb > 0; replaces lift_project_local).
+// lift_project_local trusts the two anchors immediately flanking the hit. At s200 a
+// stray anchor (a B73-unique k-mer whose assembly copy is a TE/paralog elsewhere) sits
+// next to most hits in divergent sequence, so the flanking pair is "not collinear" and
+// the hit falls through to the 500kb median, which lands 10-100kb off (in-panel Ki3
+// 0.1x: 24% of per-assembly projections, only 4% of them within 2kb of the truth).
+// Here an anchor is kept only if it is collinear with one of its next nb anchors (real
+// alignment chains come in runs of anchors, strays are singletons); the dominant
+// (reference sequence, strand) among the kept anchors wins; the hit is interpolated
+// between the nearest kept anchors on each side when they agree, else extrapolated
+// from the nearer one and clamped between the two. Kept anchors whose diagonal is more
+// than max_mad from the dominant set's median diagonal are ignored too (chained strays:
+// a TE copy elsewhere on the same chromosome also yields runs of collinear anchors).
+// Windows: 5*local_win, then win; failing both, the wide median below runs unchanged.
+static int32_t lift_chain_nb = 0;
+
+void rb3_lift_set_chain(int32_t nb) { lift_chain_nb = nb; }
+
+static int i64_cmp(const void *x, const void *y)
+{
+	int64_t a = *(const int64_t*)x, b = *(const int64_t*)y;
+	return a < b? -1 : a > b;
+}
+
+static int lift_project_chain_win(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos, int64_t W, int64_t D,
+								  int64_t *out_rsid, int64_t *out_rpos)
+{
+	const rb3_liftpt_t *pt = lf->pt;
+	int64_t lo = lf->off[csid], hi = lf->off[csid + 1], a, b, n, i, k, l, r, best_key = -1, best_n = 0;
+	int8_t *sg;
+	int64_t vals[256], cnts[256]; int nv = 0, u;
+	l = lo, r = hi; while (l < r) { int64_t m = (l + r) >> 1; if (pt[m].cpos < cpos - W) l = m + 1; else r = m; } a = l;
+	l = a, r = hi; while (l < r) { int64_t m = (l + r) >> 1; if (pt[m].cpos <= cpos + W) l = m + 1; else r = m; } b = l;
+	n = b - a;
+	if (n < 2) return 0;
+	sg = Kcalloc(km, int8_t, n);
+	for (i = 0; i < n; ++i)
+		for (k = 1; k <= lift_chain_nb && i + k < n; ++k) {
+			int s = lift_collinear(&pt[a + i], &pt[a + i + k], lift_local_tol);
+			if (s == 0) continue;
+			if (sg[i] == 0) sg[i] = s;
+			if (sg[i + k] == 0) sg[i + k] = s;
+		}
+	for (i = 0; i < n; ++i) { // tally (rsid, strand) over kept anchors
+		int64_t key, f = -1;
+		if (sg[i] == 0) continue;
+		key = (int64_t)pt[a + i].rsid * 2 + (sg[i] > 0);
+		for (u = 0; u < nv; ++u) if (vals[u] == key) { f = u; break; }
+		if (f < 0) { if (nv < 256) vals[nv] = key, cnts[nv++] = 1; }
+		else ++cnts[f];
+	}
+	for (u = 0; u < nv; ++u) if (cnts[u] > best_n) best_n = cnts[u], best_key = vals[u];
+	if (best_n < 2) { kfree(km, sg); return 0; }
+	{
+		const rb3_liftpt_t *L = 0, *R = 0;
+		int s = (best_key & 1)? 1 : -1;
+		int64_t *dg = Kmalloc(km, int64_t, best_n), nd = 0, med;
+		for (i = 0; i < n; ++i) // median diagonal of the dominant chain set: excludes chained TE/paralog strays
+			if (sg[i] != 0 && (int64_t)pt[a + i].rsid * 2 + (sg[i] > 0) == best_key)
+				dg[nd++] = pt[a + i].rpos - s * pt[a + i].cpos;
+		qsort(dg, nd, 8, i64_cmp);
+		med = dg[nd >> 1];
+		kfree(km, dg);
+		for (i = 0; i < n; ++i) {
+			const rb3_liftpt_t *p = &pt[a + i];
+			if (sg[i] == 0 || (int64_t)p->rsid * 2 + (sg[i] > 0) != best_key) continue;
+			if (llabs(p->rpos - s * p->cpos - med) > D) continue;
+			if (p->cpos <= cpos) L = p;
+			else { R = p; break; }
+		}
+		kfree(km, sg);
+		if (!L && !R) return 0;
+		*out_rsid = best_key >> 1;
+		if (L && R) {
+			int64_t dL = cpos - L->cpos, dR = R->cpos - cpos;
+			int64_t vL = L->rpos + s * dL, vR = R->rpos - s * dR, v, x0, x1;
+			x0 = L->rpos < R->rpos? L->rpos : R->rpos, x1 = L->rpos < R->rpos? R->rpos : L->rpos;
+			if (llabs(vL - vR) <= lift_local_tol) v = L->rpos + (int64_t)((double)(R->rpos - L->rpos) * dL / (dL + dR > 0? dL + dR : 1) + .5);
+			else v = dL <= dR? vL : vR;
+			*out_rpos = v < x0? x0 : v > x1? x1 : v;
+		} else {
+			const rb3_liftpt_t *N = L? L : R;
+			*out_rpos = N->rpos + s * (cpos - N->cpos);
+			if (*out_rpos < 0) *out_rpos = 0;
+		}
+		return 1;
+	}
+}
+
+static int lift_project_chain(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos, int64_t win, int64_t max_mad,
+							  int64_t *out_rsid, int64_t *out_rpos)
+{
+	int64_t W[2]; int t;
+	W[0] = 5 * lift_local_win, W[1] = win;
+	for (t = 0; t < 2; ++t) {
+		if (t > 0 && W[t] <= W[t-1]) continue;
+		if (lift_project_chain_win(lf, km, csid, cpos, W[t], max_mad, out_rsid, out_rpos)) return 1;
+	}
+	return 0;
+}
+
 // Core projector. Finds the reference coordinate for a assembly hit by fitting a
 // colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
 // colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
@@ -295,7 +397,10 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
 	int64_t *resP, *resM, madP, madM, med;
 	rb3_liftpt_t *pt = lf->pt;
-	if (lift_local_win > 0 && lift_project_local(lf, csid, cpos, out_rsid, out_rpos)) {
+	rb3_lift_last_path = 0;
+	if (lift_local_win > 0 && (lift_chain_nb > 0? lift_project_chain(lf, km, csid, cpos, win, max_mad, out_rsid, out_rpos)
+	                                             : lift_project_local(lf, csid, cpos, out_rsid, out_rpos))) {
+		rb3_lift_last_path = 1;
 		if (out_mode) *out_mode = 0;
 		return 1;
 	}
@@ -359,6 +464,7 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 				}
 				if (bp < 0) return 0;
 				*out_rsid = best_rsid, *out_rpos = bp;
+				rb3_lift_last_path = 3;
 				if (out_mode) *out_mode = 1;
 				return 1;
 			}
@@ -366,6 +472,7 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	}
 	*out_rsid = best_rsid;
 	*out_rpos = sign * cpos + med;
+	rb3_lift_last_path = 2;
 	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
 	if (out_mode) *out_mode = 0;
 	kfree(km, resP); kfree(km, resM);
