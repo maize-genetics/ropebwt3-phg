@@ -296,9 +296,12 @@ static int lift_project_local(const rb3_lift_t *lf, int32_t csid, int64_t cpos,
 // than max_mad from the dominant set's median diagonal are ignored too (chained strays:
 // a TE copy elsewhere on the same chromosome also yields runs of collinear anchors).
 // Windows: 5*local_win, then win; failing both, the wide median below runs unchanged.
-static int32_t lift_chain_nb = 0;
+static int32_t lift_chain_nb = 0, lift_chain_interp = 0;
 
-void rb3_lift_set_chain(int32_t nb) { lift_chain_nb = nb; }
+void rb3_lift_set_chain(int32_t nb, int interp)
+{
+	lift_chain_nb = nb, lift_chain_interp = interp;
+}
 
 static int i64_cmp(const void *x, const void *y)
 {
@@ -359,7 +362,7 @@ static int lift_project_chain_win(const rb3_lift_t *lf, void *km, int32_t csid, 
 			int64_t dL = cpos - L->cpos, dR = R->cpos - cpos;
 			int64_t vL = L->rpos + s * dL, vR = R->rpos - s * dR, v, x0, x1;
 			x0 = L->rpos < R->rpos? L->rpos : R->rpos, x1 = L->rpos < R->rpos? R->rpos : L->rpos;
-			if (llabs(vL - vR) <= lift_local_tol) v = L->rpos + (int64_t)((double)(R->rpos - L->rpos) * dL / (dL + dR > 0? dL + dR : 1) + .5);
+			if (llabs(vL - vR) <= lift_local_tol || lift_chain_interp) v = L->rpos + (int64_t)((double)(R->rpos - L->rpos) * dL / (dL + dR > 0? dL + dR : 1) + .5);
 			else v = dL <= dR? vL : vR;
 			*out_rpos = v < x0? x0 : v > x1? x1 : v;
 		} else {

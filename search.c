@@ -1655,6 +1655,7 @@ static ko_longopt_t long_options[] = {
 	{ "lift-local-win",  ko_required_argument, 360 },
 	{ "lift-local-tol",  ko_required_argument, 361 },
 	{ "lift-chain-nb",   ko_required_argument, 362 },
+	{ "lift-chain-interp", ko_no_argument,     363 },
 	{ "kmer",            ko_required_argument, 316 },
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
@@ -1696,7 +1697,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
 	int64_t lift_local_win_opt = 0, lift_local_tol_opt = 1000; // --lift-local-win/--lift-local-tol
-	int32_t lift_chain_nb_opt = 0; // --lift-chain-nb
+	int32_t lift_chain_nb_opt = 0, lift_chain_interp_opt = 0; // --lift-chain-nb, --lift-chain-interp
 
 	rb3_mopt_init(&opt);
 	if (getenv("RB3_PLACE_DEBUG")) refmap_place_debug = atoi(getenv("RB3_PLACE_DEBUG"));
@@ -1749,6 +1750,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 360) lift_local_win_opt = rb3_parse_num(o.arg);
 		else if (c == 361) lift_local_tol_opt = rb3_parse_num(o.arg);
 		else if (c == 362) lift_chain_nb_opt = atoi(o.arg);
+		else if (c == 363) lift_chain_interp_opt = 1;
 		else if (c == 316) opt.kmer_len = atoi(o.arg);    // k-mer-agreement placement (0 = off)
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
@@ -1842,6 +1844,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --lift-local-tol=NUM  collinearity tolerance for --lift-local-win [1000]\n");
 			fprintf(stderr, "  --lift-chain-nb=INT   with --lift-local-win: drop anchors not collinear with one of their next\n"
 			                "                    INT anchors, project via the nearest kept anchors (0 = off) [0]\n");
+			fprintf(stderr, "  --lift-chain-interp   with --lift-chain-nb: interpolate across indels between the kept\n"
+			                "                    anchors instead of extrapolating from the nearer one\n");
 			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
 			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
@@ -2022,7 +2026,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.lift_fn) { // E4: load the assembly->reference liftover
 			rb3_lift_set_local(lift_local_win_opt, lift_local_tol_opt);
-			rb3_lift_set_chain(lift_chain_nb_opt);
+			rb3_lift_set_chain(lift_chain_nb_opt, lift_chain_interp_opt);
 			p.lift = rb3_lift_restore(opt.lift_fn);
 			if (p.lift == 0) {
 				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);

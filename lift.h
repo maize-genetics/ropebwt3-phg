@@ -23,8 +23,10 @@ void rb3_lift_set_local(int64_t local_win, int64_t local_tol);
 
 // With local projection on, replace the flanking-pair rule by a chain-filtered one: keep
 // anchors collinear with one of their next nb anchors, interpolate between the nearest
-// kept anchors of the dominant reference/strand. 0 = off (flanking pair).
-void rb3_lift_set_chain(int32_t nb);
+// kept anchors of the dominant reference/strand. 0 = off (flanking pair). interp: always
+// interpolate between the nearest kept anchors (else extrapolate from the nearer one when
+// the two disagree).
+void rb3_lift_set_chain(int32_t nb, int interp);
 
 // Like rb3_lift_project, but when the locus is not colinear (a PAV/insertion between
 // the flanking anchors) it returns the nearest reference anchor = the closest
