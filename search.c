@@ -9,6 +9,7 @@
 #include "lift.h"
 #include "ps4g.h"
 #include "hitcount.h"
+#include "pairing.h"
 #include "khashl-km.h"
 
 KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
@@ -94,6 +95,9 @@ typedef struct {
 	int64_t support_win;   // chain --support=best --lift: an assembly-only SMEM counts only if it
 	                       // projects within this many bp of the chain's reference span (0 = no check)
 	int8_t dup_count;      // chain: a read named "<name>;x=N" stands for N identical reads (PS4G/npy counts)
+	int8_t paired;         // --paired: reads are mate pairs (two files R1/R2, or one interleaved file); 0 = single-end
+	double pe_mean, pe_sd; // --pe-isize=MEAN,SD: fixed insert-size distribution (pe_mean <= 0: estimate per batch)
+	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -132,6 +136,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
 	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
+	opt->paired = 0, opt->pe_mean = 0.0, opt->pe_sd = 0.0; // single-end by default; insert size estimated per batch
+	opt->pe_slack = 2000;  // lift projections are typically within ~2kb (the --anchor-dist-thresh scale)
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -172,6 +178,11 @@ typedef struct {
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
+	rb3_seqio_t *fp2;        // --paired with two files: the R2 stream (NULL: interleaved, or single-end)
+	rb3_isize_t isize;       // --paired: insert-size distribution in use (fixed, or the latest good batch estimate)
+	int isize_fixed;         // --paired: isize came from --pe-isize; never re-estimated
+	int64_t pe_cnt[5];       // --paired: pairs per RB3_PE_* class
+	int pe_warned;           // --paired: the "too few pairs to estimate" warning was printed
 } pipeline_t;
 
 typedef struct {
@@ -201,6 +212,10 @@ typedef struct refmap_rst_s {
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
 	int32_t core_len; // length of the exact interval used (s->len, or the SMEM core)
+	int8_t capped;    // the occurrence sample hit RB3_RM_MAX_ASSEMBLY: gametes may be incomplete
+	int32_t n_proj;   // --paired + --lift: this read's per-assembly reference projections (for mate rescue)
+	int64_t *proj_rsid, *proj_pos; // allocated with RB3_MALLOC; NULL when n_proj == 0
+	int32_t *proj_gid; // gamete of each projection (NULL without --ps4g/--npy)
 	int64_t occ; // --report-occ: raw FM-index interval size for the matched query (whole read, or the
 	             // matched SMEM core if there was no end-to-end match) -- 0 for UNPLACED and for
 	             // --kmer-mode results (no single whole-query interval exists there). Pangenome-wide:
@@ -218,6 +233,7 @@ typedef struct {
 	rb3_swrst_t *rst, *rst_rev;
 	m_hapdiv_t *hapdiv;
 	refmap_rst_t *refmap; // refmap: one entry per query
+	rb3_pe_res_t *pe;     // --paired: one entry per mate pair (seq[2i], seq[2i+1])
 	m_tbuf_t *buf;
 } step_t;
 
@@ -551,13 +567,13 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 {
 	const rb3_fmi_t *f = &p->fmi;
 	int64_t rsids[RB3_RM_MAX_ASSEMBLY], rposs[RB3_RM_MAX_ASSEMBLY], best_rsid = -1, med, v[RB3_RM_MAX_ASSEMBLY];
-	int32_t n = 0, k, j, bestn, m;
+	int32_t n = 0, k, j, bestn, m, gids[RB3_RM_MAX_ASSEMBLY];
 	for (k = 0; k < r->n_asm_list && n < RB3_RM_MAX_ASSEMBLY; ++k) {
 		int64_t clen, st, en, rsid, rpos;
 		pos_stranded(f->sid, &r->assemblies[k], s->len, &clen, &st, &en);
 		if (rb3_lift_project(p->lift, km, (int32_t)(r->assemblies[k].sid >> 1), st,
 							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
-			rsids[n] = rsid, rposs[n] = rpos, ++n;
+			gids[n] = p->gtab? p->gtab->sid2g[r->assemblies[k].sid >> 1] : -1, rsids[n] = rsid, rposs[n] = rpos, ++n;
 		else rsid = -1, rpos = -1;
 		if (refmap_place_debug)
 			fprintf(stderr, "PLD\t%s\t%d\t%ld\t%s\t%ld\t%d\t%s\t%ld\n", s->name, r->core_len, (long)r->occ,
@@ -565,6 +581,12 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 					rsid >= 0? f->sid->name[rsid] : ".", (long)rpos);
 	}
 	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
+	if (p->opt->paired) { // keep every projection: a mate placed far from this one may find one near it
+		r->n_proj = n;
+		r->proj_rsid = RB3_MALLOC(int64_t, n), r->proj_pos = RB3_MALLOC(int64_t, n);
+		memcpy(r->proj_rsid, rsids, n * sizeof(int64_t)), memcpy(r->proj_pos, rposs, n * sizeof(int64_t));
+		if (p->gtab) r->proj_gid = RB3_MALLOC(int32_t, n), memcpy(r->proj_gid, gids, n * sizeof(int32_t));
+	}
 	for (k = 0, bestn = 0; k < n; ++k) {           // majority reference sequence
 		int32_t c = 0;
 		for (j = 0; j < n; ++j) if (rsids[j] == rsids[k]) ++c;
@@ -739,6 +761,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	// locate a sample of occurrences; separate reference hits (exact) from assemblies
 	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
 	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_ASSEMBLY, pos);
+	r->capped = (np >= RB3_RM_MAX_ASSEMBLY);
 	{
 		int ref_found = 0;
 		for (i = 0; i < np; ++i) {
@@ -944,6 +967,26 @@ static void refmap_count_hit(const pipeline_t *p, int8_t status)
 	rb3_hitcount_add(&((pipeline_t*)p)->hitcount, status == RB3_RM_PLACED || status == RB3_RM_EXACT);
 }
 
+// --paired: the single PS4G/npy event of a pair, at the anchor mate a's position, carrying the
+// founders both mates share (rb3_pe_event_gametes). --ps4g-per-read gets one line, named after
+// the fragment (the mate name without "/1" or "/2").
+static void refmap_pair_event(const pipeline_t *p, const m_seq_t *s, const refmap_rst_t *a, const refmap_rst_t *b)
+{
+	int32_t *g, n, k;
+	if (a->n_gametes <= 0 && b->n_gametes <= 0) return;
+	g = RB3_MALLOC(int32_t, a->n_gametes + b->n_gametes);
+	n = rb3_pe_event_gametes(a->gametes, a->n_gametes, a->capped, b->gametes, b->n_gametes, b->capped, g);
+	if (n > 0 && p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, a->ref_sid, a->cL, g, n);
+	if (n > 0 && p->ps4g_per_read_fp) {
+		const char *nm = p->fmi.sid->name[a->ref_sid], *us = strchr(nm, '_');
+		fprintf(p->ps4g_per_read_fp, "%.*s\t%s\t%ld\t", s->name? rb3_pe_name_len(s->name) : 1, s->name? s->name : "?",
+				us? us + 1 : nm, (long)a->cL);
+		for (k = 0; k < n; ++k) fprintf(p->ps4g_per_read_fp, "%s%d", k? "," : "", g[k]);
+		fputc('\n', p->ps4g_per_read_fp);
+	}
+	free(g);
+}
+
 static void write_refmap(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -966,17 +1009,100 @@ static void write_refmap(step_t *t)
 			free(r->sub);
 		} else {
 			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ);
+			if (t->pe) { // --paired: one extra column, the pair class (MOVED = this mate was rescued)
+				const rb3_pe_res_t *e = &t->pe[j >> 1];
+				out.l--; // drop the newline
+				rb3_sprintf_lite(&out, "\t%s\n", e->cls == RB3_PE_RESC && e->rescued == (j & 1)? "MOVED" : rb3_pe_class_str[(int)e->cls]);
+			}
 			fputs(out.s, stdout);
-			refmap_rst_accumulate(p->ps4g_acc, r);
-			write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
+			if (t->pe == 0 || t->pe[j >> 1].cls == RB3_PE_DISC) { // single-end, or a discordant mate: its own event
+				refmap_rst_accumulate(p->ps4g_acc, r);
+				write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
+			} else if (t->pe[j >> 1].anchor == (j & 1)) // one event per pair, at the anchor mate
+				refmap_pair_event(p, s, r, &t->refmap[j ^ 1]);
 			refmap_count_hit(p, r->status);
 		}
+	}
+	for (j = 0; j < t->n_seq; ++j) { // after all rows: a pair event reads its mate's gametes
+		refmap_rst_t *r = &t->refmap[j];
 		free(r->assemblies);
 		free(r->gametes);
-		free(s->seq);
-		free(s->name);
+		free(r->proj_rsid);
+		free(r->proj_pos);
+		free(r->proj_gid);
+		free(t->seq[j].seq);
+		free(t->seq[j].name);
 	}
 	free(out.s);
+}
+
+/********************************************************************
+ * --paired: mate pairing over one batch (refmap)
+ ********************************************************************/
+#define RB3_PE_MIN_PAIRS       25   // fewest EXACT-EXACT pairs for a batch's own insert-size estimate
+#define RB3_PE_DEFAULT_MAX_INS 1000 // max insert used until some batch yields an estimate
+
+static inline int8_t refmap_pe_rank(const refmap_rst_t *r)
+{
+	if (r->ref_sid < 0) return 0;
+	return r->status == RB3_RM_EXACT? 2 : r->status == RB3_RM_PLACED? 1 : 0;
+}
+
+// Estimate the insert size from the batch's confidently placed pairs (both mates EXACT on one
+// contig, opposite strands; span = fragment end - fragment start), then classify every pair
+// and move rescued mates next to their anchor. Runs in pipeline step 1, which kt_pipeline
+// serializes across batches, so updating p->isize / p->pe_cnt here is race-free.
+static void refmap_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	int64_t max_dist;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	if (!p->isize_fixed) {
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		rb3_isize_t is;
+		for (i = 0; i < n_pair; ++i) {
+			const refmap_rst_t *a = &t->refmap[2*i], *b = &t->refmap[2*i+1];
+			if (a->status != RB3_RM_EXACT || b->status != RB3_RM_EXACT) continue;
+			if (a->ref_sid != b->ref_sid || a->strand == b->strand) continue;
+			span[n_span++] = (a->cR > b->cR? a->cR : b->cR) - (a->cL < b->cL? a->cL : b->cL);
+		}
+		if (rb3_pe_isize_estimate(span, n_span, RB3_PE_MIN_PAIRS, &is)) {
+			p->isize = is;
+			if (rb3_verbose >= 3)
+				fprintf(stderr, "[M::%s] insert size from %d pairs: mean %.1f, sd %.1f, max %ld\n",
+						__func__, is.n, is.mean, is.sd, (long)is.max_ins);
+		} else if (!p->isize.ok && !p->pe_warned && rb3_verbose >= 2) {
+			fprintf(stderr, "WARNING: only %d confidently placed pairs in a batch (need %d) to estimate the insert size; "
+							"using max insert %d until one does (or pass --pe-isize)\n", n_span, RB3_PE_MIN_PAIRS, RB3_PE_DEFAULT_MAX_INS);
+			p->pe_warned = 1;
+		}
+		free(span);
+	}
+	max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	for (i = 0; i < n_pair; ++i) {
+		refmap_rst_t *r[2];
+		rb3_pe_mate_t m[2];
+		int k;
+		r[0] = &t->refmap[2*i], r[1] = &t->refmap[2*i+1];
+		for (k = 0; k < 2; ++k) {
+			m[k].rank = refmap_pe_rank(r[k]);
+			m[k].rsid = r[k]->ref_sid, m[k].pos = r[k]->cL;
+			m[k].n_proj = r[k]->n_proj, m[k].proj_rsid = r[k]->proj_rsid, m[k].proj_pos = r[k]->proj_pos;
+			m[k].proj_gid = r[k]->proj_gid;
+		}
+		rb3_pe_resolve(m, max_dist, &t->pe[i]);
+		if (t->pe[i].cls == RB3_PE_RESC) { // move the mate; keep only founders whose own copy projected there
+			const rb3_pe_res_t *e = &t->pe[i];
+			refmap_rst_t *q = r[(int)e->rescued];
+			const rb3_pe_mate_t *a = &m[(int)e->anchor];
+			if (q->proj_gid && q->gametes) {
+				int32_t ng = rb3_pe_near_gametes(&m[(int)e->rescued], a->rsid, a->pos, max_dist, q->gametes);
+				if (ng > 0) q->n_gametes = ng; // q->gametes holds n_asm >= n_proj entries
+			}
+			q->ref_sid = e->resc_rsid, q->cL = q->cR = e->resc_pos;
+		}
+		++p->pe_cnt[(int)t->pe[i].cls];
+	}
 }
 
 /********************************************************************
@@ -1665,16 +1791,37 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		int64_t len, tot = 0;
 		int32_t n_seq = 0, m_seq = 0;
 		m_seq_t *seq = 0;
-		while (!rb3_hitcount_reached(&p->hitcount) && (ss = rb3_seq_read1(p->fp, &len, &name)) != 0) { // read sequences
-			m_seq_t *s;
-			RB3_GROW0(m_seq_t, seq, n_seq, m_seq);
-			s = &seq[n_seq++];
-			s->name = name? rb3_strdup(name) : 0;
-			s->seq = (uint8_t*)rb3_strdup(ss);
-			s->len = len;
-			s->id = p->id++;
-			s->mem = 0, s->n_mem = 0;
-			tot += len;
+		while (!rb3_hitcount_reached(&p->hitcount)) { // read sequences; --paired: whole mate pairs only
+			int32_t k, nm = p->opt->paired? 2 : 1;
+			for (k = 0; k < nm; ++k) {
+				m_seq_t *s;
+				if ((ss = rb3_seq_read1(k == 1 && p->fp2? p->fp2 : p->fp, &len, &name)) == 0) break;
+				RB3_GROW0(m_seq_t, seq, n_seq, m_seq);
+				s = &seq[n_seq++];
+				s->name = name? rb3_strdup(name) : 0;
+				s->seq = (uint8_t*)rb3_strdup(ss);
+				s->len = len;
+				s->id = p->id++;
+				s->mem = 0, s->n_mem = 0;
+				tot += len;
+			}
+			if (k == 0) { // end of input
+				if (p->fp2 && rb3_seq_read1(p->fp2, &len, &name) != 0) {
+					fprintf(stderr, "ERROR: --paired: the second file has more reads than the first\n");
+					exit(1);
+				}
+				break;
+			}
+			if (k < nm) {
+				fprintf(stderr, "ERROR: --paired: %s\n", p->fp2? "the first file has more reads than the second"
+						: "odd number of reads in the interleaved file");
+				exit(1);
+			}
+			if (nm == 2 && !rb3_pe_names_match(seq[n_seq-2].name, seq[n_seq-1].name)) {
+				fprintf(stderr, "ERROR: --paired: reads '%s' and '%s' are not mates (names must match up to /1 /2)\n",
+						seq[n_seq-2].name? seq[n_seq-2].name : "?", seq[n_seq-1].name? seq[n_seq-1].name : "?");
+				exit(1);
+			}
 			if (tot >= p->opt->batch_size)
 				break;
 		}
@@ -1710,6 +1857,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			kt_for(p->opt->n_threads, worker_for_hapdiv, in, t->n_hapdiv);
 		else
 			kt_for(p->opt->n_threads, worker_for_seq, in, t->n_seq);
+		if (p->opt->paired && p->opt->algo == RB3_SA_REFMAP)
+			refmap_pair_batch(p, t);
 		return in;
 	} else if (step == 2) {
 		for (i = 0; i < p->opt->n_threads; ++i) {
@@ -1720,7 +1869,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		if (p->opt->algo == RB3_SA_HAPDIV)
 			write_hapdiv(t);
 		else if (p->opt->algo == RB3_SA_REFMAP)
-			write_refmap(t), free(t->refmap);
+			write_refmap(t), free(t->refmap), free(t->pe);
 		else
 			write_per_seq(t);
 		free(t->seq);
@@ -1781,6 +1930,9 @@ static ko_longopt_t long_options[] = {
 	{ "support-tol",         ko_required_argument, 346 },
 	{ "support-win",         ko_required_argument, 347 },
 	{ "dup-count",           ko_no_argument,       348 },
+	{ "paired",              ko_no_argument,       370 },
+	{ "pe-isize",            ko_required_argument, 371 },
+	{ "pe-slack",            ko_required_argument, 372 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1907,6 +2059,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 346) opt.support_tol = atoi(o.arg);            // chain --support=best: coverage tolerance (bases)
 		else if (c == 347) opt.support_win = rb3_parse_num(o.arg);   // chain --support=best: lift proximity window
 		else if (c == 348) opt.dup_count = 1;                        // chain: "<name>;x=N" reads count N times
+		else if (c == 370) opt.paired = 1;                           // mate pairs: R1 R2, or one interleaved file
+		else if (c == 371) {                                         // --paired: fixed insert size MEAN,SD
+			if (sscanf(o.arg, "%lf,%lf", &opt.pe_mean, &opt.pe_sd) != 2 || opt.pe_mean <= 0 || opt.pe_sd < 0) {
+				fprintf(stderr, "ERROR: --pe-isize must be MEAN,SD (MEAN > 0, SD >= 0)\n");
+				return 1;
+			}
+		}
+		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg);      // --paired: discordance slack (bp)
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1982,6 +2142,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
 			usage_anchor_dist(&opt);
+			fprintf(stderr, "  --paired          reads are mate pairs: <R1.fq> <R2.fq>, or one interleaved file. Each\n");
+			fprintf(stderr, "                    pair adds ONE PS4G/npy event (the founders both mates share) at the\n");
+			fprintf(stderr, "                    better-placed mate; a projected mate far from its mate is moved next\n");
+			fprintf(stderr, "                    to it when one of its assembly projections lands there; stdout gains\n");
+			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC)\n");
+			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
+			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -2075,6 +2242,22 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		return 0;
 	}
 
+	if (opt.paired) { // check the paired-end setup before the (slow) index load
+		int n_files = argc - o.ind - 1;
+		const char *err = 0;
+		if (opt.algo != RB3_SA_REFMAP) err = "--paired is implemented for refmap only so far";
+		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";
+		else if (is_line) err = "--paired needs read names (FASTA/FASTQ), not -L";
+		else if (n_files != 1 && n_files != 2) err = "--paired takes <R1.fq> <R2.fq> or one interleaved file";
+		if (err) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
+			return 1;
+		}
+	} else if (opt.pe_mean > 0) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize needs --paired\n");
+		return 1;
+	}
+
 	ret = rb3_fmi_load_all(&p.fmi, argv[o.ind], load_flag);
 	if (ret < 0) return 1;
 	if (opt.max_pos > 0 && (p.fmi.ssa == 0 || p.fmi.sid == 0)) {
@@ -2089,6 +2272,12 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.lift_ridx = 0, p.ref_seq = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
+	p.fp2 = 0, p.isize_fixed = 0, p.pe_warned = 0;
+	memset(&p.isize, 0, sizeof(p.isize)), memset(p.pe_cnt, 0, sizeof(p.pe_cnt));
+	if (opt.pe_mean > 0) { // --pe-isize: same max-insert rule as the estimator (mean + 4 sd)
+		p.isize.ok = 1, p.isize_fixed = 1, p.isize.mean = opt.pe_mean, p.isize.sd = opt.pe_sd;
+		p.isize.max_ins = (int64_t)(opt.pe_mean + 4.0 * opt.pe_sd + .5);
+	}
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
 		int64_t k, plen;
@@ -2233,7 +2422,25 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
 		puts("CC");
 	}
-	for (j = o.ind + 1; j < argc; ++j) {
+	if (opt.paired) { // one pass over R1 (+ R2, or interleaved)
+		p.fp = rb3_seq_open(argv[o.ind + 1], is_line);
+		if (p.fp && argc - o.ind - 1 == 2) p.fp2 = rb3_seq_open(argv[o.ind + 2], is_line);
+		if (p.fp == 0 || (argc - o.ind - 1 == 2 && p.fp2 == 0)) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "ERROR: failed to load the sequence file '%s'\n", p.fp == 0? argv[o.ind + 1] : argv[o.ind + 2]);
+		} else kt_pipeline(2, worker_pipeline, &p, 3);
+		if (p.fp) rb3_seq_close(p.fp);
+		if (p.fp2) rb3_seq_close(p.fp2);
+		if (rb3_verbose >= 3) {
+			int64_t tot = 0;
+			for (j = 0; j < 5; ++j) tot += p.pe_cnt[j];
+			fprintf(stderr, "[M::%s] %ld pairs: %ld CONC, %ld RESC, %ld SOLO, %ld DISC, %ld NONE; insert size %s mean %.1f sd %.1f max %ld (+%ld slack)\n",
+					__func__, (long)tot, (long)p.pe_cnt[RB3_PE_CONC], (long)p.pe_cnt[RB3_PE_RESC], (long)p.pe_cnt[RB3_PE_SOLO],
+					(long)p.pe_cnt[RB3_PE_DISC], (long)p.pe_cnt[RB3_PE_NONE], p.isize_fixed? "(fixed)" : "(estimated)",
+					p.isize.mean, p.isize.sd, (long)(p.isize.ok? p.isize.max_ins : RB3_PE_DEFAULT_MAX_INS), (long)opt.pe_slack);
+		}
+	}
+	for (j = o.ind + 1; !opt.paired && j < argc; ++j) {
 		if (rb3_hitcount_reached(&p.hitcount)) break; // --target-hits already satisfied; skip remaining input files
 		p.fp = rb3_seq_open(argv[j], is_line);
 		if (p.fp == 0) {

@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o
+			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o pairing.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -54,15 +54,22 @@ test/test_lift.o:test/test_lift.c lift.h ps4g.h rb3priv.h
 test/test_lift:test/test_lift.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o
 		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
 
-test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift
+test/test_pairing.o:test/test_pairing.c pairing.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_pairing:test/test_pairing.o pairing.o
+		$(CC) $(CFLAGS) $^ -o $@ -lm
+
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
 		./test/test_lift
+		./test/test_pairing
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
