@@ -269,6 +269,55 @@ static void test_concordant_hits(void)
 	}
 }
 
+static rb3_pe_chain_t cm(int kind, int64_t rsid, int64_t lo, int64_t hi, int strand, int32_t bases)
+{
+	rb3_pe_chain_t c;
+	c.kind = kind, c.rsid = rsid, c.lo = lo, c.hi = hi, c.strand = strand, c.bases = bases;
+	return c;
+}
+
+static void test_chain_resolve(void)
+{
+	rb3_pe_chain_t m[2];
+	rb3_pe_res_t r;
+	m[0] = cm(0, -1, -1, -1, 0, 0), m[1] = cm(0, -1, -1, -1, 0, 0);
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_NONE && r.anchor == -1, "chain: no rows -> NONE");
+	m[1] = cm(1, 3, 500, 650, 1, 150);
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_SOLO && r.anchor == 1, "chain: one mate -> SOLO on it");
+	// REF/REF: gap between spans, opposite strands
+	m[0] = cm(1, 3, 100, 250, 0, 150), m[1] = cm(1, 3, 1250, 1400, 1, 150); // gap 1000
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_CONC && r.anchor == 0, "chain: gap == max_gap -> CONC, tie -> mate 0");
+	m[1].lo = 1251, m[1].hi = 1401;
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_DISC, "chain: gap one past max_gap -> DISC (no slack for REF)");
+	m[1] = cm(1, 3, 120, 270, 1, 160); // overlapping spans
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_CONC && r.anchor == 1, "chain: overlapping mates -> gap 0, more bases anchors");
+	m[1].strand = 0;
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_DISC, "chain: same strand -> DISC");
+	m[1] = cm(1, 4, 120, 270, 1, 160);
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_DISC, "chain: different contig -> DISC");
+	// spliced mate: span 100..5100 (intron inside); its mate right after -> gap measured from span ends
+	m[0] = cm(1, 3, 100, 5100, 0, 150), m[1] = cm(1, 3, 5300, 5450, 1, 150);
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_CONC, "chain: gap measured between spans (a spliced mate's intron does not count)");
+	// LIFT mates: approximate position gets lift_slack each; strand ignored; REF anchors
+	m[0] = cm(2, 3, 4000, 4000, 0, 0), m[1] = cm(1, 3, 100, 250, 0, 150); // gap 3750 <= 1000 + 2000? no
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_DISC, "chain: LIFT mate 3750 bp away > max_gap + one slack (3000) -> DISC");
+	m[0].lo = m[0].hi = 3200; // gap 2950
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_CONC && r.anchor == 1, "chain: LIFT mate within max_gap + slack, same strand OK; REF mate anchors");
+	m[1] = cm(2, 3, 7000, 7000, 0, 0); // two LIFT mates: 2 slacks -> 5000
+	rb3_pe_chain_resolve(m, 1000, 2000, &r);
+	CHECK(r.cls == RB3_PE_CONC && r.anchor == 0, "chain: two LIFT mates get both slacks (gap 3800 <= 5000)");
+}
+
 int main(void)
 {
 	test_names();
@@ -277,6 +326,7 @@ int main(void)
 	test_event_gametes();
 	test_near_gametes();
 	test_concordant_hits();
+	test_chain_resolve();
 	printf("test_pairing: %d passed, %d failed\n", n_pass, n_fail);
 	return n_fail > 0;
 }

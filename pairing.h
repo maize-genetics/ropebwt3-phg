@@ -85,6 +85,22 @@ typedef struct {
 int32_t rb3_pe_concordant_hits(const rb3_pe_hit_t *a, int32_t na, const rb3_pe_hit_t *b, int32_t nb,
 							   int64_t max_dist, int32_t la, int32_t lb, uint8_t *keep_a, uint8_t *keep_b, int64_t *span);
 
+// One mate as chain pairing sees it: its emitted rows' reference span.
+#define RB3_PE_CHAIN_NONE 0 // no row
+#define RB3_PE_CHAIN_REF  1 // reference-anchored SMEM chain: exact span and strand
+#define RB3_PE_CHAIN_LIFT 2 // lift-projected row (chain's PAV path): approximate position, no strand
+typedef struct {
+	int8_t kind;            // RB3_PE_CHAIN_*
+	int8_t strand;          // REF only: 0 forward, 1 reverse
+	int64_t rsid, lo, hi;   // reference contig and span of the mate's rows (lo == hi for LIFT)
+	int32_t bases;          // REF: query bases in the chain (anchor tie-break)
+} rb3_pe_chain_t;
+
+// Classify a chain pair. Concordant (CONC): same contig, opposite strands (when both are REF), and
+// the gap between the spans <= max_gap, plus lift_slack for each LIFT mate. Anchor: REF beats LIFT,
+// then more bases, then mate 0. One mate with rows: SOLO; none: NONE; otherwise DISC.
+void rb3_pe_chain_resolve(const rb3_pe_chain_t m[2], int64_t max_gap, int64_t lift_slack, rb3_pe_res_t *res);
+
 // Founder (gamete) set of a single pair event: sorted, deduplicated intersection of the
 // anchor's set a[] and the mate's set b[]. Falls back to a[] (sorted, deduped) when b[] is
 // empty or capped (an incomplete occurrence sample cannot veto founders), and to b[] when

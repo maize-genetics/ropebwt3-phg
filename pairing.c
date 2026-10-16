@@ -209,3 +209,25 @@ int32_t rb3_pe_concordant_hits(const rb3_pe_hit_t *a, int32_t na, const rb3_pe_h
 	free(sa); free(sb); free(sids);
 	return n_contig;
 }
+
+void rb3_pe_chain_resolve(const rb3_pe_chain_t m[2], int64_t max_gap, int64_t lift_slack, rb3_pe_res_t *res)
+{
+	int64_t gap, win;
+	memset(res, 0, sizeof(*res));
+	res->anchor = res->rescued = -1, res->resc_rsid = res->resc_pos = -1;
+	if (m[0].kind == RB3_PE_CHAIN_NONE && m[1].kind == RB3_PE_CHAIN_NONE) { res->cls = RB3_PE_NONE; return; }
+	if (m[0].kind == RB3_PE_CHAIN_NONE || m[1].kind == RB3_PE_CHAIN_NONE) {
+		res->cls = RB3_PE_SOLO, res->anchor = m[0].kind != RB3_PE_CHAIN_NONE? 0 : 1;
+		return;
+	}
+	win = max_gap + (m[0].kind == RB3_PE_CHAIN_LIFT) * lift_slack + (m[1].kind == RB3_PE_CHAIN_LIFT) * lift_slack;
+	gap = m[0].lo > m[1].hi? m[0].lo - m[1].hi : m[1].lo > m[0].hi? m[1].lo - m[0].hi : 0; // 0 if the spans overlap
+	if (m[0].rsid != m[1].rsid || gap > win
+		|| (m[0].kind == RB3_PE_CHAIN_REF && m[1].kind == RB3_PE_CHAIN_REF && m[0].strand == m[1].strand)) {
+		res->cls = RB3_PE_DISC;
+		return;
+	}
+	res->cls = RB3_PE_CONC;
+	if (m[0].kind != m[1].kind) res->anchor = m[0].kind == RB3_PE_CHAIN_REF? 0 : 1;
+	else res->anchor = m[1].bases > m[0].bases? 1 : 0;
+}

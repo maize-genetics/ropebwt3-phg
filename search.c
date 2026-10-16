@@ -1067,6 +1067,7 @@ static void write_refmap(step_t *t)
  ********************************************************************/
 #define RB3_PE_MIN_PAIRS       25   // fewest EXACT-EXACT pairs for a batch's own insert-size estimate
 #define RB3_PE_DEFAULT_MAX_INS 1000 // max insert used until some batch yields an estimate
+#define RB3_PE_EST_WIN 10000 // mem/chain: largest span accepted into the insert-size sample
 
 // Update p->isize from one batch's fragment spans (span[] is sorted in place); warn once while
 // no batch has had enough pairs. Runs in pipeline step 1 (serialized across batches).
@@ -1301,6 +1302,54 @@ static int32_t chain_read_weight(const pipeline_t *p, const m_seq_t *s)
 	return n > 0 && n < INT32_MAX? (int32_t)n : 1;
 }
 
+// One chain output row. Single-end prints it at once; --paired collects a read's rows in a sink so
+// both mates can be compared before anything is printed or counted.
+typedef struct {
+	int32_t rsid;     // reference contig
+	int64_t pos, hi;  // row position (segment start / projected position) and segment end
+	int32_t *acc, na; // founder (gamete) set, sorted
+	int8_t pav;       // 1: "pav:"-prefixed, grid-snapped insertion row
+	int8_t extra;     // 5th column of a pav: row (insertion/diverged flag), -1 if none
+	int8_t lift;      // 1: from the lift-projection (PAV) path
+} chain_row_t;
+
+typedef struct {
+	chain_row_t *a;
+	int32_t n, m;
+	int8_t strand;    // reference chain's strand
+	int32_t bases;    // query bases in the reference chain
+} chain_sink_t;
+
+static void chain_print_row(const pipeline_t *p, const char *name, int name_len, const chain_row_t *r, int32_t w, const char *cls)
+{
+	const char *nm = p->fmi.sid->name[r->rsid], *us = strchr(nm, '_');
+	int32_t i;
+	if (p->ps4g_acc && r->na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, r->rsid, r->pos, r->acc, r->na, w);
+	printf("%.*s\t%s%s\t%ld\t", name_len, name, r->pav? "pav:" : "", us? us + 1 : nm, (long)r->pos);
+	for (i = 0; i < r->na; ++i) printf("%s%d", i? "," : "", r->acc[i]);
+	if (r->extra >= 0) printf("\t%d", r->extra);
+	if (cls) printf("\t%s", cls);
+	putchar('\n');
+}
+
+// Emit (sk == NULL) or collect one row of read s.
+static void chain_put_row(const pipeline_t *p, chain_sink_t *sk, const m_seq_t *s, int32_t rsid, int64_t pos, int64_t hi,
+						  const int32_t *acc, int32_t na, int pav, int extra, int lift)
+{
+	chain_row_t r;
+	r.rsid = rsid, r.pos = pos, r.hi = hi, r.na = na, r.pav = pav, r.extra = extra, r.lift = lift;
+	if (sk == 0) {
+		const char *nm = s->name? s->name : "?";
+		r.acc = (int32_t*)acc;
+		chain_print_row(p, nm, (int)strlen(nm), &r, chain_read_weight(p, s), 0);
+		return;
+	}
+	r.acc = RB3_MALLOC(int32_t, na > 0? na : 1);
+	memcpy(r.acc, acc, na * sizeof(int32_t));
+	RB3_GROW(chain_row_t, sk->a, sk->n, sk->m);
+	sk->a[sk->n++] = r;
+}
+
 static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 {
 	int32_t cnt[7], i, c, best = 0, n = qe - qs;
@@ -1324,7 +1373,7 @@ static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 // wrong singletons -- see RopeBWTGrits-eval/experiments/pav_e1_findings_2026-07-26.md.
 // This mirrors what chain_emit does in reference space (colinear DP, then intersect over
 // the winning chain only).
-static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
+static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km, chain_sink_t *sk)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1448,8 +1497,6 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		// being the STRICTEST setting: with no grid the tolerance fell back to --gap-intron
 		// (30bp), so insertions carried by several assemblies were silently suppressed.
 		if (nmaj > 0 && bestn == np && disp <= p->opt->pav_agree) {
-			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
-			const char *contig = us? us + 1 : nm;
 			int is_insertion = n_insertion * 2 >= nmaj;   // majority of projections were true breakpoints
 			// A DIVERGED row is not a PAV: the sequence is in the reference, just too divergent
 			// to share a SMEM, and the projection is a real colinear coordinate rather than a
@@ -1462,10 +1509,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			if (!is_insertion) {
 				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
 				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
-					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
-					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
-					putchar('\n');
+					chain_put_row(p, sk, s, best_rsid, med, med, acc, na, 0, -1, 1);
 					goto pav_done;
 				}
 			} else {
@@ -1480,10 +1524,7 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 				// explicitly requested.
 				if (p->opt->insertion_rows == 2) goto pav_done;          // drop
 				if (p->opt->insertion_rows == 0) {                       // ordinary row, exact median, no snap
-					if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, med, acc, na, chain_read_weight(p, s));
-					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
-					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
-					putchar('\n');
+					chain_put_row(p, sk, s, best_rsid, med, med, acc, na, 0, -1, 1);
 					goto pav_done;
 				}
 			}
@@ -1499,15 +1540,12 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// rb3_ps4g_npy_finalize/ps4g.c time from sid->name), so this shares bins with ordinary
 			// rows on the same contig at the same coarse position. Known gap, not resolved here --
 			// see the design note on --insertion-rows above; --insertion-rows=ordinary avoids it.
-			if (p->ps4g_acc && na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, best_rsid, bp, acc, na, chain_read_weight(p, s));
-			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
-			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
 			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
 			// the nearest reference breakpoint, approximate (presence/absence only).
 			// 0 = DIVERGED: present in the reference but too divergent to share a SMEM,
 			// so the coordinate is colinear and exact. Only insertions reach here --
 			// diverged rows are routed by --diverged-rows (default: ordinary row).
-			printf("\t%d\n", is_insertion? 1 : 0);
+			chain_put_row(p, sk, s, best_rsid, bp, bp, acc, na, 1, is_insertion? 1 : 0, 1);
 		}
 	}
 pav_done:
@@ -1573,7 +1611,7 @@ static int32_t chain_support_best(const pipeline_t *p, const m_seq_t *s, void *k
 	return na;
 }
 
-static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
+static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km, chain_sink_t *sk)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1611,7 +1649,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	}
 	if (n == 0) { // no ref anchor -> try the PAV breakpoint path (which reads s->mem[].pos)
 		free(cs);
-		if (p->lift) chain_emit_pav(p, s, km);
+		if (p->lift) chain_emit_pav(p, s, km, sk);
 		for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos);
 		return;
 	}
@@ -1669,26 +1707,22 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 				na = chain_support_best(p, s, km, cs, chain, nc, rlo, rhi, acc);
 			}
 			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
-				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
-				const char *contig = us? us + 1 : nm;
 				int64_t lo, hi;
+				if (sk) { // --paired: the chain's strand and size, for comparing mates
+					sk->strand = strand;
+					for (i = 0, sk->bases = 0; i < nc; ++i) sk->bases += cs[chain[i]].qe - cs[chain[i]].qs;
+				}
 				for (i = 0; i < nc - 1; ++i) // insertion sort ascending by start (nc is tiny)
 					for (j = i + 1; j < nc; ++j)
 						if (ivlo[j] < ivlo[i]) { int64_t t0 = ivlo[i], t1 = ivhi[i]; ivlo[i] = ivlo[j], ivhi[i] = ivhi[j], ivlo[j] = t0, ivhi[j] = t1; }
 				lo = ivlo[0], hi = ivhi[0];
 				for (i = 1; i < nc; ++i) {
 					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
-						if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
-						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
-						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
-						putchar('\n');
+						chain_put_row(p, sk, s, cs[chain[0]].rsid, lo, hi, acc, na, 0, -1, 0);
 						lo = ivlo[i], hi = ivhi[i];
 					} else if (ivhi[i] > hi) hi = ivhi[i];
 				}
-				if (p->ps4g_acc) rb3_ps4g_acc_add_w(p->ps4g_acc, cs[chain[0]].rsid, lo, acc, na, chain_read_weight(p, s));
-				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
-				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
-				putchar('\n');
+				chain_put_row(p, sk, s, cs[chain[0]].rsid, lo, hi, acc, na, 0, -1, 0);
 			}
 			free(ivlo); free(ivhi);
 			free(acc);
@@ -1699,18 +1733,93 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	free(chain); free(cs);
 }
 
+/********************************************************************
+ * --paired: chain
+ ********************************************************************/
+#define RB3_PE_LIFT_SLACK 2000 // extra gap allowed per lift-projected (PAV) mate: projections are ~kb-accurate
+
+static void chain_sink_span(const chain_sink_t *sk, rb3_pe_chain_t *c)
+{
+	int32_t i;
+	memset(c, 0, sizeof(*c));
+	if (sk->n == 0) { c->kind = RB3_PE_CHAIN_NONE, c->rsid = -1; return; }
+	c->kind = sk->a[0].lift? RB3_PE_CHAIN_LIFT : RB3_PE_CHAIN_REF;
+	c->rsid = sk->a[0].rsid, c->lo = sk->a[0].pos, c->hi = sk->a[0].hi, c->strand = sk->strand, c->bases = sk->bases;
+	for (i = 1; i < sk->n; ++i) {
+		if (sk->a[i].pos < c->lo) c->lo = sk->a[i].pos;
+		if (sk->a[i].hi > c->hi) c->hi = sk->a[i].hi;
+	}
+}
+
+static void chain_write_paired(pipeline_t *p, step_t *t, void *km)
+{
+	int32_t i, j, n_pair = t->n_seq / 2, n_span = 0;
+	chain_sink_t *sk = RB3_CALLOC(chain_sink_t, t->n_seq > 0? t->n_seq : 1);
+	int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1), max_gap;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	for (j = 0; j < t->n_seq; ++j) chain_emit(p, &t->seq[j], km, &sk[j]); // collect, print nothing yet
+	if (!p->isize_fixed) { // insert size: both mates single-segment reference chains, same contig, opposite strands
+		for (i = 0; i < n_pair; ++i) {
+			const chain_sink_t *a = &sk[2*i], *b = &sk[2*i+1];
+			if (a->n != 1 || b->n != 1 || a->a[0].lift || b->a[0].lift) continue;
+			if (a->a[0].rsid != b->a[0].rsid || a->strand == b->strand) continue;
+			span[n_span] = (a->a[0].hi > b->a[0].hi? a->a[0].hi : b->a[0].hi) - (a->a[0].pos < b->a[0].pos? a->a[0].pos : b->a[0].pos);
+			if (span[n_span] < RB3_PE_EST_WIN) ++n_span;
+		}
+		pe_update_isize(p, span, n_span);
+	}
+	max_gap = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->max_intron + p->opt->pe_slack;
+	for (i = 0; i < n_pair; ++i) {
+		const m_seq_t *s0 = &t->seq[2*i];
+		chain_sink_t *k[2];
+		rb3_pe_chain_t c[2];
+		rb3_pe_res_t *e = &t->pe[i];
+		const char *cls;
+		k[0] = &sk[2*i], k[1] = &sk[2*i+1];
+		chain_sink_span(k[0], &c[0]), chain_sink_span(k[1], &c[1]);
+		rb3_pe_chain_resolve(c, max_gap, RB3_PE_LIFT_SLACK, e);
+		++p->pe_cnt[(int)e->cls];
+		cls = rb3_pe_class_str[(int)e->cls];
+		if (e->cls == RB3_PE_DISC) { // each mate on its own, as single-end
+			for (j = 0; j < 2; ++j) {
+				const m_seq_t *s = &t->seq[2*i+j];
+				const char *nm = s->name? s->name : "?";
+				int32_t r;
+				for (r = 0; r < k[j]->n; ++r) chain_print_row(p, nm, (int)strlen(nm), &k[j]->a[r], chain_read_weight(p, s), cls);
+			}
+		} else if (e->cls == RB3_PE_CONC || e->cls == RB3_PE_SOLO) { // one event: the anchor's first row
+			const chain_sink_t *a = k[(int)e->anchor], *b = k[e->anchor ^ 1];
+			const char *nm = s0->name? s0->name : "?";
+			chain_row_t r = a->a[0];
+			int32_t *g = RB3_MALLOC(int32_t, a->a[0].na + (b->n > 0? b->a[0].na : 0) + 1);
+			r.na = rb3_pe_event_gametes(a->a[0].acc, a->a[0].na, 0, b->n > 0? b->a[0].acc : 0, b->n > 0? b->a[0].na : 0, 0, g);
+			r.acc = g;
+			chain_print_row(p, nm, rb3_pe_name_len(nm), &r, chain_read_weight(p, s0), cls);
+			free(g);
+		}
+	}
+	for (j = 0; j < t->n_seq; ++j) {
+		int32_t r;
+		for (r = 0; r < sk[j].n; ++r) free(sk[j].a[r].acc);
+		free(sk[j].a);
+	}
+	free(sk); free(span);
+}
+
 static void write_per_seq(step_t *t)
 {
 	const pipeline_t *p = t->p;
 	int32_t i, j;
 	kstring_t out = {0,0,0};
 	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
+	if (p->opt->algo == RB3_SA_CHAIN && p->opt->paired) // both mates first, then one event per pair
+		chain_write_paired((pipeline_t*)p, t, km);
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
 		if (p->opt->algo != RB3_SA_CHAIN) free(s->seq); // chain's PAV path still reads s->seq (pav_low_complexity)
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
-			chain_emit(p, s, km);
+			if (!p->opt->paired) chain_emit(p, s, km, 0);
 			free(s->seq);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
@@ -1828,7 +1937,6 @@ static void write_hapdiv(step_t *t)
 /********************************************************************
  * --paired: mate pairing over one batch (mem)
  ********************************************************************/
-#define RB3_PE_EST_WIN 10000 // mem: window for the insert-size sample (full-length SMEM hits only)
 
 // A read's located SMEM hits, as implied read starts on each contig's forward strand, flattened
 // in (SMEM, position) order; full_only: only SMEMs covering the whole read. Returns the count.
@@ -2432,10 +2540,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int n_files = argc - o.ind - 1;
 		const char *err = 0;
 		int is_mem = (opt.algo == RB3_SA_MEM_TG || opt.algo == RB3_SA_MEM_ORI);
-		if (opt.algo != RB3_SA_REFMAP && !is_mem) err = "--paired is implemented for refmap and mem only so far";
+		int is_chain = (opt.algo == RB3_SA_CHAIN);
+		if (opt.algo != RB3_SA_REFMAP && !is_mem && !is_chain) err = "--paired is implemented for refmap, mem and chain (not sw)";
 		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM); use a large value, e.g. -p 1024";
 		else if (is_mem && (opt.min_gap_len > 0 || (opt.flag & RB3_MF_WRITE_COV))) err = "mem --paired cannot be combined with --gap/--cov";
-		else if (is_mem && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
+		else if ((is_mem || is_chain) && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";
 		else if (is_line) err = "--paired needs read names (FASTA/FASTQ), not -L";
 		else if (n_files != 1 && n_files != 2) err = "--paired takes <R1.fq> <R2.fq> or one interleaved file";
@@ -2443,7 +2552,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
 		}
-		if (is_mem && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM positions are exact: no projection slack
+		if ((is_mem || is_chain) && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM/chain positions are exact
 	} else if (opt.pe_mean > 0 || opt.pe_trust_exact) {
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact need --paired\n");
 		return 1;
