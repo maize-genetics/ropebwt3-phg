@@ -56,6 +56,23 @@ void rb3_lift_ridx_destroy(rb3_lift_ridx_t *ridx);
 // liftover points by construction -- it never appears as an assembly/csid).
 int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_t rsid, int64_t rpos);
 
+// Inverse projection, reference -> assembly: project reference position (rsid,rpos)
+// into founder `gamete`'s assembly using that founder's liftover anchors on rsid,
+// with exactly the algorithm of rb3_lift_project (the local bracket when
+// rb3_lift_set_local is on, then the +-win median/MAD fit) but with the reference as
+// the key axis. Returns 1 and sets *out_csid (assembly SEQUENCE index, as in
+// rb3_lift_t), *out_cpos (forward strand), *out_sign (+1 same orientation, -1
+// inverted) and *out_method (1 local bracket, 2 local one-sided, 3 wide median);
+// returns 0 when there is no confident collinear projection. out_sign/out_method
+// may be NULL. anchor_k = the k of `ropebwt3 lift -k` that built the map (it is not
+// stored in the .lift file): on a slope -1 locus the result is shifted by k-1 so
+// that base r maps to its own homologous base (points pair k-mer leftmost bases).
+// Unlike the forward projector, the local bracket picks the better-fitting slope
+// rather than +1 first, since here the orientation decides the output strand.
+int rb3_lift_project_inv(const rb3_lift_ridx_t *ridx, void *km, int32_t gamete, int64_t rsid, int64_t rpos,
+						 int64_t win, int64_t max_mad, int32_t min_support, int32_t anchor_k,
+						 int64_t *out_csid, int64_t *out_cpos, int *out_sign, int *out_method);
+
 // Ternary read-sharing state for one (founder, row): match (1) if the founder is in
 // the row's matched-founder set, independent of distance; otherwise diverged (0) if
 // dist is within thresh bp of an anchor, deletion (-1) if dist exceeds thresh or the

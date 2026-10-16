@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o pairing.o
+			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o pairing.o isa.o extract.o snap.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -60,16 +60,23 @@ test/test_pairing.o:test/test_pairing.c pairing.h
 test/test_pairing:test/test_pairing.o pairing.o
 		$(CC) $(CFLAGS) $^ -o $@ -lm
 
-test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing
+test/test_extract.o:test/test_extract.c snap.h isa.h lift.h ps4g.h fm-index.h rb3priv.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_extract:test/test_extract.o snap.o isa.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o sais-ss.o libsais.o libsais64.o
+		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
 		./test/test_lift
 		./test/test_pairing
+		./test/test_extract test/output
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)
@@ -103,3 +110,6 @@ ssa.o: ketopt.h ksort.h
 lift.o: fm-index.h io.h rb3priv.h ketopt.h kalloc.h kthread.h lift.h
 ps4g.o: rb3priv.h ps4g.h io.h kseq.h
 hitcount.o: hitcount.h
+isa.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h isa.h
+snap.o: rb3priv.h snap.h
+extract.o: rb3priv.h fm-index.h rld0.h mrope.h rope.h io.h ketopt.h kalloc.h kthread.h lift.h ps4g.h isa.h
