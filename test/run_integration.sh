@@ -682,7 +682,6 @@ check_eq "mem --paired -p 2: sampled mates cannot veto -- every row keeps all it
 pe_err "mem --paired without -p" "needs -p INT" mem --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "mem --paired with --cov" "cannot be combined" mem --paired --cov -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "mem --pe-trust-exact" "refmap only" mem --paired --pe-trust-exact -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
-pe_err "sw --paired not implemented yet" "refmap, mem and chain (not sw)" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
 # --- 13. chain --paired: one event per concordant pair (mate gap <= max insert + --max-intron) ---
 CPR="chain --ref-prefix=B73 -l 19 --lift=$PLIFT -t2"
@@ -719,6 +718,29 @@ check_eq "chain --paired --dup-count: the pair event counts 3" "$(awk '/^#TotalU
 check_eq "chain without --paired: one row per mate segment, no class column (P1 gives 2 rows)" \
 	"$(grep -c '^P1/' "$TMP/ch_se.tsv")/$(awk -F'\t' '$1=="P2/1"{print NF}' "$TMP/ch_se.tsv")" "2/4"
 
+# --- 14. sw --paired: per-assembly concordance of the mates' alignment positions (as mem) ---
+"$RB" sw --paired -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/sw_pe.paf" 2>"$TMP/sw_pe.log"
+check_eq "sw --paired exits 0" "$?" "0"
+sw_tag() { awk -F'\t' -v n="$1" '$1==n{print $NF}' "$TMP/sw_pe.paf" | sort -u | tr '\n' ' '; }
+sw_pos() { awk -F'\t' -v n="$1" '$1==n{s=$6":"$5":"$8; for(i=12;i<=NF;++i) if($i~/^ap:Z:/) s=s";"substr($i,6); print s}' "$TMP/sw_pe.paf"; }
+check_eq "sw: every line carries a pe:Z: tag" "$(awk -F'\t' '$NF!~/^pe:Z:(CONC|DISC|SOLO|NONE)$/' "$TMP/sw_pe.paf" | wc -l | tr -d ' ')" "0"
+check_eq "sw P5: CONC keeps only Mo17 (single-end primary was Ki3's TE copy)" "$(sw_pos P5/1)|$(sw_pos P5/2)" "Mo17_chr1:+:9600|Mo17_chr1:-:10000"
+check_eq "sw P6: the duplicated mate keeps the 4 positions next to its mate (of 8)" \
+	"$(sw_pos P6/1 | tr ';,' '\n\n' | grep -c ':\?1[12][0-9][0-9][0-9]$')/$(awk -F'\t' '$1=="P6/1"{print $15}' "$TMP/sw_pe.paf")" "4/rh:i:8"
+check_eq "sw P1/P4/P7 DISC, P3 SOLO, P2 CONC" "$(sw_tag P1/1)$(sw_tag P4/2)$(sw_tag P7/1)$(sw_tag P3/1)$(sw_tag P2/2)" \
+	"pe:Z:DISC pe:Z:DISC pe:Z:DISC pe:Z:SOLO pe:Z:CONC "
+if grep -q '47 pairs: 43 CONC, 0 RESC, 1 SOLO, 3 DISC, 0 NONE' "$TMP/sw_pe.log"; then pass; else fail "sw --paired: pair-class summary"; fi
+if grep -q 'insert size from 42 pairs: mean 400.7' "$TMP/sw_pe.log"; then pass; else fail "sw --paired: insert size from end-to-end hits"; fi
+"$RB" sw --paired -p 64 -t2 "$PIDX" "$PE/interleaved.fa" > "$TMP/sw_il.paf" 2>/dev/null
+check_eq "sw --paired: interleaved == R1 R2" "$(cmp -s "$TMP/sw_pe.paf" "$TMP/sw_il.paf" && echo same)" "same"
+"$RB" sw -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/sw_se.paf" 2>/dev/null
+check_eq "sw without --paired: no pe:Z: tag, P5/1 primary is Ki3's copy" \
+	"$(grep -c 'pe:Z:' "$TMP/sw_se.paf")/$(awk -F'\t' '$1=="P5/1"{print $6":"$8}' "$TMP/sw_se.paf")" "0/Ki3_chr1:16100"
+check_eq "sw --paired: DISC lines identical to single-end apart from the tag" \
+	"$(grep '^P4/1	' "$TMP/sw_pe.paf" | sed 's/	pe:Z:DISC$//' | cmp -s - <(grep '^P4/1	' "$TMP/sw_se.paf") && echo same)" "same"
+pe_err "sw --paired without -p" "sw --paired needs -p INT" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "sw --paired with --all-e2e" "cannot be combined with --all-e2e" sw --paired -p 64 --all-e2e "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -748,6 +770,9 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" chain --ref-prefix=B73 -l 19 --lift="$TMP/pe.lift" --paired --support=best --ps4g "$TMP/vg_ch.ps4g" -K 2000 -t2 \
 		"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ch_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on chain --paired"; cat "$TMP/valgrind_ch_pe.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" sw --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_sw_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on sw --paired"; cat "$TMP/valgrind_sw_pe.log" >&2; fi
 	for ml in 1 5000; do
 		valgrind --error-exitcode=99 --leak-check=full -q \
 			"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --max-locate=$ml --ps4g "$TMP/vg_ml.ps4g" -t2 \

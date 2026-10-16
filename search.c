@@ -244,7 +244,8 @@ typedef struct {
 	m_hapdiv_t *hapdiv;
 	refmap_rst_t *refmap; // refmap: one entry per query
 	rb3_pe_res_t *pe;     // --paired: one entry per mate pair (seq[2i], seq[2i+1])
-	int64_t pe_max_dist;  // --paired (mem): concordance window used for this batch
+	int64_t pe_max_dist;  // --paired (mem/sw): concordance window used for this batch
+	uint8_t **sw_keep;    // --paired (sw): per read, keep flags over its (hit, position) list; NULL = keep all
 	m_tbuf_t *buf;
 } step_t;
 
@@ -1831,17 +1832,32 @@ static void write_per_seq(step_t *t)
 			fputs(out.s, stdout);
 		} else if (p->opt->algo == RB3_SA_SW) { // write PAF
 			rb3_swrst_t *r = &t->rst[j];
+			const char *pcls = t->pe? rb3_pe_class_str[(int)t->pe[j >> 1].cls] : 0;
+			uint8_t *keep = t->sw_keep? t->sw_keep[j] : 0; // --paired CONC: concordant positions only
 			if (r->n > 0) { // mapped
+				int32_t x = 0;
 				for (i = 0; i < r->n; ++i) {
+					rb3_swhit_t *h = &r->a[i];
+					if (keep) { // move the concordant positions to the front; drop the hit if it has none
+						int32_t k, m = 0;
+						for (k = 0; k < h->n_pos; ++k, ++x)
+							if (keep[x]) h->pos[m++] = h->pos[k];
+						if (m == 0) continue;
+						h->n_pos = m;
+					}
 					out.l = 0;
-					write_paf(&out, &p->fmi, &r->a[i], s);
+					write_paf(&out, &p->fmi, h, s);
+					if (pcls) out.l--, rb3_sprintf_lite(&out, "\tpe:Z:%s\n", pcls);
 					fputs(out.s, stdout);
 				}
 			} else if (p->opt->flag & RB3_MF_WRITE_UNMAP) { // unmapped
 				write_name(&out, s);
-				rb3_sprintf_lite(&out, "\t%d\t*\t*\t*\t*\t*\t*\t*\t0\t0\t0\n", s->len);
+				rb3_sprintf_lite(&out, "\t%d\t*\t*\t*\t*\t*\t*\t*\t0\t0\t0", s->len);
+				if (pcls) rb3_sprintf_lite(&out, "\tpe:Z:%s", pcls);
+				rb3_sprintf_lite(&out, "\n");
 				fputs(out.s, stdout);
 			}
+			if (keep) free(keep);
 			rb3_swrst_free(r);
 		} else if (p->opt->min_gap_len > 0) { // output regions not covered by long MEMs
 			for (i = 0; i < s->n_gap; ++i) {
@@ -1904,6 +1920,7 @@ static void write_per_seq(step_t *t)
 	free(out.s);
 	free(t->rst);
 	free(t->rst_rev);
+	free(t->sw_keep);
 }
 
 static void write_hapdiv(step_t *t)
@@ -2015,6 +2032,97 @@ static void mem_pair_worker(void *data, long i, int tid)
 	for (c = 0; c < 2; ++c) free(h[c]), free(k[c]);
 }
 
+/********************************************************************
+ * --paired: mate pairing over one batch (sw)
+ ********************************************************************/
+// A read's located sw hits as implied read starts on each contig's forward strand, flattened in
+// (hit, position) order; full_only: only end-to-end (whole-read) hits. Returns the count.
+static int32_t sw_read_hits(const pipeline_t *p, const m_seq_t *s, const rb3_swrst_t *r, int full_only, rb3_pe_hit_t *h)
+{
+	int32_t i, k, n = 0;
+	for (i = 0; i < r->n; ++i) {
+		const rb3_swhit_t *x = &r->a[i];
+		int32_t qs = x->n_qoff > 0? x->qoff[0] : 0, qe = qs + x->qlen;
+		if (full_only && (qs != 0 || qe != s->len)) continue;
+		for (k = 0; k < x->n_pos; ++k) {
+			int64_t clen, st, en;
+			int strand = x->pos[k].sid & 1;
+			pos_stranded(p->fmi.sid, &x->pos[k], x->rlen, &clen, &st, &en);
+			h[n].sid = x->pos[k].sid >> 1, h[n].strand = strand;
+			h[n++].start = strand? st - (s->len - qe) : st - qs;
+		}
+	}
+	return n;
+}
+
+static int32_t sw_n_pos(const rb3_swrst_t *r)
+{
+	int32_t i, n = 0;
+	for (i = 0; i < r->n; ++i) n += r->a[i].n_pos;
+	return n;
+}
+
+// 1 if every occurrence of the read's best-scoring hit was located (-p did not truncate it)
+static int sw_fully_located(const rb3_swrst_t *r)
+{
+	int32_t i, b = -1;
+	for (i = 0; i < r->n; ++i) if (b < 0 || r->a[i].score > r->a[b].score) b = i;
+	return b >= 0 && r->a[b].n_pos >= r->a[b].hi - r->a[b].lo;
+}
+
+static void sw_pair_worker(void *data, long i, int tid)
+{
+	step_t *t = (step_t*)data;
+	rb3_pe_hit_t *h[2];
+	uint8_t *k[2];
+	int32_t n[2], c, nc;
+	rb3_pe_res_t *e = &t->pe[i];
+	for (c = 0; c < 2; ++c) {
+		int32_t m = sw_n_pos(&t->rst[2*i+c]);
+		h[c] = RB3_MALLOC(rb3_pe_hit_t, m > 0? m : 1);
+		k[c] = RB3_CALLOC(uint8_t, m > 0? m : 1);
+		n[c] = sw_read_hits(t->p, &t->seq[2*i+c], &t->rst[2*i+c], 0, h[c]);
+	}
+	nc = rb3_pe_concordant_hits(h[0], n[0], h[1], n[1], t->pe_max_dist, t->seq[2*i].len, t->seq[2*i+1].len, k[0], k[1], 0);
+	e->anchor = e->rescued = -1;
+	e->cls = nc > 0? RB3_PE_CONC : n[0] > 0 && n[1] > 0? RB3_PE_DISC : n[0] > 0 || n[1] > 0? RB3_PE_SOLO : RB3_PE_NONE;
+	e->resc_support = nc;
+	for (c = 0; c < 2 && nc > 0; ++c)
+		if (!sw_fully_located(&t->rst[2*i+(c^1)])) // the mate's positions are a -p sample: keep all of this read's
+			memset(k[c], 1, n[c] > 0? n[c] : 1);
+	for (c = 0; c < 2; ++c) {
+		if (nc > 0) t->sw_keep[2*i+c] = k[c];
+		else free(k[c]);
+		free(h[c]);
+	}
+}
+
+static void sw_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	t->sw_keep = RB3_CALLOC(uint8_t*, t->n_seq > 0? t->n_seq : 1);
+	if (!p->isize_fixed) { // sample: pairs whose mates both have end-to-end hits on a shared contig
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		for (i = 0; i < n_pair; ++i) {
+			int32_t ma = sw_n_pos(&t->rst[2*i]), mb = sw_n_pos(&t->rst[2*i+1]), na, nb;
+			rb3_pe_hit_t *ha, *hb;
+			int64_t sp;
+			if (ma == 0 || mb == 0) continue;
+			ha = RB3_MALLOC(rb3_pe_hit_t, ma), hb = RB3_MALLOC(rb3_pe_hit_t, mb);
+			na = sw_read_hits(p, &t->seq[2*i], &t->rst[2*i], 1, ha), nb = sw_read_hits(p, &t->seq[2*i+1], &t->rst[2*i+1], 1, hb);
+			if (rb3_pe_concordant_hits(ha, na, hb, nb, RB3_PE_EST_WIN, t->seq[2*i].len, t->seq[2*i+1].len, 0, 0, &sp) > 0 && sp > 0)
+				span[n_span++] = sp;
+			free(ha), free(hb);
+		}
+		pe_update_isize(p, span, n_span);
+		free(span);
+	}
+	t->pe_max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	kt_for(p->opt->n_threads, sw_pair_worker, t, n_pair);
+	for (i = 0; i < n_pair; ++i) ++p->pe_cnt[(int)t->pe[i].cls];
+}
+
 static void mem_pair_batch(pipeline_t *p, step_t *t)
 {
 	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
@@ -2122,6 +2230,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			refmap_pair_batch(p, t);
 		else if (p->opt->paired && (p->opt->algo == RB3_SA_MEM_TG || p->opt->algo == RB3_SA_MEM_ORI))
 			mem_pair_batch(p, t);
+		else if (p->opt->paired && p->opt->algo == RB3_SA_SW)
+			sw_pair_batch(p, t);
 		return in;
 	} else if (step == 2) {
 		for (i = 0; i < p->opt->n_threads; ++i) {
@@ -2511,6 +2621,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (strcmp(argv[0], "sw") == 0 || strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -e          end-to-end mode (forcing -k to 1)\n");
+			fprintf(stderr, "  --paired    mate pairs (<R1> <R2>, or one interleaved file); needs a LARGE -p (start at\n");
+			fprintf(stderr, "              -p 1024: sw's -p is a per-read position budget, 0 locates one per hit). A pair\n");
+			fprintf(stderr, "              with hits on the same contig, opposite strands, implied starts within the\n");
+			fprintf(stderr, "              insert is CONC: its PAF lines keep only those positions. Every line gets a\n");
+			fprintf(stderr, "              pe:Z: tag (CONC/DISC/SOLO/NONE). --pe-isize=MEAN,SD, --pe-slack=NUM [0]\n");
 			fprintf(stderr, "  -j INT      min MEM length to initiate alignment [%d]\n", opt.swo.min_mem_len);
 			fprintf(stderr, "  -k INT      require INT-mer match at the end of alignment [%d]\n", opt.swo.end_len);
 			fprintf(stderr, "  -b          align both strands (effective with --all-e2e)\n");
@@ -2540,11 +2655,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		int n_files = argc - o.ind - 1;
 		const char *err = 0;
 		int is_mem = (opt.algo == RB3_SA_MEM_TG || opt.algo == RB3_SA_MEM_ORI);
-		int is_chain = (opt.algo == RB3_SA_CHAIN);
-		if (opt.algo != RB3_SA_REFMAP && !is_mem && !is_chain) err = "--paired is implemented for refmap, mem and chain (not sw)";
+		int is_chain = (opt.algo == RB3_SA_CHAIN), is_sw = (opt.algo == RB3_SA_SW);
+		if (opt.algo != RB3_SA_REFMAP && !is_mem && !is_chain && !is_sw) err = "--paired is implemented for refmap, mem, chain and sw";
+		else if (is_sw && opt.max_pos <= 0) err = "sw --paired needs -p INT (positions to locate); use a large value, e.g. -p 1024";
+		else if (is_sw && (opt.flag & RB3_MF_WRITE_ALL)) err = "sw --paired cannot be combined with --all-e2e/-g";
 		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM); use a large value, e.g. -p 1024";
 		else if (is_mem && (opt.min_gap_len > 0 || (opt.flag & RB3_MF_WRITE_COV))) err = "mem --paired cannot be combined with --gap/--cov";
-		else if ((is_mem || is_chain) && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
+		else if ((is_mem || is_chain || is_sw) && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";
 		else if (is_line) err = "--paired needs read names (FASTA/FASTQ), not -L";
 		else if (n_files != 1 && n_files != 2) err = "--paired takes <R1.fq> <R2.fq> or one interleaved file";
@@ -2552,7 +2669,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
 		}
-		if ((is_mem || is_chain) && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM/chain positions are exact
+		if ((is_mem || is_chain || is_sw) && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM/chain/sw positions are exact
 	} else if (opt.pe_mean > 0 || opt.pe_trust_exact) {
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact need --paired\n");
 		return 1;
