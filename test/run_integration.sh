@@ -618,6 +618,11 @@ pe_err "--paired: -L has no read names" "not -L" $PRM --paired -L "$PIDX" "$PE/i
 pe_err "--pe-isize without --paired" "need --paired" $PRM --pe-isize=400,10 "$PIDX" "$PE/r1.fa"
 pe_err "--pe-isize malformed" "MEAN,SD" $PRM --paired --pe-isize=400 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
+# --pe-near-win: P5's rescued mate has Ki3's TE copy 6.5 kb from its mate; a 100 kb window keeps Ki3
+"$RB" $PRM --paired --pe-near-win=100000 --ps4g-per-read="$TMP/nw.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/nw.tsv" 2>/dev/null
+check_eq "--pe-near-win=100000: P5's event keeps Ki3 (copy 6.5 kb away) as well as Mo17" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/nw.pr")" "1,2"
+check_eq "--pe-near-win only changes RESC founder sets (stdout identical)" "$(cmp -s "$TMP/pe.tsv" "$TMP/nw.tsv" && echo same)" "same"
+
 # --max-locate: refmap's per-read occurrence sample (default 256, the former fixed limit)
 "$RB" $PRM --max-locate=256 --paired --ps4g="$TMP/ml256.ps4g" --npy="$TMP/ml256.npy" --ps4g-per-read="$TMP/ml256.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ml256.tsv" 2>/dev/null
 check_eq "--max-locate=256 (the default) reproduces the default run exactly" \

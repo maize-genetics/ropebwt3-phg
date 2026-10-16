@@ -100,6 +100,8 @@ typedef struct {
 	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
 	int32_t max_locate;    // refmap: occurrences of a read located per read (the rest are not sampled) [256]
 	int8_t pe_slack_set;   // --pe-slack given explicitly (else mem uses 0: SMEM positions are exact)
+	int64_t pe_near_win;   // --pe-near-win: a rescued mate keeps founders whose own projection is within this
+	                       // many bp of the anchor (0 = the concordance window, max insert + --pe-slack)
 	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
 	rb3_swopt_t swo;
 } rb3_mopt_t;
@@ -1126,7 +1128,8 @@ static void refmap_pair_batch(pipeline_t *p, step_t *t)
 			refmap_rst_t *q = r[(int)e->rescued];
 			const rb3_pe_mate_t *a = &m[(int)e->anchor];
 			if (q->proj_gid && q->gametes) {
-				int32_t ng = rb3_pe_near_gametes(&m[(int)e->rescued], a->rsid, a->pos, max_dist, q->gametes);
+				int64_t nw = p->opt->pe_near_win > 0? p->opt->pe_near_win : max_dist;
+				int32_t ng = rb3_pe_near_gametes(&m[(int)e->rescued], a->rsid, a->pos, nw, q->gametes);
 				if (ng > 0) q->n_gametes = ng; // q->gametes holds n_asm >= n_proj entries
 			}
 			if (q->status == RB3_RM_EXACT) { // moved to another reference copy: keep its length, take its strand
@@ -2086,6 +2089,7 @@ static ko_longopt_t long_options[] = {
 	{ "pe-slack",            ko_required_argument, 372 },
 	{ "pe-trust-exact",      ko_no_argument,       373 },
 	{ "max-locate",          ko_required_argument, 374 },
+	{ "pe-near-win",         ko_required_argument, 375 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -2220,6 +2224,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg), opt.pe_slack_set = 1; // --paired: discordance slack (bp)
+		else if (c == 375) opt.pe_near_win = rb3_parse_num(o.arg);   // --paired: rescued-mate founder window
 		else if (c == 374) opt.max_locate = atoi(o.arg);             // refmap: occurrences located per read
 		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
@@ -2316,6 +2321,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    -p does not apply to refmap; raise --max-locate instead\n");
 			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
 			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
+			fprintf(stderr, "  --pe-near-win=NUM --paired: a MOVED mate keeps the founders whose own projection lies\n");
+			fprintf(stderr, "                    within NUM bp of its mate (0 = max insert + --pe-slack) [%ld]\n", (long)opt.pe_near_win);
 			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
 			fprintf(stderr, "                    PLACED mate onto the EXACT one (default: keep them as two events)\n");
 		}
