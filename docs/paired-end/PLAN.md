@@ -200,6 +200,36 @@ Fully located reads miss only 1.35% of the time.
 - There is no discard flag yet. DISC rows are printed with their pair class, so they can be
   filtered downstream.
 
+### Tuned minimap2 + Ia453 at -p 1024 (2026-10-16): about parity
+
+**Correction to the take above.** minimap2's defaults are wrong for a 25-genome pangenome. The
+`sr` preset's `-f 1000,5000` ignores any seed with more than 1,000 occurrences, so low-copy
+repeats go unmapped. Tuned: `-f 25000,50000 -N 100`, which drops primary unmapped from 6.1% to
+0.5% on a 20k-pair pilot. The comparison also needs the same per-assembly pairing rule on both
+sides: minimap2's tied-best hits are kept on a contig only if the mate has a tied-best hit within
+1 kb on it (`pe_filter_eval.py sampair`).
+
+| Oh43, % of reads | at locus | precision (kept) | set | wrong B73 | wrong B73 of kept | kept |
+|---|---|---|---|---|---|---|
+| mem PE -p 1024, all | 96.18 | 96.88 | 8.81 | 1.79 | 3.31 | 99.3 |
+| mem PE -p 1024, drop DISC | 95.47 | 97.68 | 8.61 | 1.47 | 2.75 | 97.7 |
+| mm2 tuned PE proper, raw tied sets | 96.25 | 97.29 | 11.06 | 2.89 | 4.54 | 98.9 |
+| mm2 tuned PE proper, pair-filtered sets | 96.23 | 97.28 | 8.37 | 1.63 | 3.07 | 98.9 |
+
+| Ia453 (held-out) | set | wrong B73 | wrong B73 of kept | kept |
+|---|---|---|---|---|
+| mem PE -p 1024, all | 8.46 | 2.17 | 4.27 | 98.4 |
+| mem PE -p 1024, drop DISC | 7.87 | 1.53 | 3.08 | 93.1 |
+| mm2 tuned PE proper, pair-filtered sets | 7.81 | 1.75 | 3.53 | 97.9 |
+
+**Verdict: accuracy is about equal.**
+- mem with DISC dropped is slightly more precise (wrong B73 about 0.2 pp lower).
+- minimap2 keeps more reads: +1.2 pp in-panel, +4.8 pp held-out, where divergence produces
+  more mem DISC pairs.
+- mem's real advantages are cost and integration: 171–210 s and 9 GB on the existing ropebwt3
+  index, against 366–388 s and 113 GB plus a 9-minute index build (179 GB peak) for minimap2.
+  Pair-aware founder sets are also built in.
+
 ## Next phases
 
 - **Phase 2, chain:**
