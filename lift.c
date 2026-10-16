@@ -223,6 +223,169 @@ static int64_t i64_median(int64_t *a, int64_t n)
 	return a[n>>1];
 }
 
+// Optional LOCAL projection, tried before the wide-window median below. The wide
+// median offset over +-win (500kb by default) is robust but coarse: maize has 10-100kb
+// replacement/indel blocks every few hundred kb, so the median offset across a 1Mb
+// window is often tens of kb off at the read itself (measured: only 33% of PLACED
+// reads from collinear sequence land within 10kb of their true reference position).
+// When enabled (lift_local_win > 0), the nearest anchors on each side within
+// lift_local_win are used directly if they are collinear with each other; otherwise
+// the wide median runs unchanged, so no read that projected before fails now.
+static int64_t lift_local_win = 0, lift_local_tol = 1000;
+__thread int rb3_lift_last_path; // debug: 0 fail, 1 local, 2 wide median, 3 breakpoint
+
+void rb3_lift_set_local(int64_t local_win, int64_t local_tol)
+{
+	lift_local_win = local_win, lift_local_tol = local_tol;
+}
+
+// Two anchors are collinear if their reference spacing equals their assembly spacing
+// (slope +1) or its negation (slope -1) within tol. Returns the slope sign, 0 if not.
+static int lift_collinear(const rb3_liftpt_t *x, const rb3_liftpt_t *y, int64_t tol)
+{
+	int64_t dc = y->cpos - x->cpos, dr = y->rpos - x->rpos;
+	if (x->rsid != y->rsid) return 0;
+	if (llabs(dr - dc) <= tol) return 1;
+	if (llabs(dr + dc) <= tol) return -1;
+	return 0;
+}
+
+static int lift_project_local(const rb3_lift_t *lf, int32_t csid, int64_t cpos,
+							  int64_t *out_rsid, int64_t *out_rpos)
+{
+	int64_t lo = lf->off[csid], hi = lf->off[csid + 1], j, l, r;
+	const rb3_liftpt_t *pt = lf->pt, *L = 0, *R = 0;
+	int s;
+	if (hi - lo < 2) return 0;
+	l = lo, r = hi; // j = first index with pt.cpos > cpos
+	while (l < r) { int64_t mid = (l + r) >> 1; if (pt[mid].cpos <= cpos) l = mid + 1; else r = mid; }
+	j = l;
+	if (j - 1 >= lo && cpos - pt[j-1].cpos <= lift_local_win) L = &pt[j-1];
+	if (j < hi && pt[j].cpos - cpos <= lift_local_win) R = &pt[j];
+	if (L && R && (s = lift_collinear(L, R, lift_local_tol)) != 0) { // bracketed by a collinear pair
+		int64_t v = L->rpos + s * (cpos - L->cpos), a = L->rpos < R->rpos? L->rpos : R->rpos, b = L->rpos < R->rpos? R->rpos : L->rpos;
+		*out_rsid = L->rsid, *out_rpos = v < a? a : v > b? b : v;
+		return 1;
+	}
+	// one-sided: the nearer anchor, confirmed by the next anchor on the same side
+	{
+		const rb3_liftpt_t *N = 0, *N2 = 0;
+		int64_t dL = L? cpos - L->cpos : -1, dR = R? R->cpos - cpos : -1;
+		if (L && (!R || dL <= dR)) { N = L; N2 = (j - 2 >= lo && L->cpos - pt[j-2].cpos <= lift_local_win)? &pt[j-2] : 0; }
+		else if (R) { N = R; N2 = (j + 1 < hi && pt[j+1].cpos - R->cpos <= lift_local_win)? &pt[j+1] : 0; }
+		if (N && N2 && (s = lift_collinear(N, N2, lift_local_tol)) != 0) {
+			*out_rsid = N->rsid, *out_rpos = N->rpos + s * (cpos - N->cpos);
+			if (*out_rpos < 0) *out_rpos = 0;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+// Optional ROBUST local projection (lift_chain_nb > 0; replaces lift_project_local).
+// lift_project_local trusts the two anchors immediately flanking the hit. At s200 a
+// stray anchor (a B73-unique k-mer whose assembly copy is a TE/paralog elsewhere) sits
+// next to most hits in divergent sequence, so the flanking pair is "not collinear" and
+// the hit falls through to the 500kb median, which lands 10-100kb off (in-panel Ki3
+// 0.1x: 24% of per-assembly projections, only 4% of them within 2kb of the truth).
+// Here an anchor is kept only if it is collinear with one of its next nb anchors (real
+// alignment chains come in runs of anchors, strays are singletons); the dominant
+// (reference sequence, strand) among the kept anchors wins; the hit is interpolated
+// between the nearest kept anchors on each side when they agree, else extrapolated
+// from the nearer one and clamped between the two. Kept anchors whose diagonal is more
+// than max_mad from the dominant set's median diagonal are ignored too (chained strays:
+// a TE copy elsewhere on the same chromosome also yields runs of collinear anchors).
+// Windows: 5*local_win, then win; failing both, the wide median below runs unchanged.
+static int32_t lift_chain_nb = 0, lift_chain_interp = 0;
+
+void rb3_lift_set_chain(int32_t nb, int interp)
+{
+	lift_chain_nb = nb, lift_chain_interp = interp;
+}
+
+static int i64_cmp(const void *x, const void *y)
+{
+	int64_t a = *(const int64_t*)x, b = *(const int64_t*)y;
+	return a < b? -1 : a > b;
+}
+
+static int lift_project_chain_win(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos, int64_t W, int64_t D,
+								  int64_t *out_rsid, int64_t *out_rpos)
+{
+	const rb3_liftpt_t *pt = lf->pt;
+	int64_t lo = lf->off[csid], hi = lf->off[csid + 1], a, b, n, i, k, l, r, best_key = -1, best_n = 0;
+	int8_t *sg;
+	int64_t vals[256], cnts[256]; int nv = 0, u;
+	l = lo, r = hi; while (l < r) { int64_t m = (l + r) >> 1; if (pt[m].cpos < cpos - W) l = m + 1; else r = m; } a = l;
+	l = a, r = hi; while (l < r) { int64_t m = (l + r) >> 1; if (pt[m].cpos <= cpos + W) l = m + 1; else r = m; } b = l;
+	n = b - a;
+	if (n < 2) return 0;
+	sg = Kcalloc(km, int8_t, n);
+	for (i = 0; i < n; ++i)
+		for (k = 1; k <= lift_chain_nb && i + k < n; ++k) {
+			int s = lift_collinear(&pt[a + i], &pt[a + i + k], lift_local_tol);
+			if (s == 0) continue;
+			if (sg[i] == 0) sg[i] = s;
+			if (sg[i + k] == 0) sg[i + k] = s;
+		}
+	for (i = 0; i < n; ++i) { // tally (rsid, strand) over kept anchors
+		int64_t key, f = -1;
+		if (sg[i] == 0) continue;
+		key = (int64_t)pt[a + i].rsid * 2 + (sg[i] > 0);
+		for (u = 0; u < nv; ++u) if (vals[u] == key) { f = u; break; }
+		if (f < 0) { if (nv < 256) vals[nv] = key, cnts[nv++] = 1; }
+		else ++cnts[f];
+	}
+	for (u = 0; u < nv; ++u) if (cnts[u] > best_n) best_n = cnts[u], best_key = vals[u];
+	if (best_n < 2) { kfree(km, sg); return 0; }
+	{
+		const rb3_liftpt_t *L = 0, *R = 0;
+		int s = (best_key & 1)? 1 : -1;
+		int64_t *dg = Kmalloc(km, int64_t, best_n), nd = 0, med;
+		for (i = 0; i < n; ++i) // median diagonal of the dominant chain set: excludes chained TE/paralog strays
+			if (sg[i] != 0 && (int64_t)pt[a + i].rsid * 2 + (sg[i] > 0) == best_key)
+				dg[nd++] = pt[a + i].rpos - s * pt[a + i].cpos;
+		qsort(dg, nd, 8, i64_cmp);
+		med = dg[nd >> 1];
+		kfree(km, dg);
+		for (i = 0; i < n; ++i) {
+			const rb3_liftpt_t *p = &pt[a + i];
+			if (sg[i] == 0 || (int64_t)p->rsid * 2 + (sg[i] > 0) != best_key) continue;
+			if (llabs(p->rpos - s * p->cpos - med) > D) continue;
+			if (p->cpos <= cpos) L = p;
+			else { R = p; break; }
+		}
+		kfree(km, sg);
+		if (!L && !R) return 0;
+		*out_rsid = best_key >> 1;
+		if (L && R) {
+			int64_t dL = cpos - L->cpos, dR = R->cpos - cpos;
+			int64_t vL = L->rpos + s * dL, vR = R->rpos - s * dR, v, x0, x1;
+			x0 = L->rpos < R->rpos? L->rpos : R->rpos, x1 = L->rpos < R->rpos? R->rpos : L->rpos;
+			if (llabs(vL - vR) <= lift_local_tol || lift_chain_interp) v = L->rpos + (int64_t)((double)(R->rpos - L->rpos) * dL / (dL + dR > 0? dL + dR : 1) + .5);
+			else v = dL <= dR? vL : vR;
+			*out_rpos = v < x0? x0 : v > x1? x1 : v;
+		} else {
+			const rb3_liftpt_t *N = L? L : R;
+			*out_rpos = N->rpos + s * (cpos - N->cpos);
+			if (*out_rpos < 0) *out_rpos = 0;
+		}
+		return 1;
+	}
+}
+
+static int lift_project_chain(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos, int64_t win, int64_t max_mad,
+							  int64_t *out_rsid, int64_t *out_rpos)
+{
+	int64_t W[2]; int t;
+	W[0] = 5 * lift_local_win, W[1] = win;
+	for (t = 0; t < 2; ++t) {
+		if (t > 0 && W[t] <= W[t-1]) continue;
+		if (lift_project_chain_win(lf, km, csid, cpos, W[t], max_mad, out_rsid, out_rpos)) return 1;
+	}
+	return 0;
+}
+
 // Core projector. Finds the reference coordinate for a assembly hit by fitting a
 // colinear model to nearby shared anchors. When `allow_bp` and the locus is NOT
 // colinear (an insertion/PAV sits between the flanking anchors -> large MAD), it
@@ -237,6 +400,13 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	int64_t a, b, i, n, cnt, best_rsid, best_n, sign;
 	int64_t *resP, *resM, madP, madM, med;
 	rb3_liftpt_t *pt = lf->pt;
+	rb3_lift_last_path = 0;
+	if (lift_local_win > 0 && (lift_chain_nb > 0? lift_project_chain(lf, km, csid, cpos, win, max_mad, out_rsid, out_rpos)
+	                                             : lift_project_local(lf, csid, cpos, out_rsid, out_rpos))) {
+		rb3_lift_last_path = 1;
+		if (out_mode) *out_mode = 0;
+		return 1;
+	}
 	if (hi - lo < min_support) return 0;
 	// binary search the window [cpos-win, cpos+win] within [lo,hi)
 	{
@@ -297,6 +467,7 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 				}
 				if (bp < 0) return 0;
 				*out_rsid = best_rsid, *out_rpos = bp;
+				rb3_lift_last_path = 3;
 				if (out_mode) *out_mode = 1;
 				return 1;
 			}
@@ -304,6 +475,7 @@ static int lift_project_core(const rb3_lift_t *lf, void *km, int32_t csid, int64
 	}
 	*out_rsid = best_rsid;
 	*out_rpos = sign * cpos + med;
+	rb3_lift_last_path = 2;
 	if (*out_rpos < 0) *out_rpos = 0;   // extrapolation past a chromosome start -> clamp
 	if (out_mode) *out_mode = 0;
 	kfree(km, resP); kfree(km, resM);
@@ -329,6 +501,102 @@ int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cp
 						int64_t *out_rsid, int64_t *out_rpos, int *out_mode)
 {
 	return lift_project_core(lf, km, csid, cpos, win, max_mad, min_support, 1, out_rsid, out_rpos, out_mode);
+}
+
+/* ---- reference-position index (nearest-anchor queries) ----------------- */
+
+// rb3_lift_t.pt[] is sorted by (csid,cpos) -- fine for the carrier-side projection
+// in lift_project_core, but useless for "nearest anchor to reference position X for
+// founder G", which is what a per-founder read-sharing/distance feature needs. This
+// builds a second index over the SAME points: perm[] is a permutation of point
+// indices into lf->pt, bucketed by (gamete,rsid) and sorted by rpos within each
+// bucket, via a two-pass counting sort (same off[]-then-place idiom as
+// lift_builder_finalize's own (csid)-keyed off[] above) followed by one qsort per
+// bucket. off[] has n_gamete*n_seq+1 entries; most (gamete,rsid) combinations are
+// empty (a founder only ever has anchors on its own chromosomes) but at real panel
+// sizes (~25 gametes x ~24000 sequences) that's a few MB, not worth compacting.
+struct rb3_lift_ridx_s {
+	int32_t n_gamete;
+	int64_t n_seq;   // == lf->n_seq; also the per-gamete bucket count (indexed by rsid)
+	int64_t *off;    // off[g*n_seq+rsid]..off[g*n_seq+rsid+1] = range in perm[]
+	int32_t *perm;   // n_pt entries: index into lf->pt, bucketed by (g,rsid), sorted by rpos
+	const rb3_lift_t *lf; // NOT owned; caller must keep lf alive at least as long as this index
+};
+
+static const rb3_liftpt_t *ridx_sort_pt; // scratch for ridx_perm_cmp during the single-threaded per-bucket sort below
+
+static int ridx_perm_cmp(const void *a, const void *b)
+{
+	int64_t xa = ridx_sort_pt[*(const int32_t*)a].rpos;
+	int64_t xb = ridx_sort_pt[*(const int32_t*)b].rpos;
+	return xa < xb? -1 : xa > xb? 1 : 0;
+}
+
+rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g, int32_t n_gamete)
+{
+	rb3_lift_ridx_t *ridx;
+	int64_t i, n_buckets, *cursor;
+	if (lf == 0 || sid2g == 0 || n_gamete <= 0) return 0;
+	ridx = RB3_CALLOC(rb3_lift_ridx_t, 1);
+	ridx->n_gamete = n_gamete;
+	ridx->n_seq = lf->n_seq;
+	ridx->lf = lf;
+	n_buckets = (int64_t)n_gamete * lf->n_seq;
+	ridx->off = RB3_CALLOC(int64_t, n_buckets + 1);
+	ridx->perm = RB3_MALLOC(int32_t, lf->n_pt > 0? lf->n_pt : 1);
+	for (i = 0; i < lf->n_pt; ++i) { // pass 1: bucket sizes -> off[key+1]
+		int32_t g = sid2g[lf->pt[i].csid];
+		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
+		ridx->off[key + 1]++;
+	}
+	for (i = 0; i < n_buckets; ++i) ridx->off[i+1] += ridx->off[i]; // prefix sum
+	cursor = RB3_MALLOC(int64_t, n_buckets);
+	memcpy(cursor, ridx->off, n_buckets * sizeof(int64_t));
+	for (i = 0; i < lf->n_pt; ++i) { // pass 2: place into perm[] via the cursor
+		int32_t g = sid2g[lf->pt[i].csid];
+		int64_t key = (int64_t)g * lf->n_seq + lf->pt[i].rsid;
+		ridx->perm[cursor[key]++] = (int32_t)i;
+	}
+	free(cursor);
+	ridx_sort_pt = lf->pt; // pass 3: sort each bucket's slice of perm[] by rpos
+	for (i = 0; i < n_buckets; ++i) {
+		int64_t lo = ridx->off[i], hi = ridx->off[i+1];
+		if (hi - lo > 1) qsort(ridx->perm + lo, hi - lo, sizeof(int32_t), ridx_perm_cmp);
+	}
+	return ridx;
+}
+
+void rb3_lift_ridx_destroy(rb3_lift_ridx_t *ridx)
+{
+	if (ridx == 0) return;
+	free(ridx->off); free(ridx->perm); free(ridx);
+}
+
+int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_t rsid, int64_t rpos)
+{
+	int64_t key, lo, hi, l, r, best = -1;
+	if (ridx == 0 || gamete < 0 || gamete >= ridx->n_gamete || rsid < 0 || rsid >= ridx->n_seq) return -1;
+	key = (int64_t)gamete * ridx->n_seq + rsid;
+	lo = ridx->off[key], hi = ridx->off[key + 1];
+	if (hi <= lo) return -1; // this gamete has no anchor at all on this reference sequence
+	l = lo, r = hi; // first index with pt[perm[idx]].rpos >= rpos
+	while (l < r) {
+		int64_t mid = (l + r) >> 1;
+		if (ridx->lf->pt[ridx->perm[mid]].rpos < rpos) l = mid + 1; else r = mid;
+	}
+	if (l < hi) best = ridx->lf->pt[ridx->perm[l]].rpos - rpos;       // nearest anchor at/after rpos
+	if (l > lo) {                                                     // nearest anchor before rpos
+		int64_t d = rpos - ridx->lf->pt[ridx->perm[l-1]].rpos;
+		if (best < 0 || d < best) best = d;
+	}
+	return best;
+}
+
+int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh)
+{
+	if (in_gameteset) return 1;
+	if (dist >= 0 && dist <= thresh) return 0;
+	return -1;
 }
 
 /* ---- the `lift` subcommand (build + dump) ------------------------------ */

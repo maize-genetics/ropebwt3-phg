@@ -159,6 +159,12 @@ ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 
 # 2. place queries through it
 ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift pan.fmd query.fa
+
+# 3. optional: also export a per-founder ternary read-sharing matrix and a
+#    per-founder distance-to-lift-anchor matrix, packed into the same --npy
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift pan.lift \
+  --npy=pan.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  pan.fmd query.fa
 ```
 
 Output is one tab-separated line per query with columns: 1) query name, 2) query
@@ -173,6 +179,20 @@ repeat/retro) and is deliberately not placed.
 With `--report-occ`, one more column is appended: 12) `occ`, the pangenome-wide
 FM-index occurrence count (a copy-number signal), off by default — passing no
 flag reproduces today's output byte-for-byte.
+
+With `--npy=FILE --anchor-dist-npy` (step 3 above), the numpy array widens from
+`(n_gametes+2)` to `(3*n_gametes+2)` columns: the usual read-count/presence
+block, then a per-founder **ternary read-sharing** state (`1`=match,
+`0`=diverged, `-1`=deletion relative to reference), then a per-founder
+**distance to that founder's nearest `ropebwt3 lift` anchor**, in bp
+(`-1`=no anchor at all on this reference sequence), before the usual `gA`/`gB`
+diploid training labels. `--anchor-dist-thresh=NUM` sets the bp cutoff between
+diverged and deletion [2000, matching `ropebwt3 lift`'s default anchor stride
+`-s`]. The reference genome's own gamete always has distance 0 (it has zero
+liftover anchors by construction), so it is never a deletion: it reads match
+when the row's reads carry it and diverged otherwise. A `<npy>.layout.tsv` sidecar
+records the exact column ranges; `--npy` without `--anchor-dist-npy` is
+unchanged.
 
 Options:
 
@@ -194,6 +214,11 @@ Options:
   whole read set.
 * `--report-occ` appends a pangenome-wide occurrence-count ("copy number")
   column, off by default (opt-in).
+* `--anchor-dist-npy` (with `--npy` and `--lift`) widens the numpy array with
+  a per-founder ternary read-sharing block and a per-founder
+  distance-to-nearest-lift-anchor block, off by default (opt-in; see above).
+  `--anchor-dist-thresh=NUM` sets the diverged/deletion distance cutoff in bp
+  [2000].
 
 A query that matches a carrier only partially (e.g. one mismatch) is placed via
 its longest exact core; in that case the reported inserted size is approximate.
@@ -201,6 +226,97 @@ its longest exact core; in that case the reported inserted size is approximate.
 See [docs/usage.md](docs/usage.md) for a full guide (§7 PS4G/numpy output,
 §8 `--target-hits`) and a runnable example ([docs/examples/](docs/examples/),
 `sh docs/examples/run.sh`).
+
+#### Paired-end reads (`--paired`)
+
+`refmap --paired` reads mate pairs, from two files (`R1.fq R2.fq`) or from one interleaved file
+whose mates sit next to each other. Mate names must match up to a trailing `/1` or `/2`. Each
+mate is placed exactly as in single-end mode. Then each pair is classified, and the class is
+appended to both mates' stdout rows as one extra column:
+
+| class | meaning | PS4G/npy |
+|---|---|---|
+| `CONC` | both mates placed on one contig within `max_ins + --pe-slack` | one event, at the more confident mate |
+| `RESC` / `MOVED` | discordant, but a PLACED mate has a lift projection near the other mate; the `MOVED` mate is re-placed there | one event |
+| `SOLO` | only one mate placed | one event |
+| `DISC` | discordant, not rescuable | each mate is its own event, as in single-end mode |
+| `NONE` | neither mate placed | none |
+
+A pair event's founder set is the intersection of the two mates' sets: the founders that carry
+the whole fragment. It falls back to the anchor mate's set when the intersection is empty. A
+`MOVED` mate keeps only the founders whose own copy projected near its mate, so a TE/paralog copy
+elsewhere (on another chromosome, or more than `--pe-near-win` away) does not count.
+`--pe-near-win` [100000] is a founder-set tolerance, not the mate gap: pairing and rescue still use
+max insert + `--pe-slack` (about 2.7 kb). It is wide because lift projections are often 2–20 kb
+off. With it set to that 2.7 kb, true founders were dropped; on simulated maize, refmap then
+lost 0.65 pp of per-fragment recall vs single-end, against 0.19 pp at 100 kb, for +0.03 in mean
+founder set and no change in positions. `max_ins` comes from a per-batch, bwa-style estimate over EXACT/EXACT
+pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defaults to 2000 bp,
+the lift-projection error scale. An EXACT mate's other reference copies count as
+alternative positions too, so pairing also picks the right copy of a duplicated sequence.
+`--pe-trust-exact` (opt-in) moves the PLACED mate of an unrescuable EXACT + PLACED pair onto the
+EXACT mate. The PS4G/npy layout is unchanged. `--paired` works with `refmap` and `mem`; `chain`
+and `sw` reject it.
+
+**`-p` has no effect on `refmap`; use `--max-locate=INT` [256].** It sets how many occurrences of
+each read refmap locates; the rest are not sampled. Too small a value truncates a read's
+gameteSet, and if the read's reference copy isn't sampled, the read is called PLACED instead of
+EXACT. A read whose sample was capped can't veto its mate's founders under `--paired`.
+
+`--max-locate` only matters when `--max-occ` lets reads through with more occurrences than the
+sample holds: `--max-occ=0` (off, the default) or `--max-occ` > `--max-locate`. With the usual
+`--max-occ=-1` (auto = one per genome, 25 for the maize index), every read with more
+occurrences is dropped as MULTI first. Every kept read is then located in full and
+`--max-locate` changes nothing; refmap warns about this. On the simulated maize pairs, output at
+`--max-locate=1024` was byte-identical to 256 under `--max-occ=-1`. So refmap's ~1.5 pp
+paired-mode loss of true-founder recall does not come from sampling. Raise `--max-locate` with
+`--paired` only if you run with `--max-occ=0` or a large `--max-occ`.
+
+```sh
+ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=pe.npy \
+  pan.fmd R1.fq R2.fq > pe.tsv
+```
+
+#### Paired-end `mem` (`--paired`)
+
+`mem --paired -p INT` takes the same inputs as `refmap --paired`. Each SMEM hit implies where the
+whole read starts on that contig. Two mates are concordant on a contig when they hit it on
+opposite strands with implied starts within the insert size. In a pangenome, the concordant
+contigs are the assemblies that carry the whole fragment. A concordant pair (`CONC`) prints only
+its concordant positions; `DISC`, `SOLO` and `NONE` pairs print everything. Every row gets a
+trailing class column.
+
+One exception: if a mate's longest SMEM has more occurrences than `-p` located, that mate's hits
+are only a sample. It cannot rule out its partner's hits, so the partner keeps all of its
+positions. The insert size is estimated from mates with whole-read SMEMs, or set with
+`--pe-isize`. `--pe-slack` defaults to 0 here, because SMEM positions are exact.
+
+**With `--paired`, raise `-p` well above what you would use single-end.** `-p` caps how many
+occurrences of each SMEM are located. In a pangenome, even a low-copy repeat exceeds a small cap.
+The located positions are then only a sample, which often misses the read's true locus, and the
+mate can't confirm the locus. Pairing is what makes a large `-p` affordable: the concordance
+filter prunes a repetitive read's extra copies down to the one next to its mate, so founder sets
+don't grow. `-p` keeps its usual default (`--paired` without `-p` is an error). Measured on 500k
+simulated 150 bp pairs from an in-panel maize line, 25-genome index, 16 threads:
+
+| `-p` | true founder at true locus | mean founder set | wrong B73 placement | discordant pairs | wall time |
+|---|---|---|---|---|---|
+| 128 | 91.4% | 9.1 | 3.8% | 29.5k | 77 s |
+| 1024 | **96.2%** | **8.8** | **1.8%** | 8.9k | 171 s |
+
+At `-p 128`, reads whose longest SMEM was only partly located caused 7.3 of the 8.5 pp of misses;
+fully located reads miss 1.3% of the time. **Start with `-p 1024`.** Go higher only if many reads
+are still capped: in a single-end run, compare column 4 (the SMEM's occurrence count) with column 5
+(positions located). In paired `CONC` rows, column 5 counts only the concordant positions. The cost is time and output size; memory barely changes (about 9 GB).
+
+`DISC` pairs, whose mates have no concordant contig, are printed and labelled rather than
+dropped. Filtering them downstream works like minimap2's proper-pair filter: wrong B73
+placements fall from 1.8% to 1.5% of reads, at the cost of 1.5% of reads in-panel and 5% for a
+held-out line (whose divergence from every founder yields more discordant pairs).
+
+```sh
+ropebwt3 mem --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.mem.tsv
+```
 
 ### <a name="chain"></a>RNAseq: chaining and PAV placement
 
@@ -232,16 +348,71 @@ ropebwt3 lift --ref-prefix=B73 -t 20 -o pan.lift pan.fmd B73.fa
 ropebwt3 chain --ref-prefix=B73 --lift pan.lift -l 31 -t 20 pan.fmd reads.fq
 ```
 
-This adds a fifth column naming the row class:
+This adds a fifth column naming the row class, when the row is emitted with the
+`pav:` schema (see `--insertion-rows` below):
 
-* **`1` = insertion** — absent from the reference. The contig is prefixed `pav:`
-  and the position is the nearest breakpoint, snapped to `--pav-grid` (default
-  5000). This is **presence/absence evidence only**: the coordinate is deliberately
-  coarse, because a breakpoint is not a base-level position.
+* **`1` = insertion** — absent from the reference. By default the contig is
+  prefixed `pav:` and the position is the nearest breakpoint, snapped to
+  `--pav-grid` (default 5000). This is **presence/absence evidence only**: the
+  coordinate is deliberately coarse, because a breakpoint is not a base-level
+  position. `--insertion-rows=ordinary` instead emits it as an ordinary row at
+  the exact (unsnapped) median projected position — see below.
 * **`0` = diverged** — present in the reference but too divergent to share an exact
   match. The coordinate is colinear and exact, so by default these are emitted as
   **ordinary rows** (no `pav:` prefix, no snapping) and need no special handling
   downstream. `--diverged-rows=ordinary|pav|drop` changes that.
+
+`--ps4g`, `--npy`, `--label-bed`, `--bin-size`, and `--npy-binary` (documented
+under [`refmap`](#refmap) above) apply to `chain` too: every row shown on stdout,
+`pav:`-prefixed or not, folds into the same PS4G/npy accumulator. The
+accumulator itself has no concept of the `pav:` prefix — it always keys on the
+row's real reference sequence and (possibly grid-snapped) position, so a `pav:`
+row and an ordinary row landing on the same contig/bin/gameteSet are
+indistinguishable once aggregated. `--insertion-rows=ordinary` avoids the
+ambiguity by construction, since it never emits a coarse, prefix-only row.
+
+#### Ternary read-sharing block (`--anchor-dist-npy`)
+
+`chain` writes the same per-founder ternary + distance block as `refmap` (see
+[above](#refmap)), with the same options, defaults and validation
+(`--anchor-dist-npy` needs `--npy` and `--lift`), the same
+`(3*n_gametes+2)`-column int32 layout and the same `.bins.tsv`/`.gametes.tsv`/
+`.layout.tsv` sidecars, so downstream readers consume it unchanged:
+
+```sh
+ropebwt3 chain --ref-prefix=B73 --lift pan.lift --lift-local-win=20000 -t 20 \
+  --insertion-rows=ordinary --ps4g=reads.ps4g \
+  --npy=reads.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  pan.fmd reads.fq > reads.tsv
+```
+
+Both commands share one code path: every row printed on stdout is folded into
+the PS4G/npy accumulator as (reference contig, row start, founder set), and the
+ternary/distance columns are derived per npy row (contig, bin, founder set)
+exactly as for `refmap`. For a chained read this means:
+
+* **match (1)** — the founder is in the read's founder set, i.e. it carries
+  *every* SMEM of the winning colinear chain (the chain-wide intersection, the
+  same set printed in column 4 and counted in the PS4G file). As in `refmap`,
+  match is exactly "count > 0" in that row.
+* **diverged (0) / deletion (-1)** — any other founder, split by the distance
+  from the row's bin start to that founder's nearest `lift` anchor:
+  `<= --anchor-dist-thresh` is diverged, farther (or no anchor on that
+  contig) is a deletion. The reference gamete is never a deletion.
+* **Spliced reads.** A read split by an intron gives one row per exon segment
+  at that segment's own start (as on stdout), each carrying the whole read's
+  founder set; diverged/deletion is judged at each segment's own position, so a
+  founder can be diverged at one exon and deleted at another. A founder that
+  lacks any one exon does not support the read, the same whole-read standard
+  `refmap` uses.
+* **PAV rows** (with `--lift`, reads with no reference SMEM) use the assembly-only
+  founder set and the projected position. Grid-snapped insertion rows (the
+  default `--insertion-rows=pav`) are looked up at the snapped coordinate, up to
+  `--pav-grid` bp from the breakpoint, and `chain` warns about it; pass
+  `--insertion-rows=ordinary` to keep them at the exact projected position.
+
+`--lift-local-win`/`--lift-local-tol` apply to `chain`'s lift projections as
+they do to `refmap`'s.
 
 Options:
 
@@ -265,9 +436,73 @@ Options:
   row [60]. The assembly-only path has no colinear reference confirmation, so it
   needs a longer floor than `-l`.
 * `--diverged-rows=STR` routing for diverged rows [ordinary].
+* `--insertion-rows=STR` routing for true-insertion rows: `ordinary` emits the
+  read inline on its real contig at the exact (unsnapped) median — more precise
+  than the grid-snapped `pav:` row, since `--pav-grid` floors rather than
+  centers, and it keeps the evidence positionally inline with ordinary rows for
+  downstream per-contig windowing; `pav` is the grid-snapped, `pav:`-prefixed
+  row (**default**, unchanged from prior behavior); `drop` discards the row
+  entirely [pav].
+* `--anchor-dist-npy` (with `--npy` and `--lift`) / `--anchor-dist-thresh=NUM`
+  write the per-founder ternary + distance block, as for `refmap` [off / 2000].
 * `--trim-polya=INT` trim a terminal poly-A/poly-T run before searching [0 = off].
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
+
+#### Paired-end `sw` (`--paired`)
+
+`sw --paired -p INT` uses the same inputs and the same per-assembly concordance as
+`mem --paired`. Each PAF hit's located positions imply where the whole read starts on each
+contig. Two mates are concordant on a contig when they hit it on opposite strands with implied
+starts within the insert. A `CONC` pair's lines keep only concordant positions: a concordant
+one becomes the primary (columns 6–9) and the rest go in `ap:Z`. A hit left with none is
+dropped. `rh:i` still reports the hit's full occurrence count. Every line gets a `pe:Z:` tag
+(`CONC`/`DISC`/`SOLO`/`NONE`); `DISC` pairs keep all their positions.
+
+**Use a large `-p`; start with `-p 1024`.** In `sw`, `-p` is a per-read *budget* of positions,
+and `-p 0` (the default) locates just one occurrence per hit. A mate whose best hit was only
+partly located cannot veto its partner's positions. `--paired` without `-p` is an error, and so
+is `--paired` with `--all-e2e`. `--pe-slack` defaults to 0.
+
+Measured on 500k simulated 150 bp pairs, `-p 1024`, 16 threads. For an in-panel line, the true
+founder was at the true locus for 96.69% of reads single-end and 96.64% paired. Mean founder set
+fell from 12.0 to 8.7 assemblies, and wrong B73 placements from 4.2% to 1.8% of reads. Dropping
+`DISC` pairs gives 97.95% locus precision and 1.33% wrong B73, at the cost of 2.5% of reads
+(8.4% for a held-out line). Runtime is about 240 s per 500k pairs and 17–20 GB RAM, about 1.4×
+slower than `mem --paired`.
+
+```sh
+ropebwt3 sw --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.paf
+```
+
+#### Paired-end `chain` (`--paired`)
+
+`chain --paired` takes the same inputs as `refmap --paired` (R1 R2, or one interleaved file).
+Each mate is chained as in single-end mode, then the pair is classified:
+
+* **`CONC`.** Both mates have rows on the same contig, on opposite strands (when both are
+  reference chains), and the gap between their spans is at most max insert + `--max-intron` +
+  `--pe-slack`. `--pe-slack` defaults to 0 here, because chain positions are exact. A
+  lift-placed (PAV-path) mate gets 2 kb extra, since its position is a projection. The gap is
+  measured between the mates' spans, so a spliced mate's own intron doesn't count. The
+  `--max-intron` allowance lets RNAseq mates that straddle an intron still pair.
+* **`SOLO`.** Only one mate has rows.
+* **`DISC`.** Both mates have rows but no concordant placement. Each mate is emitted as in
+  single-end mode.
+
+`CONC` and `SOLO` pairs give **one row and one PS4G/npy event**, named after the fragment
+(`/1` and `/2` dropped), at the anchor mate's first segment. The anchor is a reference chain over
+a lift row, then the mate with more chained bases. The founder set is the intersection of the
+mates' sets, falling back to the anchor's set if they share none. With `--support=best` it is the
+intersection of the two mates' best sets. `--dup-count` takes `;x=N` from mate 1's name, so name a
+collapsed pair `<frag>;x=N/1` and `<frag>;x=N/2`. Every row gets a trailing pair-class column,
+after the `pav:` rows' 5th column. The insert size is estimated from pairs whose mates are both
+single-segment reference chains, or set with `--pe-isize`.
+
+```sh
+ropebwt3 chain --ref-prefix=B73 --lift=pan.lift --paired --support=best --ps4g=pe.ps4g \
+  pan.fmd R1.fq R2.fq > pe.chain.tsv
+```
 
 ### <a name="deprecated"></a>Deprecated
 

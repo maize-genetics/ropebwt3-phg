@@ -344,6 +344,403 @@ check_eq "--diverged-rows=drop leaves the all-insertion output unchanged" \
 	>/dev/null 2>"$TMP/badarg.log"
 check_eq "--diverged-rows rejects an invalid value" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
 
+# --- 6. chain --anchor-dist-npy: the same ternary + distance block refmap writes ---
+# chain feeds the same PS4G/npy accumulator as refmap, so --anchor-dist-npy must give the same
+# (3*n_gamete+2)-column layout and sidecars. A synthetic spliced read (B73[0,60) + B73[400,460),
+# a 340 bp "intron") checks that each exon segment becomes its own row at its own start bin,
+# carrying the read's chain-wide founder set.
+B73_SEQ=$(awk '/^>B73_chr1/{f=1;next}/^>/{f=0}f' "$DIR/pangenome.fa" | tr -d '\n')
+{ cat "$DIR/queries.fa"; printf '>spliced_query\n%s%s\n' "${B73_SEQ:0:60}" "${B73_SEQ:400:60}"; } > "$TMP/chain_q.fa"
+
+"$RB" chain --ref-prefix=B73 --npy "$TMP/cad_nolift.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>"$TMP/cad_nolift.log"
+check_eq "chain --anchor-dist-npy without --lift exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+check_line_in "chain --anchor-dist-npy without --lift names the missing option (same error as refmap)" \
+	"$TMP/cad_nolift.log" "ERROR: --anchor-dist-npy requires --lift=FILE"
+
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad_plain.ps4g" --npy "$TMP/cad_plain.npy" \
+	-t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad_plain.tsv" 2>/dev/null
+check_eq "chain --npy (plain) exits 0" "$?" "0"
+"$RB" chain --ref-prefix=B73 --lift="$LIFT" --pav-grid=0 --ps4g "$TMP/cad.ps4g" --npy "$TMP/cad.npy" \
+	--anchor-dist-npy --anchor-dist-thresh=2000 -t1 "$IDX" "$TMP/chain_q.fa" > "$TMP/cad.tsv" 2>/dev/null
+check_eq "chain --anchor-dist-npy exits 0" "$?" "0"
+check_eq "chain --anchor-dist-npy leaves stdout unchanged" \
+	"$(cmp -s "$TMP/cad_plain.tsv" "$TMP/cad.tsv" && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves the PS4G file unchanged (modulo #Command)" \
+	"$(cmp -s <(grep -v '^#Command' "$TMP/cad_plain.ps4g") <(grep -v '^#Command' "$TMP/cad.ps4g") && echo same || echo differ)" "same"
+check_eq "chain --anchor-dist-npy leaves bins.tsv unchanged" \
+	"$(cmp -s "$TMP/cad_plain.npy.bins.tsv" "$TMP/cad.npy.bins.tsv" && echo same || echo differ)" "same"
+check_line_in "chain spliced read: exon 1 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t0\t0,1,2,3,4,5,6')"
+check_line_in "chain spliced read: exon 2 row at its own start" "$TMP/cad.tsv" "$(printf 'spliced_query\tchr1\t400\t0,1,2,3,4,5,6')"
+cad_header=$(head -c 200 "$TMP/cad.npy" | tr -d '\0')
+cad_shape=$(echo "$cad_header" | grep -oE "'shape': \([0-9]+, [0-9]+\)" | grep -oE '[0-9]+' | tr '\n' ' ')
+check_eq "chain --anchor-dist-npy: 4 rows x 23 columns (3*7 gametes + 2 labels)" "$cad_shape" "4 23 "
+check_line_in "chain --anchor-dist-npy writes the layout sidecar (ternary block)" "$TMP/cad.npy.layout.tsv" \
+	"$(printf 'ternary\t7\t14\tmatch(1)/diverged(0)/deletion(-1) per founder')"
+check_eq "plain chain --npy writes no layout sidecar" "$([ -e "$TMP/cad_plain.npy.layout.tsv" ] && echo yes || echo no)" "no"
+
+"$RB" refmap --ref-prefix=B73 --lift="$LIFT" --npy "$TMP/rad.npy" --anchor-dist-npy -t1 "$IDX" "$TMP/chain_q.fa" \
+	>/dev/null 2>/dev/null
+check_eq "refmap --anchor-dist-npy exits 0 on the same input" "$?" "0"
+check_eq "chain and refmap write the same layout sidecar" \
+	"$(cmp -s "$TMP/rad.npy.layout.tsv" "$TMP/cad.npy.layout.tsv" && echo same || echo differ)" "same"
+
+if [ -n "$NPY_PY" ]; then
+	"$NPY_PY" - "$TMP/cad_plain.npy" "$TMP/cad.npy" "$TMP/rad.npy" <<'EOF'
+import sys, numpy as np
+plain, wide, rwide = (np.load(f) for f in sys.argv[1:4])
+K = 7
+assert wide.dtype == np.int32 and wide.shape == (4, 3 * K + 2), wide.shape
+assert rwide.dtype == wide.dtype and rwide.shape[1] == wide.shape[1], (rwide.shape, wide.shape)
+# the count block and the label columns are exactly the plain --npy output
+assert (wide[:, :K] == plain[:, :K]).all() and (wide[:, -2:] == plain[:, -2:]).all()
+for a in (wide, rwide):  # refmap's definition, applied cell by cell, holds for both commands
+    cnt, tern, dist = a[:, :K], a[:, K:2*K], a[:, 2*K:3*K]
+    assert set(np.unique(tern)) <= {-1, 0, 1}
+    assert ((tern == 1) == (cnt > 0)).all(), "ternary match must be exactly the row's founder set"
+    off = tern != 1
+    assert ((tern == 0) == (off & (dist >= 0) & (dist <= 2000))).all()
+    assert ((tern == -1) == (off & ((dist < 0) | (dist > 2000)))).all()
+    assert (dist[:, 0] == 0).all(), "reference gamete distance is 0 by construction"
+# rows: bin0 {B73} (ref_query), bin0 {1..6} (insertion reads), bin0 {all} and bin1 {all} (spliced read)
+assert wide[:, K:2*K].tolist() == [[1,0,0,0,0,0,0], [0,1,1,1,1,1,1], [1]*7, [1]*7], wide[:, K:2*K].tolist()
+assert wide[2, :K].tolist() == [1]*7 and wide[3, :K].tolist() == [1]*7, "one count per exon segment"
+print("CHAIN_ANCHOR_DIST_OK")
+EOF
+	if [ $? -eq 0 ]; then pass; else fail "chain --anchor-dist-npy numpy check raised an assertion"; fi
+else
+	echo "SKIP: chain --anchor-dist-npy numpy check needs a python3 with numpy" >&2
+fi
+
+# --- 7. chain never links SMEMs on different reference contigs ---
+# Two unrelated reference contigs: B73_chr1 (copied into Oh43) and B73_chr2 (copied into Mo17). The
+# read is 80 bp of chr1 at 1000 followed by 80 bp of chr2 at 1020, so the two SMEMs sit at
+# similar coordinates on different contigs. Linking them would emit one chr1 row whose founder set is
+# {B73,Oh43} ∩ {B73,Mo17} = {B73}; the colinear DP must instead keep them apart, leaving the best
+# single-contig chain. With this seed the chr2 SMEM extends 2 bp left into the chr1 half (the random
+# sequences share those bases), so it is the longer one and wins: chr2 at 1018, B73 + Mo17 = 0,1.
+awk 'BEGIN{srand(7); split("ACGT", b, ""); for (c = 1; c <= 2; ++c) { s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]; seq[c] = s }
+     print ">B73_chr1"; print seq[1]; print ">B73_chr2"; print seq[2]; print ">Oh43_chr1"; print seq[1]; print ">Mo17_chr2"; print seq[2]
+     print substr(seq[1], 1001, 80) substr(seq[2], 1021, 80) > "'"$TMP"'/xcontig_query.seq"}' > "$TMP/xcontig.fa"
+printf '>xcontig\n%s\n' "$(cat "$TMP/xcontig_query.seq")" > "$TMP/xcontig_query.fa"
+"$RB" build -d -o "$TMP/xcontig.fmd" "$TMP/xcontig.fa" >/dev/null 2>"$TMP/xcontig_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/xcontig.fmd.ssa" "$TMP/xcontig.fmd" >/dev/null 2>>"$TMP/xcontig_build.log"
+check_eq "cross-contig fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/xcontig.fa" | gzip > "$TMP/xcontig.fmd.len.gz"
+"$RB" chain --ref-prefix=B73 -t1 "$TMP/xcontig.fmd" "$TMP/xcontig_query.fa" > "$TMP/xcontig.tsv" 2>"$TMP/xcontig.log"
+check_eq "chain exits 0 (cross-contig read)" "$?" "0"
+check_eq "chain: one row for the cross-contig read" "$(grep -c '^xcontig' "$TMP/xcontig.tsv")" "1"
+check_line_in "chain: SMEMs on different contigs are not chained (best single-contig chain, B73 + Mo17)" \
+	"$TMP/xcontig.tsv" "$(printf 'xcontig\tchr2\t1018\t0,1')"
+check_eq "chain: no row with the cross-contig intersection {B73} alone" \
+	"$(awk -F'\t' '$1=="xcontig" && $4=="0"' "$TMP/xcontig.tsv" | wc -l | tr -d ' ')" "0"
+
+# --- 8. chain --support=best: founder set = the assemblies that best explain the read ---
+# B73_chr1 and Mo17_chr1 are identical random sequence; Zd_chr1 is the same with SNPs at 1130 and
+# 1160 -- a diverged allele. The donor read is Zd's [1100,1250) with one extra base change at read
+# offset 110 (the donor is a different accession than Zd), so it matches no assembly end to end:
+# SMEMs [0,110) in Zd only and [111,150) in all three (B73's own match [61,110) is contained in the
+# Zd SMEM, so it is not super-maximal). The default rule keeps only reference-hitting SMEMs, so the
+# read is called {B73,Mo17,Zd}; --support=best counts the Zd-only SMEM (150 bases for Zd vs 39) and
+# calls Zd alone, at the same placement. A B73-allele read
+# from the same region stays {B73,Mo17}; a read outside the diverged region stays {all three}.
+awk 'BEGIN{srand(11); split("ACGT", b, ""); s = ""; for (i = 0; i < 3000; ++i) s = s b[int(rand()*4)+1]
+     z = s; for (p = 1130; p <= 1160; p += 30) { c = substr(z, p+1, 1); n = (c == "A")? "C" : "A"; z = substr(z, 1, p) n substr(z, p+2) }
+     print ">B73_chr1"; print s; print ">Mo17_chr1"; print s; print ">Zd_chr1"; print z
+     d = substr(z, 1101, 150); c = substr(d, 111, 1); n = (c == "G")? "T" : "G"; d = substr(d, 1, 110) n substr(d, 112)
+     print ">donor_read\n" d > "'"$TMP"'/sup_q.fa"
+     print ">b73_read\n" substr(s, 1101, 150) >> "'"$TMP"'/sup_q.fa"
+     print ">shared_read\n" substr(s, 2001, 150) >> "'"$TMP"'/sup_q.fa"}' > "$TMP/sup.fa"
+"$RB" build -d -o "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_build.log" &&
+	"$RB" ssa -s8 -o "$TMP/sup.fmd.ssa" "$TMP/sup.fmd" >/dev/null 2>>"$TMP/sup_build.log"
+check_eq "support fixture builds" "$?" "0"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)}
+     END{if(n)print n"\t"l}' "$TMP/sup.fa" | gzip > "$TMP/sup.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 20 -o "$TMP/sup.lift" "$TMP/sup.fmd" "$TMP/sup.fa" >/dev/null 2>"$TMP/sup_lift.log"
+check_eq "support fixture lift builds" "$?" "0"
+SUPC="chain --ref-prefix=B73 -l 19 --lift=$TMP/sup.lift -t1"
+"$RB" $SUPC "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_default.tsv" 2>"$TMP/sup_default.log"
+check_eq "chain (default support) exits 0" "$?" "0"
+"$RB" $SUPC --support=chain "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_chain.tsv" 2>/dev/null
+check_eq "--support=chain is byte-identical to the default" "$(cmp -s "$TMP/sup_default.tsv" "$TMP/sup_chain.tsv" && echo same)" "same"
+check_eq "default rule: the donor read's set includes B73 (the bias --support=best fixes)" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_default.tsv")" "0,1,2"
+"$RB" $SUPC --support=best "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_best.tsv" 2>"$TMP/sup_best.log"
+check_eq "chain --support=best exits 0" "$?" "0"
+check_eq "--support=best: donor read -> Zd alone (gamete 2), same placement as default" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3":"$4}' "$TMP/sup_best.tsv")" \
+	"$(awk -F'\t' '$1=="donor_read"{print $2":"$3}' "$TMP/sup_default.tsv"):2"
+check_eq "--support=best: B73-allele read -> B73 + Mo17" \
+	"$(awk -F'\t' '$1=="b73_read"{print $4}' "$TMP/sup_best.tsv")" "0,1"
+check_eq "--support=best: read in shared sequence -> all three" \
+	"$(awk -F'\t' '$1=="shared_read"{print $4}' "$TMP/sup_best.tsv")" "0,1,2"
+"$RB" $SUPC --support=best --support-tol=200 "$TMP/sup.fmd" "$TMP/sup_q.fa" > "$TMP/sup_tol.tsv" 2>/dev/null
+check_eq "--support-tol larger than the read keeps every assembly with any support" \
+	"$(awk -F'\t' '$1=="donor_read"{print $4}' "$TMP/sup_tol.tsv")" "0,1,2"
+"$RB" $SUPC --support=bogus "$TMP/sup.fmd" "$TMP/sup_q.fa" >/dev/null 2>&1
+check_eq "--support=bogus exits non-zero" "$([ $? -ne 0 ] && echo yes || echo no)" "yes"
+
+# --- 9. chain output does not depend on the suffix-array sampling rate (hit order) ---
+# rb3_ssa_multi returns an interval's occurrences in an order that depends on `ssa -s`; chain keeps
+# the first reference hit and breaks ties by order, so the hits are sorted before use. Same index,
+# SA sampled at 1/256 and 1/2: chain output (stdout, PS4G and npy) must be byte-identical.
+cp "$TMP/pangenome.fmd" "$TMP/ss2.fmd"; cp "$IDX.len.gz" "$TMP/ss2.fmd.len.gz"
+"$RB" ssa -s1 -o "$TMP/ss2.fmd.ssa" "$TMP/ss2.fmd" >/dev/null 2>"$TMP/ss2.log"
+for ix in "$IDX" "$TMP/ss2.fmd"; do
+	tag=$(basename "$ix" .fmd)
+	"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --support=best --ps4g "$TMP/ho_$tag.ps4g" --npy "$TMP/ho_$tag.npy" -t1 \
+		"$ix" "$DIR/queries.fa" > "$TMP/ho_$tag.tsv" 2>/dev/null
+done
+check_eq "chain stdout identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.tsv" "$TMP/ho_ss2.tsv" && echo same)" "same"
+check_eq "chain npy identical across SA sampling rates" "$(cmp -s "$TMP/ho_pangenome.npy" "$TMP/ho_ss2.npy" && echo same)" "same"
+check_eq "chain PS4G identical across SA sampling rates (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/ho_pangenome.ps4g") <(grep -v '^#Command' "$TMP/ho_ss2.ps4g") >/dev/null && echo same)" "same"
+
+# --- 10. chain --dup-count: a collapsed duplicate read named <name>;x=N counts N times ---
+# Every query three times (all reads) versus once each named ";x=3": identical PS4G and npy.
+awk '/^>/{n=substr($1,2); next}{s[n]=s[n] $0; o[++k]=n} END{for (i=1;i<=k;++i) if (!(o[i] in d)) {d[o[i]]=1; for (r=0;r<3;++r) print ">" o[i] "_" r "\n" s[o[i]]; print ">" o[i] ";x=3\n" s[o[i]] > "'"$TMP"'/dup_collapsed.fa"}}' \
+	"$DIR/queries.fa" > "$TMP/dup_full.fa"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_full.ps4g" --npy "$TMP/dup_full.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_full.fa" > /dev/null 2>&1
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --dup-count --ps4g "$TMP/dup_coll.ps4g" --npy "$TMP/dup_coll.npy" --anchor-dist-npy -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "--dup-count: collapsed reads give the same npy as the duplicated input" \
+	"$(cmp -s "$TMP/dup_full.npy" "$TMP/dup_coll.npy" && echo same)" "same"
+check_eq "--dup-count: same PS4G counts (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_coll.ps4g") >/dev/null && echo same)" "same"
+"$RB" chain --ref-prefix=B73 -l 19 --lift="$LIFT" --insertion-rows=ordinary --ps4g "$TMP/dup_nocount.ps4g" -t1 \
+	"$IDX" "$TMP/dup_collapsed.fa" > /dev/null 2>&1
+check_eq "without --dup-count the ;x=N suffix is ignored (counts differ from the duplicated input)" \
+	"$(diff <(grep -v '^#Command' "$TMP/dup_full.ps4g") <(grep -v '^#Command' "$TMP/dup_nocount.ps4g") >/dev/null && echo same || echo differ)" "differ"
+
+# --- 11. refmap --paired: mate pairs -> one PS4G/npy event per pair ---
+# Fixture docs/examples/pe/ (generated by make_pe_fixture.py; see its docstring for the design):
+# 4 genomes (gametes B73=0 Ki3=1 Mo17=2 Oh43=3), 40 clean pairs for the insert-size estimate and
+# seven hand-built pairs P1..P7 covering CONC (with a founder-set intersection), SOLO, DISC, RESC,
+# a reference-copy tie-break (P6) and --pe-trust-exact (P7).
+PE="$DIR/pe"
+PIDX="$TMP/pe.fmd"; PLIFT="$TMP/pe.lift"
+"$RB" build -d -o "$PIDX" "$PE/pangenome.fa" >/dev/null 2>"$TMP/pe_build.log"
+"$RB" ssa -s8 -o "$PIDX.ssa" "$PIDX" >/dev/null 2>>"$TMP/pe_build.log"
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$PE/pangenome.fa" | gzip > "$PIDX.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$PLIFT" "$PIDX" "$PE/pangenome.fa" >/dev/null 2>>"$TMP/pe_build.log"
+check_eq "paired fixture: index + lift build" "$?" "0"
+PRM="refmap --ref-prefix=B73 --lift=$PLIFT -t2"
+
+"$RB" $PRM --paired --ps4g="$TMP/pe.ps4g" --npy="$TMP/pe.npy" --ps4g-per-read="$TMP/pe.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe.tsv" 2>"$TMP/pe.log"
+check_eq "--paired (R1 R2) exits 0" "$?" "0"
+check_eq "--paired: one row per mate (47 pairs)" "$(wc -l < "$TMP/pe.tsv" | tr -d ' ')" "94"
+check_eq "--paired: every row gains exactly one trailing column (12)" \
+	"$(awk -F'\t' '{print NF}' "$TMP/pe.tsv" | sort -u | tr '\n' ' ')" "12 "
+pe_class() { awk -F'\t' -v n="$1" '$1==n{print $3"/"$NF}' "$TMP/pe.tsv"; }
+check_eq "P1: projected mate + exact mate within the insert -> CONC" "$(pe_class P1/1) $(pe_class P1/2)" "PLACED/CONC EXACT/CONC"
+check_eq "P2: two exact mates -> CONC" "$(pe_class P2/1) $(pe_class P2/2)" "EXACT/CONC EXACT/CONC"
+check_eq "P3: one mate unplaceable -> SOLO" "$(pe_class P3/1) $(pe_class P3/2)" "EXACT/SOLO UNPLACED/SOLO"
+check_eq "P4: exact mates 17 kb apart -> DISC" "$(pe_class P4/1) $(pe_class P4/2)" "EXACT/DISC EXACT/DISC"
+check_eq "P5: projected mate rescued next to its exact mate -> MOVED/RESC" "$(pe_class P5/1) $(pe_class P5/2)" "PLACED/MOVED EXACT/RESC"
+check_eq "P5: the moved mate's position is Mo17's projection (9200), not Ki3's TE copy (16100)" \
+	"$(awk -F'\t' '$1=="P5/1"{print $8}' "$TMP/pe.tsv")" "9200"
+check_eq "--paired: all 40 clean pairs CONC" "$(grep -c '^iso.*	CONC$' "$TMP/pe.tsv")" "80"
+check_eq "P6: exact mate with two reference copies ends at the copy next to its mate (11000, not 19000)" \
+	"$(awk -F'\t' '$1=="P6/1"{print $8}' "$TMP/pe.tsv")" "11000"
+check_eq "P7: projected mate with nothing near its exact mate -> DISC by default" "$(pe_class P7/1) $(pe_class P7/2)" "PLACED/DISC EXACT/DISC"
+if grep -q 'insert size from 4[12] pairs: mean 399.5' "$TMP/pe.log"; then pass; else fail "--paired: insert size estimate (mean 399.5) not logged"; fi
+check_eq "--paired: summary = 44 CONC+RESC (P6 lands in either), 1 SOLO, 2 DISC, 0 NONE" \
+	"$(sed -n 's/.*] 47 pairs: \([0-9]*\) CONC, \([0-9]*\) RESC, \([0-9]*\) SOLO, \([0-9]*\) DISC, \([0-9]*\) NONE.*/\1+\2 \3 \4 \5/p' "$TMP/pe.log" | awk '{split($1,a,"+"); print a[1]+a[2], $2, $3, $4}')" "44 1 2 0"
+
+# PS4G: one event per non-discordant pair, two per discordant one -> 40 + 5 + 2*2 = 49 counts
+check_eq "--paired ps4g: #TotalUniqueCounts = 40 clean + P1,P2,P3,P5,P6 + 2 each for discordant P4, P7 = 49" \
+	"$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/pe.ps4g")" "49"
+check_eq "--paired ps4g: data-row counts sum to the total" \
+	"$(awk -F'\t' 'f{s+=$4} /^gameteSet/{f=1} END{print s}' "$TMP/pe.ps4g")" "49"
+check_line_in "P1 event: founders both mates share = {Mo17} only, at the exact mate (10300 -> bin 40)" "$TMP/pe.ps4g" "$(printf '2\tchr1\t40\t1')"
+check_line_in "P5 event: default --pe-near-win (100 kb) keeps Ki3's copy 6.5 kb away with Mo17, bin 37" "$TMP/pe.ps4g" "$(printf '1,2\tchr1\t37\t1')"
+check_line_in "per-read: P1 is one line named after the fragment" "$TMP/pe.pr" "$(printf 'P1\tchr1\t10300\t2')"
+check_line_in "per-read: P3 (SOLO) uses the placed mate's set" "$TMP/pe.pr" "$(printf 'P3\tchr1\t14000\t0,1,2,3')"
+check_eq "per-read: discordant P4 gives one line per mate" "$(grep -c '^P4/[12]	' "$TMP/pe.pr")" "2"
+check_eq "per-read: 49 events (+ header)" "$(wc -l < "$TMP/pe.pr" | tr -d ' ')" "50"
+
+# single-end run of the same reads, for contrast: P1 then gives two separate events
+"$RB" $PRM --ps4g="$TMP/pe_se.ps4g" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_se.tsv" 2>/dev/null
+check_eq "without --paired: 11 columns, files read one after another" \
+	"$(awk -F'\t' '{print NF}' "$TMP/pe_se.tsv" | sort -u | tr '\n' ' ')/$(wc -l < "$TMP/pe_se.tsv" | tr -d ' ')" "11 /94"
+check_eq "without --paired: no P1 event has the Mo17-only set at bin 40" \
+	"$(grep -c "^2	chr1	40	" "$TMP/pe_se.ps4g")" "0"
+check_eq "without --paired: one event per placed read (93 = 94 reads minus P3's junk mate)" \
+	"$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/pe_se.ps4g")/$(awk -F'\t' '$3=="PLACED"||$3=="EXACT"' "$TMP/pe_se.tsv" | wc -l | tr -d ' ')" "93/93"
+
+# interleaved input == two files
+"$RB" $PRM --paired --ps4g="$TMP/pe_il.ps4g" --npy="$TMP/pe_il.npy" "$PIDX" "$PE/interleaved.fa" > "$TMP/pe_il.tsv" 2>/dev/null
+check_eq "--paired interleaved: same stdout as R1 R2" "$(cmp -s "$TMP/pe.tsv" "$TMP/pe_il.tsv" && echo same)" "same"
+check_eq "--paired interleaved: same PS4G (minus the command line)" \
+	"$(diff <(grep -v '^#Command' "$TMP/pe.ps4g") <(grep -v '^#Command' "$TMP/pe_il.ps4g") >/dev/null && echo same)" "same"
+check_eq "--paired interleaved: same npy" "$(cmp -s "$TMP/pe.npy" "$TMP/pe_il.npy" && echo same)" "same"
+# small batches (-K) must not split a pair; output identical
+"$RB" $PRM --paired -K 250 "$PIDX" "$PE/interleaved.fa" > "$TMP/pe_k.tsv" 2>"$TMP/pe_k.log"
+check_eq "--paired -K 250 (pair-sized batches): same stdout classes" \
+	"$(cut -f1-11 "$TMP/pe_k.tsv" | cmp -s - <(cut -f1-11 "$TMP/pe.tsv") && echo same)" "same"
+if grep -q 'WARNING: only' "$TMP/pe_k.log"; then pass; else fail "--paired: tiny batches warn that the insert size cannot be estimated"; fi
+
+# --pe-trust-exact: P7's projected mate is moved onto its exact mate; nothing else changes
+"$RB" $PRM --paired --pe-trust-exact --ps4g="$TMP/pe_te.ps4g" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_te.tsv" 2>/dev/null
+check_eq "--pe-trust-exact: P7 -> PLACED/MOVED at 6000 + EXACT/RESC" \
+	"$(awk -F'\t' '$1=="P7/1"{print $3"/"$NF"@"$8} $1=="P7/2"{print $3"/"$NF}' "$TMP/pe_te.tsv" | tr '\n' ' ')" "PLACED/MOVED@6000 EXACT/RESC "
+check_eq "--pe-trust-exact: every other row unchanged" \
+	"$(diff <(grep -v '^P7/' "$TMP/pe.tsv") <(grep -v '^P7/' "$TMP/pe_te.tsv") >/dev/null && echo same)" "same"
+check_eq "--pe-trust-exact: P7 is now one event (48)" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/pe_te.ps4g")" "48"
+pe_err_te() { "$RB" $PRM --pe-trust-exact "$PIDX" "$PE/r1.fa" >/dev/null 2>"$TMP/pe_te_err.log"; }
+pe_err_te; if [ $? -ne 0 ] && grep -q 'need --paired' "$TMP/pe_te_err.log"; then pass; else fail "--pe-trust-exact without --paired must fail"; fi
+
+# fixed insert size
+"$RB" $PRM --paired --pe-isize=400,10 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_fix.tsv" 2>"$TMP/pe_fix.log"
+check_eq "--pe-isize: exits 0, same classes" "$(cmp -s "$TMP/pe.tsv" "$TMP/pe_fix.tsv" && echo same)" "same"
+if grep -q 'insert size (fixed) mean 400.0 sd 10.0 max 440' "$TMP/pe_fix.log"; then pass; else fail "--pe-isize: fixed insert size not reported"; fi
+"$RB" $PRM --paired --pe-slack=0 --pe-isize=400,10 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_s0.tsv" 2>/dev/null
+check_eq "--pe-slack=0: P1's projected mate (100 bp off) is still concordant at max 440" "$(awk -F'\t' '$1=="P1/1"{print $NF}' "$TMP/pe_s0.tsv")" "CONC"
+
+# input errors (each must exit non-zero with a message, before any output)
+pe_err() { # pe_err <desc> <expected message fragment> args...
+	local d="$1" m="$2"; shift 2
+	"$RB" "$@" > "$TMP/pe_err.out" 2> "$TMP/pe_err.log"
+	if [ $? -ne 0 ] && grep -q -- "$m" "$TMP/pe_err.log"; then pass; else fail "$d (want non-zero exit + '$m')"; cat "$TMP/pe_err.log" >&2; fi
+}
+printf '>x/2\nACGT\n>y/2\nACGT\n' > "$TMP/r2_badname.fa"; head -4 "$PE/r1.fa" > "$TMP/r1_two.fa"
+pe_err "--paired: mate names differ" "are not mates" $PRM --paired "$PIDX" "$TMP/r1_two.fa" "$TMP/r2_badname.fa"
+head -6 "$PE/r2.fa" > "$TMP/r2_three.fa"
+pe_err "--paired: R2 longer than R1" "second file has more reads" $PRM --paired "$PIDX" "$TMP/r1_two.fa" "$TMP/r2_three.fa"
+pe_err "--paired: R1 longer than R2" "first file has more reads" $PRM --paired "$PIDX" "$TMP/r2_three.fa" "$TMP/r1_two.fa"
+head -6 "$PE/interleaved.fa" > "$TMP/il_odd.fa"
+pe_err "--paired: odd interleaved file" "odd number of reads" $PRM --paired "$PIDX" "$TMP/il_odd.fa"
+pe_err "--paired: three input files" "R1.fq> <R2.fq> or one interleaved" $PRM --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa" "$PE/r1.fa"
+pe_err "--paired: -L has no read names" "not -L" $PRM --paired -L "$PIDX" "$PE/interleaved.fa"
+pe_err "--pe-isize without --paired" "need --paired" $PRM --pe-isize=400,10 "$PIDX" "$PE/r1.fa"
+pe_err "--pe-isize malformed" "MEAN,SD" $PRM --paired --pe-isize=400 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+
+# --pe-near-win: P5's rescued mate has Ki3's TE copy 6.5 kb from its mate; a 2 kb window drops it
+"$RB" $PRM --paired --pe-near-win=2000 --ps4g-per-read="$TMP/nw.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/nw.tsv" 2>/dev/null
+check_eq "--pe-near-win=2000: P5's event keeps only Mo17 (Ki3's copy is 6.5 kb away)" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/nw.pr")" "2"
+check_eq "default --pe-near-win: P5's event is {Ki3,Mo17}" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/pe.pr")" "1,2"
+check_eq "--pe-near-win only changes RESC founder sets (stdout identical)" "$(cmp -s "$TMP/pe.tsv" "$TMP/nw.tsv" && echo same)" "same"
+
+# --max-locate: refmap's per-read occurrence sample (default 256, the former fixed limit)
+"$RB" $PRM --max-locate=256 --paired --ps4g="$TMP/ml256.ps4g" --npy="$TMP/ml256.npy" --ps4g-per-read="$TMP/ml256.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ml256.tsv" 2>/dev/null
+check_eq "--max-locate=256 (the default) reproduces the default run exactly" \
+	"$(cmp -s "$TMP/pe.tsv" "$TMP/ml256.tsv" && cmp -s "$TMP/pe.npy" "$TMP/ml256.npy" && cmp -s "$TMP/pe.pr" "$TMP/ml256.pr" && diff <(grep -v '^#Command' "$TMP/pe.ps4g") <(grep -v '^#Command' "$TMP/ml256.ps4g") >/dev/null && echo same)" "same"
+"$RB" $PRM --max-locate=1 --ps4g-per-read="$TMP/ml1.pr" "$PIDX" "$PE/r1.fa" > "$TMP/ml1.tsv" 2>/dev/null
+check_eq "--max-locate=1: an exact read shared by all 4 genomes carries one sampled gamete (iso00/1)" \
+	"$(awk -F'\t' '$1=="iso00/1"{n=split($4,a,","); print n}' "$TMP/ml1.pr")" "1"
+# with one occurrence sampled, the B73 copy can be missed: the read is then PLACED, not EXACT
+check_eq "--max-locate=1: iso00/1's only sampled occurrence is an assembly copy -> PLACED" \
+	"$(awk -F'\t' '$1=="iso00/1"{print $3}' "$TMP/ml1.tsv")" "PLACED"
+"$RB" $PRM --max-locate=4 --ps4g-per-read="$TMP/ml4.pr" "$PIDX" "$PE/r1.fa" > "$TMP/ml4.tsv" 2>/dev/null
+check_eq "--max-locate=4 (all 4 occurrences): iso00/1 is EXACT with all four gametes" \
+	"$(awk -F'\t' '$1=="iso00/1"{print $3}' "$TMP/ml4.tsv")/$(awk -F'\t' '$1=="iso00/1"{n=split($4,a,","); print n}' "$TMP/ml4.pr")" "EXACT/4"
+"$RB" $PRM --max-occ=-1 --max-locate=512 "$PIDX" "$PE/r1.fa" > /dev/null 2>"$TMP/ml_warn.log"
+if grep -q 'max-locate=512 has no effect: --max-occ=4' "$TMP/ml_warn.log"; then pass; else fail "--max-locate under an auto --max-occ (4 taxa) warns that it cannot act"; fi
+"$RB" $PRM --max-locate=512 "$PIDX" "$PE/r1.fa" > /dev/null 2>"$TMP/ml_nowarn.log"
+check_eq "--max-locate with --max-occ off: no warning" "$(grep -c 'has no effect' "$TMP/ml_nowarn.log")" "0"
+pe_err "--max-locate=0 rejected" "max-locate must be >= 1" $PRM --max-locate=0 "$PIDX" "$PE/r1.fa"
+pe_err "--max-locate is refmap-only" "refmap only (mem/chain: use -p)" mem --max-locate=512 -p 64 "$PIDX" "$PE/r1.fa"
+
+if [ -n "$NPY_PY" ]; then
+	if "$NPY_PY" verify_ps4g_npy.py "$TMP/pe.ps4g" "$TMP/pe.npy" > "$TMP/pe_verify.log" 2>&1; then pass
+	else fail "verify_ps4g_npy.py: --paired PS4G and npy disagree"; cat "$TMP/pe_verify.log" >&2; fi
+fi
+
+# --- 12. mem --paired: per-assembly concordance of the mates' SMEM hits ---
+# Same fixture. A pair is CONC when both mates hit one contig on opposite strands with implied
+# read starts within the insert; only those positions are printed. Fixture spans differ per
+# genome, so expectations below are per contig (see make_pe_fixture.py for coordinates).
+"$RB" mem --paired -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_pe.tsv" 2>"$TMP/mem_pe.log"
+check_eq "mem --paired exits 0" "$?" "0"
+mem_cls() { awk -F'\t' -v n="$1" '$1==n{print $NF}' "$TMP/mem_pe.tsv" | sort -u | tr '\n' ' '; }
+mem_pos() { awk -F'\t' -v n="$1" '$1==n{for(i=6;i<NF;++i) print $i}' "$TMP/mem_pe.tsv" | sort | tr '\n' ' '; }
+check_eq "mem P2: CONC on all four genomes" "$(mem_cls P2/1)$(mem_cls P2/2)" "CONC CONC "
+check_eq "mem P5: CONC, only Mo17 carries both mates (Ki3's TE copy is elsewhere)" "$(mem_pos P5/1)/$(mem_pos P5/2)" "Mo17_chr1:+:9600 /Mo17_chr1:-:10000 "
+check_eq "mem P6: the duplicated mate keeps only the copy next to its mate (4 of 8 positions)" \
+	"$(awk -F'\t' '$1=="P6/1"{print $4"/"$5}' "$TMP/mem_pe.tsv")" "8/4"
+check_eq "mem P6: kept positions are the 11000 copy" "$(mem_pos P6/1)" "B73_chr1:+:11000 Ki3_chr1:+:12000 Mo17_chr1:+:12400 Oh43_chr1:+:11000 "
+check_eq "mem P1: mates 900 bp apart on Mo17 (> max insert) -> DISC, positions unfiltered" "$(mem_cls P1/1)$(awk -F'\t' '$1=="P1/2"{print $5}' "$TMP/mem_pe.tsv")" "DISC 3"
+check_eq "mem P3: junk mate has no SMEM -> SOLO" "$(mem_cls P3/1)/$(grep -c '^P3/2' "$TMP/mem_pe.tsv")" "SOLO /0"
+check_eq "mem P4, P7: DISC" "$(mem_cls P4/1)$(mem_cls P7/2)" "DISC DISC "
+check_eq "mem: 40 clean pairs all CONC" "$(awk -F'\t' '$1~/^iso/ && $NF!="CONC"' "$TMP/mem_pe.tsv" | wc -l | tr -d ' ')" "0"
+if grep -q '47 pairs: 43 CONC, 0 RESC, 1 SOLO, 3 DISC, 0 NONE' "$TMP/mem_pe.log"; then pass; else fail "mem --paired: pair-class summary"; fi
+if grep -q 'insert size from 42 pairs: mean 400.7' "$TMP/mem_pe.log"; then pass; else fail "mem --paired: insert size from whole-read SMEM pairs"; fi
+"$RB" mem --paired -p 64 -t2 "$PIDX" "$PE/interleaved.fa" > "$TMP/mem_il.tsv" 2>/dev/null
+check_eq "mem --paired: interleaved == R1 R2" "$(cmp -s "$TMP/mem_pe.tsv" "$TMP/mem_il.tsv" && echo same)" "same"
+"$RB" mem -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_se.tsv" 2>/dev/null
+check_eq "mem without --paired: the same SMEM rows (files read one after another, so sort)" \
+	"$(cut -f1-4 "$TMP/mem_se.tsv" | sort | cmp -s - <(cut -f1-4 "$TMP/mem_pe.tsv" | sort) && echo same)" "same"
+check_eq "mem without --paired: P6/1 lists both copies (8 positions)" "$(awk -F'\t' '$1=="P6/1"{print $5}' "$TMP/mem_se.tsv")" "8"
+"$RB" mem --paired --pe-isize=400,10 -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > /dev/null 2>"$TMP/mem_fix.log"
+if grep -q 'insert size (fixed) mean 400.0 sd 10.0 max 440 (+0 slack)' "$TMP/mem_fix.log"; then pass; else fail "mem --pe-isize: fixed insert, no slack by default"; fi
+# -p 2 locates only 2 of each SMEM's 4-8 occurrences: no mate is fully located, so nothing is filtered
+"$RB" mem --paired -p 2 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_p2.tsv" 2>/dev/null
+check_eq "mem --paired -p 2: sampled mates cannot veto -- every row keeps all its located positions" \
+	"$(awk -F'\t' 'NF>5 && $5!=NF-6' "$TMP/mem_p2.tsv" | wc -l | tr -d ' ')/$([ "$(grep -c 'CONC$' "$TMP/mem_p2.tsv")" -gt 0 ] && echo conc)" "0/conc"
+pe_err "mem --paired without -p" "needs -p INT" mem --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "mem --paired with --cov" "cannot be combined" mem --paired --cov -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "mem --pe-trust-exact" "refmap only" mem --paired --pe-trust-exact -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+
+# --- 13. chain --paired: one event per concordant pair (mate gap <= max insert + --max-intron) ---
+CPR="chain --ref-prefix=B73 -l 19 --lift=$PLIFT -t2"
+"$RB" $CPR --paired --ps4g="$TMP/ch_pe.ps4g" --npy="$TMP/ch_pe.npy" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ch_pe.tsv" 2>"$TMP/ch_pe.log"
+check_eq "chain --paired exits 0" "$?" "0"
+ch_row() { awk -F'\t' -v n="$1" '$1==n{print $2":"$3":"$4":"$NF}' "$TMP/ch_pe.tsv" | tr '\n' ' '; }
+check_eq "chain P1: insertion mate (lift row, Ki3+Mo17) + exact mate (B73,Mo17,Oh43) -> one CONC event {Mo17} at the exact mate" \
+	"$(ch_row P1)" "chr1:10300:2:CONC "
+check_eq "chain P2: one CONC event named after the fragment, at the anchor's first segment" "$(ch_row P2)" "chr1:12000:0,1,2,3:CONC "
+check_eq "chain P3/P5/P6: the other mate emits no chain row -> SOLO, one event" "$(ch_row P3)$(ch_row P5)$(ch_row P6)" \
+	"chr1:14000:0,1,2,3:SOLO chr1:9600:0,1,2,3:SOLO chr1:11350:0,1,2,3:SOLO "
+check_eq "chain P4: mates 17 kb apart -> DISC, each mate's own row" "$(ch_row P4/1)$(ch_row P4/2)" "chr1:1000:0,1,2,3:DISC chr1:18000:0,1,2,3:DISC "
+check_eq "chain P7: Ki3-only lift row 10 kb from its mate -> DISC" "$(ch_row P7/1)" "chr1:16450:1:DISC "
+check_eq "chain: 40 clean pairs one CONC row each" "$(grep -c '^iso[0-9]*	.*	CONC$' "$TMP/ch_pe.tsv")" "40"
+if grep -q '47 pairs: 42 CONC, 0 RESC, 3 SOLO, 2 DISC, 0 NONE' "$TMP/ch_pe.log"; then pass; else fail "chain --paired: pair-class summary"; fi
+if grep -q 'insert size from 41 pairs: mean 399.5' "$TMP/ch_pe.log"; then pass; else fail "chain --paired: insert size from single-segment reference chains"; fi
+check_eq "chain --paired ps4g: 42 CONC + 3 SOLO + 2x2 DISC = 49 events" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/ch_pe.ps4g")" "49"
+if [ -n "$NPY_PY" ]; then
+	if "$NPY_PY" verify_ps4g_npy.py "$TMP/ch_pe.ps4g" "$TMP/ch_pe.npy" > "$TMP/ch_pe_verify.log" 2>&1; then pass
+	else fail "verify_ps4g_npy.py: chain --paired PS4G and npy disagree"; cat "$TMP/ch_pe_verify.log" >&2; fi
+fi
+"$RB" $CPR --paired --ps4g="$TMP/ch_il.ps4g" "$PIDX" "$PE/interleaved.fa" > "$TMP/ch_il.tsv" 2>/dev/null
+check_eq "chain --paired: interleaved == R1 R2" "$(cmp -s "$TMP/ch_pe.tsv" "$TMP/ch_il.tsv" && echo same)" "same"
+"$RB" $CPR --paired -K 250 "$PIDX" "$PE/interleaved.fa" > "$TMP/ch_k.tsv" 2>/dev/null
+check_eq "chain --paired -K 250 (pair-sized batches): same events" "$(cut -f1-4 "$TMP/ch_k.tsv" | cmp -s - <(cut -f1-4 "$TMP/ch_pe.tsv") && echo same)" "same"
+"$RB" $CPR --paired --support=best "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ch_best.tsv" 2>/dev/null
+check_eq "chain --paired --support=best: P1 = intersection of the mates' best sets ({Mo17})" "$(awk -F'\t' '$1=="P1"{print $4}' "$TMP/ch_best.tsv")" "2"
+# --dup-count: a collapsed pair named <frag>;x=3/1, /2 counts 3 for its one event
+printf '>P2;x=3/1\n%s\n>P2;x=3/2\n%s\n' "$(awk '/^>P2\/1/{getline; print}' "$PE/r1.fa")" "$(awk '/^>P2\/2/{getline; print}' "$PE/r2.fa")" > "$TMP/ch_dup.fa"
+"$RB" $CPR --paired --pe-isize=400,10 --dup-count --ps4g="$TMP/ch_dup.ps4g" "$PIDX" "$TMP/ch_dup.fa" > "$TMP/ch_dup.tsv" 2>/dev/null
+check_eq "chain --paired --dup-count: one row for the collapsed pair" "$(grep -c '^P2;x=3	' "$TMP/ch_dup.tsv")" "1"
+check_eq "chain --paired --dup-count: the pair event counts 3" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/ch_dup.ps4g")" "3"
+"$RB" $CPR --ps4g="$TMP/ch_se.ps4g" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ch_se.tsv" 2>/dev/null
+check_eq "chain without --paired: one row per mate segment, no class column (P1 gives 2 rows)" \
+	"$(grep -c '^P1/' "$TMP/ch_se.tsv")/$(awk -F'\t' '$1=="P2/1"{print NF}' "$TMP/ch_se.tsv")" "2/4"
+
+# --- 14. sw --paired: per-assembly concordance of the mates' alignment positions (as mem) ---
+"$RB" sw --paired -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/sw_pe.paf" 2>"$TMP/sw_pe.log"
+check_eq "sw --paired exits 0" "$?" "0"
+sw_tag() { awk -F'\t' -v n="$1" '$1==n{print $NF}' "$TMP/sw_pe.paf" | sort -u | tr '\n' ' '; }
+sw_pos() { awk -F'\t' -v n="$1" '$1==n{s=$6":"$5":"$8; for(i=12;i<=NF;++i) if($i~/^ap:Z:/) s=s";"substr($i,6); print s}' "$TMP/sw_pe.paf"; }
+check_eq "sw: every line carries a pe:Z: tag" "$(awk -F'\t' '$NF!~/^pe:Z:(CONC|DISC|SOLO|NONE)$/' "$TMP/sw_pe.paf" | wc -l | tr -d ' ')" "0"
+check_eq "sw P5: CONC keeps only Mo17 (single-end primary was Ki3's TE copy)" "$(sw_pos P5/1)|$(sw_pos P5/2)" "Mo17_chr1:+:9600|Mo17_chr1:-:10000"
+check_eq "sw P6: the duplicated mate keeps the 4 positions next to its mate (of 8)" \
+	"$(sw_pos P6/1 | tr ';,' '\n\n' | grep -c ':\?1[12][0-9][0-9][0-9]$')/$(awk -F'\t' '$1=="P6/1"{print $15}' "$TMP/sw_pe.paf")" "4/rh:i:8"
+check_eq "sw P1/P4/P7 DISC, P3 SOLO, P2 CONC" "$(sw_tag P1/1)$(sw_tag P4/2)$(sw_tag P7/1)$(sw_tag P3/1)$(sw_tag P2/2)" \
+	"pe:Z:DISC pe:Z:DISC pe:Z:DISC pe:Z:SOLO pe:Z:CONC "
+if grep -q '47 pairs: 43 CONC, 0 RESC, 1 SOLO, 3 DISC, 0 NONE' "$TMP/sw_pe.log"; then pass; else fail "sw --paired: pair-class summary"; fi
+if grep -q 'insert size from 42 pairs: mean 400.7' "$TMP/sw_pe.log"; then pass; else fail "sw --paired: insert size from end-to-end hits"; fi
+"$RB" sw --paired -p 64 -t2 "$PIDX" "$PE/interleaved.fa" > "$TMP/sw_il.paf" 2>/dev/null
+check_eq "sw --paired: interleaved == R1 R2" "$(cmp -s "$TMP/sw_pe.paf" "$TMP/sw_il.paf" && echo same)" "same"
+"$RB" sw -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/sw_se.paf" 2>/dev/null
+check_eq "sw without --paired: no pe:Z: tag, P5/1 primary is Ki3's copy" \
+	"$(grep -c 'pe:Z:' "$TMP/sw_se.paf")/$(awk -F'\t' '$1=="P5/1"{print $6":"$8}' "$TMP/sw_se.paf")" "0/Ki3_chr1:16100"
+check_eq "sw --paired: DISC lines identical to single-end apart from the tag" \
+	"$(grep '^P4/1	' "$TMP/sw_pe.paf" | sed 's/	pe:Z:DISC$//' | cmp -s - <(grep '^P4/1	' "$TMP/sw_se.paf") && echo same)" "same"
+pe_err "sw --paired without -p" "sw --paired needs -p INT" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "sw --paired with --all-e2e" "cannot be combined with --all-e2e" sw --paired -p 64 --all-e2e "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -357,6 +754,34 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --walk --target-hits=5 -K 10 -t4 "$IDX" "$TMP/target_hits.fa" \
 		> /dev/null 2>"$TMP/valgrind_target.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on --target-hits; see $TMP/valgrind_target.log"; cat "$TMP/valgrind_target.log" >&2; fi
+
+	# chain --support=best with --lift and the npy accumulator (best-support masks, lift projections)
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" chain --ref-prefix=B73 -l 19 --lift="$TMP/sup.lift" --support=best --npy "$TMP/vg_sup.npy" --anchor-dist-npy -t2 \
+		"$TMP/sup.fmd" "$TMP/sup_q.fa" > /dev/null 2>"$TMP/valgrind_sup.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on chain --support=best; see $TMP/valgrind_sup.log"; cat "$TMP/valgrind_sup.log" >&2; fi
+
+	# --paired: projections, rescue, pair events and the per-read file
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --ps4g "$TMP/vg_pe.ps4g" --npy "$TMP/vg_pe.npy" --ps4g-per-read "$TMP/vg_pe.pr" -K 2000 -t2 \
+		"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --paired; see $TMP/valgrind_pe.log"; cat "$TMP/valgrind_pe.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" chain --ref-prefix=B73 -l 19 --lift="$TMP/pe.lift" --paired --support=best --ps4g "$TMP/vg_ch.ps4g" -K 2000 -t2 \
+		"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ch_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on chain --paired"; cat "$TMP/valgrind_ch_pe.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" sw --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_sw_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on sw --paired"; cat "$TMP/valgrind_sw_pe.log" >&2; fi
+	for ml in 1 5000; do
+		valgrind --error-exitcode=99 --leak-check=full -q \
+			"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --max-locate=$ml --ps4g "$TMP/vg_ml.ps4g" -t2 \
+			"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ml$ml.log"
+		if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --max-locate=$ml"; cat "$TMP/valgrind_ml$ml.log" >&2; fi
+	done
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi
