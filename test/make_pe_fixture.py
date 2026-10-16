@@ -18,8 +18,9 @@ Pairs (mate 1 forward, mate 2 reverse-complemented, 100 bp unless noted):
   P3   mate 1 = R[14000:14100], mate 2 = random junk -> SOLO, set {0,1,2,3}
   P4   mate 1 = R[1000:1100], mate 2 = R[18000:18100] -> DISC (17 kb apart): two events
   P5   mate 1 = T[100:250] (Mo17 projects ~9,200, Ki3 ~16,100; the upper median picks Ki3's),
-       mate 2 = R[9600:9700] (EXACT) -> mate 1 MOVED next to mate 2 (RESC); Ki3's copy is
-       elsewhere, so the event's founder set is {Mo17} = "2"
+       mate 2 = R[9600:9700] (EXACT) -> mate 1 MOVED next to mate 2 (RESC). Founder set: with the
+       default --pe-near-win (100 kb) Ki3's copy 6.5 kb away still counts -> {Ki3,Mo17} = "1,2";
+       with --pe-near-win below 6.5 kb only Mo17 -> "2"
   P6   mate 1 = R[19000:19100] (two reference copies: 11000 and 19000), mate 2 = R[11350:11450]
        -> mate 1 ends at the copy next to its mate (11000): CONC, or RESC/MOVED if refmap reported
        the other copy first

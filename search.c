@@ -101,7 +101,7 @@ typedef struct {
 	int32_t max_locate;    // refmap: occurrences of a read located per read (the rest are not sampled) [256]
 	int8_t pe_slack_set;   // --pe-slack given explicitly (else mem uses 0: SMEM positions are exact)
 	int64_t pe_near_win;   // --pe-near-win: a rescued mate keeps founders whose own projection is within this
-	                       // many bp of the anchor (0 = the concordance window, max insert + --pe-slack)
+	                       // many bp of the anchor, same contig (0 = the concordance window) [100000]
 	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
 	rb3_swopt_t swo;
 } rb3_mopt_t;
@@ -142,6 +142,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
 	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
 	opt->max_locate = RB3_RM_MAX_ASSEMBLY;
+	opt->pe_near_win = 100000; // lift projections are 2-20 kb noisy; the ~2.7 kb concordance window dropped true founders
 	opt->paired = 0, opt->pe_mean = 0.0, opt->pe_sd = 0.0; // single-end by default; insert size estimated per batch
 	opt->pe_slack = 2000;  // lift projections are typically within ~2kb (the --anchor-dist-thresh scale)
 	rb3_swopt_init(&opt->swo);
@@ -2322,7 +2323,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
 			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
 			fprintf(stderr, "  --pe-near-win=NUM --paired: a MOVED mate keeps the founders whose own projection lies\n");
-			fprintf(stderr, "                    within NUM bp of its mate (0 = max insert + --pe-slack) [%ld]\n", (long)opt.pe_near_win);
+			fprintf(stderr, "                    on its mate's contig within NUM bp (founder set only; the mate gap\n");
+			fprintf(stderr, "                    is max insert + --pe-slack); 0 = that gap [%ld]\n", (long)opt.pe_near_win);
 			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
 			fprintf(stderr, "                    PLACED mate onto the EXACT one (default: keep them as two events)\n");
 		}

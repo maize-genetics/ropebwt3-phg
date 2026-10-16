@@ -245,11 +245,12 @@ appended to both mates' stdout rows as one extra column:
 A pair event's founder set is the intersection of the two mates' sets: the founders that carry
 the whole fragment. It falls back to the anchor mate's set when the intersection is empty. A
 `MOVED` mate keeps only the founders whose own copy projected near its mate, so a TE/paralog copy
-elsewhere does not count. That founder window is `--pe-near-win` (default: the concordance
-window, max insert + `--pe-slack`, about 2.7 kb). Lift projections are often 2–20 kb off, so
-the default drops some true founders. Widening it to 100 kb recovered 71% of refmap's paired
-recall loss (0.65 → 0.19 pp per fragment on simulated maize) for a +0.03 change in mean founder
-set; copies on other chromosomes stay excluded. `max_ins` comes from a per-batch, bwa-style estimate over EXACT/EXACT
+elsewhere (on another chromosome, or more than `--pe-near-win` away) does not count.
+`--pe-near-win` [100000] is a founder-set tolerance, not the mate gap: pairing and rescue still use
+max insert + `--pe-slack` (about 2.7 kb). It is wide because lift projections are often 2–20 kb
+off. With it set to that 2.7 kb, true founders were dropped; on simulated maize, refmap then
+lost 0.65 pp of per-fragment recall vs single-end, against 0.19 pp at 100 kb, for +0.03 in mean
+founder set and no change in positions. `max_ins` comes from a per-batch, bwa-style estimate over EXACT/EXACT
 pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defaults to 2000 bp,
 the lift-projection error scale. An EXACT mate's other reference copies count as
 alternative positions too, so pairing also picks the right copy of a duplicated sequence.

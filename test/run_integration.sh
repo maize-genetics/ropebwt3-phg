@@ -555,7 +555,7 @@ check_eq "--paired ps4g: #TotalUniqueCounts = 40 clean + P1,P2,P3,P5,P6 + 2 each
 check_eq "--paired ps4g: data-row counts sum to the total" \
 	"$(awk -F'\t' 'f{s+=$4} /^gameteSet/{f=1} END{print s}' "$TMP/pe.ps4g")" "49"
 check_line_in "P1 event: founders both mates share = {Mo17} only, at the exact mate (10300 -> bin 40)" "$TMP/pe.ps4g" "$(printf '2\tchr1\t40\t1')"
-check_line_in "P5 event: rescued mate keeps only Mo17 (Ki3's copy is elsewhere), bin 37" "$TMP/pe.ps4g" "$(printf '2\tchr1\t37\t1')"
+check_line_in "P5 event: default --pe-near-win (100 kb) keeps Ki3's copy 6.5 kb away with Mo17, bin 37" "$TMP/pe.ps4g" "$(printf '1,2\tchr1\t37\t1')"
 check_line_in "per-read: P1 is one line named after the fragment" "$TMP/pe.pr" "$(printf 'P1\tchr1\t10300\t2')"
 check_line_in "per-read: P3 (SOLO) uses the placed mate's set" "$TMP/pe.pr" "$(printf 'P3\tchr1\t14000\t0,1,2,3')"
 check_eq "per-read: discordant P4 gives one line per mate" "$(grep -c '^P4/[12]	' "$TMP/pe.pr")" "2"
@@ -618,9 +618,10 @@ pe_err "--paired: -L has no read names" "not -L" $PRM --paired -L "$PIDX" "$PE/i
 pe_err "--pe-isize without --paired" "need --paired" $PRM --pe-isize=400,10 "$PIDX" "$PE/r1.fa"
 pe_err "--pe-isize malformed" "MEAN,SD" $PRM --paired --pe-isize=400 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
-# --pe-near-win: P5's rescued mate has Ki3's TE copy 6.5 kb from its mate; a 100 kb window keeps Ki3
-"$RB" $PRM --paired --pe-near-win=100000 --ps4g-per-read="$TMP/nw.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/nw.tsv" 2>/dev/null
-check_eq "--pe-near-win=100000: P5's event keeps Ki3 (copy 6.5 kb away) as well as Mo17" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/nw.pr")" "1,2"
+# --pe-near-win: P5's rescued mate has Ki3's TE copy 6.5 kb from its mate; a 2 kb window drops it
+"$RB" $PRM --paired --pe-near-win=2000 --ps4g-per-read="$TMP/nw.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/nw.tsv" 2>/dev/null
+check_eq "--pe-near-win=2000: P5's event keeps only Mo17 (Ki3's copy is 6.5 kb away)" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/nw.pr")" "2"
+check_eq "default --pe-near-win: P5's event is {Ki3,Mo17}" "$(awk -F'\t' '$1=="P5"{print $4}' "$TMP/pe.pr")" "1,2"
 check_eq "--pe-near-win only changes RESC founder sets (stdout identical)" "$(cmp -s "$TMP/pe.tsv" "$TMP/nw.tsv" && echo same)" "same"
 
 # --max-locate: refmap's per-read occurrence sample (default 256, the former fixed limit)

@@ -251,7 +251,8 @@ window of the anchor (max insert + `--pe-slack`, about 2.7 kb). Lift projections
 2–20 kb off, especially in non-collinear sequence, so the true founder was filtered out. In
 collinear lost cases the event itself was at the truth 65% of the time (`resc_loss_pos.py`).
 
-**Fix.** `--pe-near-win=NUM` gives that founder filter its own window (default unchanged).
+**Fix.** `--pe-near-win=NUM` gives that founder filter its own window. **Default: 100 kb**
+(adopted 2026-10-16); 0 restores the old behaviour.
 Oh43 results; positions and wrong events are unchanged in every row:
 
 | `--pe-near-win` | PE recall (per fragment) | lost vs SE | mean set (Oh43 / Ia453) |
