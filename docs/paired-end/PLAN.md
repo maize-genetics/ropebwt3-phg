@@ -237,8 +237,34 @@ is byte-identical). Rerunning the maize sims at `--max-locate=1024` with the pro
 (`--max-occ=-1`) gave **byte-identical output**. `--max-occ=-1` resolves to 25 (one per genome),
 and every read with more occurrences is MULTI before anything is located, so the sample never
 binds. The option matters only with `--max-occ=0` or a large `--max-occ`; refmap warns
-otherwise. This rules out sampling as the cause of refmap's ~1.5 pp paired recall loss; the
-cause is still open.
+otherwise. This rules out sampling as the cause of refmap's ~1.5 pp paired recall loss.
+
+### Cause of refmap's paired recall loss (2026-10-16)
+
+**Size.** Per fragment, the loss is smaller than the per-event 1.5 pp suggested. Single-end has
+the true founder in at least one mate's event for 89.17% of Oh43 fragments; paired has it for
+88.51%. That is 0.65 pp, and no fragment gains (`scratch/paired_end/refmap_loss_diag.py`).
+
+**Cause.** 96% of lost fragments are RESC pairs whose two single-end sets *both* contained Oh43.
+The rescued mate keeps only founders whose own lift projection lies within the concordance
+window of the anchor (max insert + `--pe-slack`, about 2.7 kb). Lift projections are often
+2–20 kb off, especially in non-collinear sequence, so the true founder was filtered out. In
+collinear lost cases the event itself was at the truth 65% of the time (`resc_loss_pos.py`).
+
+**Fix.** `--pe-near-win=NUM` gives that founder filter its own window (default unchanged).
+Oh43 results; positions and wrong events are unchanged in every row:
+
+| `--pe-near-win` | PE recall (per fragment) | lost vs SE | mean set (Oh43 / Ia453) |
+|---|---|---|---|
+| default (~2.7 kb) | 88.51 | 0.65 pp | 8.13 / 7.56 |
+| 20 kb | 88.88 | 0.29 pp | 8.15 / 7.58 |
+| 100 kb | 88.98 | 0.19 pp | 8.16 / 7.59 |
+| 1e9 (same-chromosome only) | 89.03 | 0.13 pp | 8.16 / 7.59 |
+
+**What remains with 1e9:**
+- 81%: the true founder's projection is on another chromosome. The filter always requires the
+  same contig, which is what excludes TE copies elsewhere.
+- 17%: the intersection legitimately lacks the founder because one mate's set did.
 
 ## Next phases
 
