@@ -158,3 +158,54 @@ int32_t rb3_pe_event_gametes(const int32_t *a, int32_t na, int a_capped,
 	}
 	return n;
 }
+
+// a hit plus its index in the caller's array, sorted by (sid, start)
+typedef struct { rb3_pe_hit_t h; int32_t i; } pe_hit_ix_t;
+static int pe_hit_ix_cmp(const void *x, const void *y)
+{
+	const rb3_pe_hit_t *a = &((const pe_hit_ix_t*)x)->h, *b = &((const pe_hit_ix_t*)y)->h;
+	if (a->sid != b->sid) return a->sid < b->sid? -1 : 1;
+	return a->start < b->start? -1 : a->start > b->start;
+}
+
+int32_t rb3_pe_concordant_hits(const rb3_pe_hit_t *a, int32_t na, const rb3_pe_hit_t *b, int32_t nb,
+							   int64_t max_dist, int32_t la, int32_t lb, uint8_t *keep_a, uint8_t *keep_b, int64_t *span)
+{
+	pe_hit_ix_t *sa, *sb;
+	int64_t *sids, last = -1;
+	int32_t i, j, lo = 0, n_sid = 0, n_contig = 0;
+	if (span) *span = -1;
+	if (na <= 0 || nb <= 0) return 0;
+	sa = (pe_hit_ix_t*)malloc(na * sizeof(pe_hit_ix_t));
+	sb = (pe_hit_ix_t*)malloc(nb * sizeof(pe_hit_ix_t));
+	sids = (int64_t*)malloc(na * sizeof(int64_t));
+	for (i = 0; i < na; ++i) sa[i].h = a[i], sa[i].i = i;
+	for (j = 0; j < nb; ++j) sb[j].h = b[j], sb[j].i = j;
+	qsort(sa, na, sizeof(pe_hit_ix_t), pe_hit_ix_cmp);
+	qsort(sb, nb, sizeof(pe_hit_ix_t), pe_hit_ix_cmp);
+	for (i = 0; i < na; ++i) { // sweep: sb[lo..] is the first b hit not before (sid, start - max_dist)
+		const rb3_pe_hit_t *x = &sa[i].h;
+		int hit = 0;
+		while (lo < nb && (sb[lo].h.sid < x->sid || (sb[lo].h.sid == x->sid && sb[lo].h.start < x->start - max_dist))) ++lo;
+		for (j = lo; j < nb && sb[j].h.sid == x->sid && sb[j].h.start <= x->start + max_dist; ++j) {
+			const rb3_pe_hit_t *y = &sb[j].h;
+			if (y->strand == x->strand) continue;
+			hit = 1;
+			if (keep_b) keep_b[sb[j].i] = 1;
+			if (span && *span < 0) {
+				int64_t s0 = x->start < y->start? x->start : y->start;
+				int64_t e0 = x->start + la > y->start + lb? x->start + la : y->start + lb;
+				*span = e0 - s0;
+			}
+		}
+		if (hit) {
+			if (keep_a) keep_a[sa[i].i] = 1;
+			sids[n_sid++] = x->sid;
+		}
+	}
+	qsort(sids, n_sid, sizeof(int64_t), cmp_i64);
+	for (i = 0; i < n_sid; ++i)
+		if (i == 0 || sids[i] != last) ++n_contig, last = sids[i];
+	free(sa); free(sb); free(sids);
+	return n_contig;
+}

@@ -613,7 +613,7 @@ pe_err "--paired: R1 longer than R2" "first file has more reads" $PRM --paired "
 head -6 "$PE/interleaved.fa" > "$TMP/il_odd.fa"
 pe_err "--paired: odd interleaved file" "odd number of reads" $PRM --paired "$PIDX" "$TMP/il_odd.fa"
 pe_err "--paired: three input files" "R1.fq> <R2.fq> or one interleaved" $PRM --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa" "$PE/r1.fa"
-pe_err "--paired: chain not implemented yet" "refmap only" chain --ref-prefix=B73 --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "--paired: chain not implemented yet" "refmap and mem only" chain --ref-prefix=B73 --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "--paired: -L has no read names" "not -L" $PRM --paired -L "$PIDX" "$PE/interleaved.fa"
 pe_err "--pe-isize without --paired" "need --paired" $PRM --pe-isize=400,10 "$PIDX" "$PE/r1.fa"
 pe_err "--pe-isize malformed" "MEAN,SD" $PRM --paired --pe-isize=400 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
@@ -622,6 +622,38 @@ if [ -n "$NPY_PY" ]; then
 	if "$NPY_PY" verify_ps4g_npy.py "$TMP/pe.ps4g" "$TMP/pe.npy" > "$TMP/pe_verify.log" 2>&1; then pass
 	else fail "verify_ps4g_npy.py: --paired PS4G and npy disagree"; cat "$TMP/pe_verify.log" >&2; fi
 fi
+
+# --- 12. mem --paired: per-assembly concordance of the mates' SMEM hits ---
+# Same fixture. A pair is CONC when both mates hit one contig on opposite strands with implied
+# read starts within the insert; only those positions are printed. Fixture spans differ per
+# genome, so expectations below are per contig (see make_pe_fixture.py for coordinates).
+"$RB" mem --paired -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_pe.tsv" 2>"$TMP/mem_pe.log"
+check_eq "mem --paired exits 0" "$?" "0"
+mem_cls() { awk -F'\t' -v n="$1" '$1==n{print $NF}' "$TMP/mem_pe.tsv" | sort -u | tr '\n' ' '; }
+mem_pos() { awk -F'\t' -v n="$1" '$1==n{for(i=6;i<NF;++i) print $i}' "$TMP/mem_pe.tsv" | sort | tr '\n' ' '; }
+check_eq "mem P2: CONC on all four genomes" "$(mem_cls P2/1)$(mem_cls P2/2)" "CONC CONC "
+check_eq "mem P5: CONC, only Mo17 carries both mates (Ki3's TE copy is elsewhere)" "$(mem_pos P5/1)/$(mem_pos P5/2)" "Mo17_chr1:+:9600 /Mo17_chr1:-:10000 "
+check_eq "mem P6: the duplicated mate keeps only the copy next to its mate (4 of 8 positions)" \
+	"$(awk -F'\t' '$1=="P6/1"{print $4"/"$5}' "$TMP/mem_pe.tsv")" "8/4"
+check_eq "mem P6: kept positions are the 11000 copy" "$(mem_pos P6/1)" "B73_chr1:+:11000 Ki3_chr1:+:12000 Mo17_chr1:+:12400 Oh43_chr1:+:11000 "
+check_eq "mem P1: mates 900 bp apart on Mo17 (> max insert) -> DISC, positions unfiltered" "$(mem_cls P1/1)$(awk -F'\t' '$1=="P1/2"{print $5}' "$TMP/mem_pe.tsv")" "DISC 3"
+check_eq "mem P3: junk mate has no SMEM -> SOLO" "$(mem_cls P3/1)/$(grep -c '^P3/2' "$TMP/mem_pe.tsv")" "SOLO /0"
+check_eq "mem P4, P7: DISC" "$(mem_cls P4/1)$(mem_cls P7/2)" "DISC DISC "
+check_eq "mem: 40 clean pairs all CONC" "$(awk -F'\t' '$1~/^iso/ && $NF!="CONC"' "$TMP/mem_pe.tsv" | wc -l | tr -d ' ')" "0"
+if grep -q '47 pairs: 43 CONC, 0 RESC, 1 SOLO, 3 DISC, 0 NONE' "$TMP/mem_pe.log"; then pass; else fail "mem --paired: pair-class summary"; fi
+if grep -q 'insert size from 42 pairs: mean 400.7' "$TMP/mem_pe.log"; then pass; else fail "mem --paired: insert size from whole-read SMEM pairs"; fi
+"$RB" mem --paired -p 64 -t2 "$PIDX" "$PE/interleaved.fa" > "$TMP/mem_il.tsv" 2>/dev/null
+check_eq "mem --paired: interleaved == R1 R2" "$(cmp -s "$TMP/mem_pe.tsv" "$TMP/mem_il.tsv" && echo same)" "same"
+"$RB" mem -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_se.tsv" 2>/dev/null
+check_eq "mem without --paired: the same SMEM rows (files read one after another, so sort)" \
+	"$(cut -f1-4 "$TMP/mem_se.tsv" | sort | cmp -s - <(cut -f1-4 "$TMP/mem_pe.tsv" | sort) && echo same)" "same"
+check_eq "mem without --paired: P6/1 lists both copies (8 positions)" "$(awk -F'\t' '$1=="P6/1"{print $5}' "$TMP/mem_se.tsv")" "8"
+"$RB" mem --paired --pe-isize=400,10 -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > /dev/null 2>"$TMP/mem_fix.log"
+if grep -q 'insert size (fixed) mean 400.0 sd 10.0 max 440 (+0 slack)' "$TMP/mem_fix.log"; then pass; else fail "mem --pe-isize: fixed insert, no slack by default"; fi
+pe_err "mem --paired without -p" "needs -p INT" mem --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "mem --paired with --cov" "cannot be combined" mem --paired --cov -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "mem --pe-trust-exact" "refmap only" mem --paired --pe-trust-exact -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
+pe_err "sw --paired not implemented yet" "refmap and mem only" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
@@ -648,6 +680,9 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --ps4g "$TMP/vg_pe.ps4g" --npy "$TMP/vg_pe.npy" --ps4g-per-read "$TMP/vg_pe.pr" -K 2000 -t2 \
 		"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --paired; see $TMP/valgrind_pe.log"; cat "$TMP/valgrind_pe.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi

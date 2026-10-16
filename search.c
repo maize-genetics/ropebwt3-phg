@@ -98,6 +98,7 @@ typedef struct {
 	int8_t paired;         // --paired: reads are mate pairs (two files R1/R2, or one interleaved file); 0 = single-end
 	double pe_mean, pe_sd; // --pe-isize=MEAN,SD: fixed insert-size distribution (pe_mean <= 0: estimate per batch)
 	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
+	int8_t pe_slack_set;   // --pe-slack given explicitly (else mem uses 0: SMEM positions are exact)
 	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
 	rb3_swopt_t swo;
 } rb3_mopt_t;
@@ -153,6 +154,7 @@ typedef struct {
 	int64_t n_pos;
 	rb3_sai_t mem;
 	rb3_pos_t *pos;
+	uint8_t *keep; // mem --paired: keep[j] != 0 iff pos[j] has a concordant mate hit (NULL if not computed)
 } m_sai_pos_t;
 
 typedef struct {
@@ -237,6 +239,7 @@ typedef struct {
 	m_hapdiv_t *hapdiv;
 	refmap_rst_t *refmap; // refmap: one entry per query
 	rb3_pe_res_t *pe;     // --paired: one entry per mate pair (seq[2i], seq[2i+1])
+	int64_t pe_max_dist;  // --paired (mem): concordance window used for this batch
 	m_tbuf_t *buf;
 } step_t;
 
@@ -1057,6 +1060,23 @@ static void write_refmap(step_t *t)
 #define RB3_PE_MIN_PAIRS       25   // fewest EXACT-EXACT pairs for a batch's own insert-size estimate
 #define RB3_PE_DEFAULT_MAX_INS 1000 // max insert used until some batch yields an estimate
 
+// Update p->isize from one batch's fragment spans (span[] is sorted in place); warn once while
+// no batch has had enough pairs. Runs in pipeline step 1 (serialized across batches).
+static void pe_update_isize(pipeline_t *p, int64_t *span, int32_t n_span)
+{
+	rb3_isize_t is;
+	if (rb3_pe_isize_estimate(span, n_span, RB3_PE_MIN_PAIRS, &is)) {
+		p->isize = is;
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] insert size from %d pairs: mean %.1f, sd %.1f, max %ld\n", __func__,
+					is.n, is.mean, is.sd, (long)is.max_ins);
+	} else if (!p->isize.ok && !p->pe_warned && rb3_verbose >= 2) {
+		fprintf(stderr, "WARNING: only %d confidently placed pairs in a batch (need %d) to estimate the insert size; "
+						"using max insert %d until one does (or pass --pe-isize)\n", n_span, RB3_PE_MIN_PAIRS, RB3_PE_DEFAULT_MAX_INS);
+		p->pe_warned = 1;
+	}
+}
+
 static inline int8_t refmap_pe_rank(const refmap_rst_t *r)
 {
 	if (r->ref_sid < 0) return 0;
@@ -1074,23 +1094,13 @@ static void refmap_pair_batch(pipeline_t *p, step_t *t)
 	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
 	if (!p->isize_fixed) {
 		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
-		rb3_isize_t is;
 		for (i = 0; i < n_pair; ++i) {
 			const refmap_rst_t *a = &t->refmap[2*i], *b = &t->refmap[2*i+1];
 			if (a->status != RB3_RM_EXACT || b->status != RB3_RM_EXACT) continue;
 			if (a->ref_sid != b->ref_sid || a->strand == b->strand) continue;
 			span[n_span++] = (a->cR > b->cR? a->cR : b->cR) - (a->cL < b->cL? a->cL : b->cL);
 		}
-		if (rb3_pe_isize_estimate(span, n_span, RB3_PE_MIN_PAIRS, &is)) {
-			p->isize = is;
-			if (rb3_verbose >= 3)
-				fprintf(stderr, "[M::%s] insert size from %d pairs: mean %.1f, sd %.1f, max %ld\n",
-						__func__, is.n, is.mean, is.sd, (long)is.max_ins);
-		} else if (!p->isize.ok && !p->pe_warned && rb3_verbose >= 2) {
-			fprintf(stderr, "WARNING: only %d confidently placed pairs in a batch (need %d) to estimate the insert size; "
-							"using max insert %d until one does (or pass --pe-isize)\n", n_span, RB3_PE_MIN_PAIRS, RB3_PE_DEFAULT_MAX_INS);
-			p->pe_warned = 1;
-		}
+		pe_update_isize(p, span, n_span);
 		free(span);
 	}
 	max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
@@ -1742,6 +1752,8 @@ static void write_per_seq(step_t *t)
 			}
 		} else { // output long MEMs
 			const rb3_fmi_t *f = &p->fmi;
+			const rb3_pe_res_t *e = t->pe? &t->pe[j >> 1] : 0; // --paired: this read's pair
+			int filt = e && e->cls == RB3_PE_CONC;            // concordant pair: print only concordant positions
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *r = &s->mem[i];
 				rb3_sai_t *q = &r->mem;
@@ -1750,16 +1762,20 @@ static void write_per_seq(step_t *t)
 				write_name(&out, s);
 				rb3_sprintf_lite(&out, "\t%d\t%d\t%ld", st, en, (long)q->size);
 				if (r->n_pos > 0) {
-					int32_t j;
-					rb3_sprintf_lite(&out, "\t%ld", r->n_pos);
+					int32_t j, nk = r->n_pos;
+					if (filt) for (j = 0, nk = 0; j < r->n_pos; ++j) nk += r->keep && r->keep[j];
+					rb3_sprintf_lite(&out, "\t%ld", (long)nk);
 					for (j = 0; j < r->n_pos; ++j) {
 						rb3_pos_t *t = &r->pos[j];
 						int64_t rlen = f->sid->len[t->sid>>1], pos;
+						if (filt && !(r->keep && r->keep[j])) continue;
 						pos = t->sid&1? rlen - (t->pos + (en - st)) : t->pos;
 						rb3_sprintf_lite(&out, "\t%s:%c:%ld", f->sid->name[t->sid>>1], "+-"[t->sid&1], pos);
 					}
 					free(r->pos);
 				}
+				free(r->keep);
+				if (e) rb3_sprintf_lite(&out, "\t%s", rb3_pe_class_str[(int)e->cls]);
 				rb3_sprintf_lite(&out, "\n");
 				fputs(out.s, stdout);
 			}
@@ -1798,6 +1814,98 @@ static void write_hapdiv(step_t *t)
 		free(t->seq[j].name);
 	free(out.s);
 	free(t->hapdiv);
+}
+
+/********************************************************************
+ * --paired: mate pairing over one batch (mem)
+ ********************************************************************/
+#define RB3_PE_EST_WIN 10000 // mem: window for the insert-size sample (full-length SMEM hits only)
+
+// A read's located SMEM hits, as implied read starts on each contig's forward strand, flattened
+// in (SMEM, position) order; full_only: only SMEMs covering the whole read. Returns the count.
+static int32_t mem_read_hits(const pipeline_t *p, const m_seq_t *s, int full_only, rb3_pe_hit_t *h)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int32_t i, j, n = 0;
+	for (i = 0; i < s->n_mem; ++i) {
+		const m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info;
+		if (full_only && (st != 0 || en != s->len)) continue;
+		for (j = 0; j < r->n_pos; ++j) {
+			const rb3_pos_t *t = &r->pos[j];
+			int64_t rlen = f->sid->len[t->sid>>1];
+			int strand = t->sid & 1;
+			int64_t pos = strand? rlen - (t->pos + (en - st)) : t->pos; // forward start of the SMEM
+			h[n].sid = t->sid >> 1, h[n].strand = strand;
+			h[n++].start = strand? pos - (s->len - en) : pos - st;
+		}
+	}
+	return n;
+}
+
+static int32_t mem_n_pos(const m_seq_t *s)
+{
+	int32_t i, n = 0;
+	for (i = 0; i < s->n_mem; ++i) n += s->mem[i].n_pos;
+	return n;
+}
+
+static void mem_pair_worker(void *data, long i, int tid)
+{
+	step_t *t = (step_t*)data;
+	m_seq_t *s[2];
+	rb3_pe_hit_t *h[2];
+	uint8_t *k[2];
+	int32_t n[2], c, nc;
+	rb3_pe_res_t *e = &t->pe[i];
+	s[0] = &t->seq[2*i], s[1] = &t->seq[2*i+1];
+	for (c = 0; c < 2; ++c) {
+		int32_t m = mem_n_pos(s[c]);
+		h[c] = RB3_MALLOC(rb3_pe_hit_t, m > 0? m : 1);
+		k[c] = RB3_CALLOC(uint8_t, m > 0? m : 1);
+		n[c] = mem_read_hits(t->p, s[c], 0, h[c]);
+	}
+	nc = rb3_pe_concordant_hits(h[0], n[0], h[1], n[1], t->pe_max_dist, s[0]->len, s[1]->len, k[0], k[1], 0);
+	e->anchor = e->rescued = -1;
+	e->cls = nc > 0? RB3_PE_CONC : n[0] > 0 && n[1] > 0? RB3_PE_DISC : n[0] > 0 || n[1] > 0? RB3_PE_SOLO : RB3_PE_NONE;
+	e->resc_support = nc; // mem: number of contigs carrying the fragment
+	if (nc > 0) // scatter the flags back to each SMEM's positions (same flattened order as mem_read_hits)
+		for (c = 0; c < 2; ++c) {
+			int32_t a, b, x = 0;
+			for (a = 0; a < s[c]->n_mem; ++a) {
+				m_sai_pos_t *r = &s[c]->mem[a];
+				if (r->n_pos <= 0) continue;
+				r->keep = RB3_MALLOC(uint8_t, r->n_pos);
+				for (b = 0; b < r->n_pos; ++b) r->keep[b] = k[c][x++];
+			}
+		}
+	for (c = 0; c < 2; ++c) free(h[c]), free(k[c]);
+}
+
+static void mem_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	if (!p->isize_fixed) { // sample: pairs whose mates both have whole-read SMEM hits on a shared contig
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		for (i = 0; i < n_pair; ++i) {
+			const m_seq_t *a = &t->seq[2*i], *b = &t->seq[2*i+1];
+			int32_t ma = mem_n_pos(a), mb = mem_n_pos(b), na, nb;
+			rb3_pe_hit_t *ha, *hb;
+			int64_t sp;
+			if (ma == 0 || mb == 0) continue;
+			ha = RB3_MALLOC(rb3_pe_hit_t, ma), hb = RB3_MALLOC(rb3_pe_hit_t, mb);
+			na = mem_read_hits(p, a, 1, ha), nb = mem_read_hits(p, b, 1, hb);
+			if (rb3_pe_concordant_hits(ha, na, hb, nb, RB3_PE_EST_WIN, a->len, b->len, 0, 0, &sp) > 0 && sp > 0)
+				span[n_span++] = sp;
+			free(ha), free(hb);
+		}
+		pe_update_isize(p, span, n_span);
+		free(span);
+	}
+	t->pe_max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	kt_for(p->opt->n_threads, mem_pair_worker, t, n_pair);
+	for (i = 0; i < n_pair; ++i) ++p->pe_cnt[(int)t->pe[i].cls];
 }
 
 static void *worker_pipeline(void *shared, int step, void *in)
@@ -1879,6 +1987,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			kt_for(p->opt->n_threads, worker_for_seq, in, t->n_seq);
 		if (p->opt->paired && p->opt->algo == RB3_SA_REFMAP)
 			refmap_pair_batch(p, t);
+		else if (p->opt->paired && (p->opt->algo == RB3_SA_MEM_TG || p->opt->algo == RB3_SA_MEM_ORI))
+			mem_pair_batch(p, t);
 		return in;
 	} else if (step == 2) {
 		for (i = 0; i < p->opt->n_threads; ++i) {
@@ -1891,7 +2001,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		else if (p->opt->algo == RB3_SA_REFMAP)
 			write_refmap(t), free(t->refmap), free(t->pe);
 		else
-			write_per_seq(t);
+			write_per_seq(t), free(t->pe);
 		free(t->seq);
 		if (rb3_verbose >= 3)
 			fprintf(stderr, "[M::%s::%.3f*%.2f] processed %d sequences\n", __func__, rb3_realtime(), rb3_percent_cpu(), t->n_seq);
@@ -2087,7 +2197,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 				return 1;
 			}
 		}
-		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg);      // --paired: discordance slack (bp)
+		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg), opt.pe_slack_set = 1; // --paired: discordance slack (bp)
 		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
@@ -2129,6 +2239,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --old-mem   use the original MEM algorithm (for testing)\n");
 			fprintf(stderr, "  --gap=NUM   output regions >=NUM that are not covered by MEMs [%d]\n", opt.min_gap_len);
 			fprintf(stderr, "  --cov       output breadth of coverage\n");
+			fprintf(stderr, "  --paired    reads are mate pairs (<R1> <R2>, or one interleaved file); needs -p. A pair\n");
+			fprintf(stderr, "              with hits on the same contig, opposite strands, implied starts within the\n");
+			fprintf(stderr, "              insert is CONC and prints only those positions; a trailing column gives\n");
+			fprintf(stderr, "              the pair class (CONC/DISC/SOLO/NONE). --pe-isize=MEAN,SD, --pe-slack=NUM [0]\n");
 		}
 		if (strcmp(argv[0], "refmap") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -2269,7 +2383,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	if (opt.paired) { // check the paired-end setup before the (slow) index load
 		int n_files = argc - o.ind - 1;
 		const char *err = 0;
-		if (opt.algo != RB3_SA_REFMAP) err = "--paired is implemented for refmap only so far";
+		int is_mem = (opt.algo == RB3_SA_MEM_TG || opt.algo == RB3_SA_MEM_ORI);
+		if (opt.algo != RB3_SA_REFMAP && !is_mem) err = "--paired is implemented for refmap and mem only so far";
+		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM)";
+		else if (is_mem && (opt.min_gap_len > 0 || (opt.flag & RB3_MF_WRITE_COV))) err = "mem --paired cannot be combined with --gap/--cov";
+		else if (is_mem && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";
 		else if (is_line) err = "--paired needs read names (FASTA/FASTQ), not -L";
 		else if (n_files != 1 && n_files != 2) err = "--paired takes <R1.fq> <R2.fq> or one interleaved file";
@@ -2277,6 +2395,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
 		}
+		if (is_mem && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM positions are exact: no projection slack
 	} else if (opt.pe_mean > 0 || opt.pe_trust_exact) {
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact need --paired\n");
 		return 1;

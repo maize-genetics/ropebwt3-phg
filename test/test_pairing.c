@@ -224,6 +224,51 @@ static void test_event_gametes(void)
 	CHECK(a[0] == 7 && b[0] == 5, "gametes: inputs are not modified");
 }
 
+static rb3_pe_hit_t hit(int64_t sid, int64_t start, int strand)
+{
+	rb3_pe_hit_t h;
+	h.sid = sid, h.start = start, h.strand = strand;
+	return h;
+}
+
+static void test_concordant_hits(void)
+{
+	// mate a: 5 hits on 3 contigs; mate b: 5 hits. max_dist 500.
+	//  contig 1: a+ @1000, b- @1400  -> concordant (dist 400)
+	//  contig 2: a+ @5000, b+ @5100  -> same strand: not
+	//            a- @9000, b+ @8600  -> concordant (dist 400, any order)
+	//  contig 3: a+ @100,  b- @700   -> dist 600 > 500: not
+	//  contig 4: only b- @50
+	//  contig 1: a+ @1000 also pairs with b- @1500 (dist 500, inclusive)
+	rb3_pe_hit_t a[5], b[5];
+	uint8_t ka[5], kb[5];
+	int64_t span;
+	int32_t n;
+	a[0] = hit(2, 9000, 1), a[1] = hit(1, 1000, 0), a[2] = hit(3, 100, 0), a[3] = hit(2, 5000, 0), a[4] = hit(9, 77, 1);
+	b[0] = hit(4, 50, 1), b[1] = hit(1, 1400, 1), b[2] = hit(2, 5100, 0), b[3] = hit(2, 8600, 0), b[4] = hit(1, 1500, 1);
+	memset(ka, 0, 5), memset(kb, 0, 5);
+	n = rb3_pe_concordant_hits(a, 5, b, 5, 500, 100, 100, ka, kb, &span);
+	CHECK(n == 2, "concordant: two contigs (1 and 2) carry the fragment");
+	CHECK(ka[0] == 1 && ka[1] == 1 && ka[2] == 0 && ka[3] == 0 && ka[4] == 0, "concordant: mate-a hits flagged (unsorted input order kept)");
+	CHECK(kb[0] == 0 && kb[1] == 1 && kb[2] == 0 && kb[3] == 1 && kb[4] == 1, "concordant: mate-b hits flagged, distance == max_dist inclusive");
+	CHECK(span == 500, "concordant: span of the first concordant pair (contig 1: 1000..1500)");
+	memset(ka, 0, 5), memset(kb, 0, 5);
+	n = rb3_pe_concordant_hits(a, 5, b, 5, 399, 100, 100, ka, kb, &span);
+	CHECK(n == 0 && span == -1 && ka[0] + ka[1] + kb[1] + kb[3] == 0, "concordant: narrower window -> nothing");
+	CHECK(rb3_pe_concordant_hits(a, 0, b, 5, 500, 100, 100, 0, 0, &span) == 0 && span == -1, "concordant: empty mate -> 0");
+	n = rb3_pe_concordant_hits(a, 5, b, 5, 500, 100, 100, 0, 0, 0);
+	CHECK(n == 2, "concordant: NULL keep/span arguments allowed");
+	{ // many hits, one contig: every hit within range of an opposite-strand partner is flagged
+		rb3_pe_hit_t x[3], y[3];
+		uint8_t kx[3] = {0,0,0}, ky[3] = {0,0,0};
+		x[0] = hit(7, 100, 0), x[1] = hit(7, 2000, 0), x[2] = hit(7, 4000, 0);
+		y[0] = hit(7, 4300, 1), y[1] = hit(7, 350, 1), y[2] = hit(7, 9000, 1);
+		n = rb3_pe_concordant_hits(x, 3, y, 3, 500, 150, 150, kx, ky, &span);
+		CHECK(n == 1 && kx[0] && !kx[1] && kx[2] && ky[0] && ky[1] && !ky[2], "concordant: two concordant pairs on one contig count as one contig");
+		CHECK(span == 400, "concordant: first pair by position (100..500)");
+	}
+}
+
 int main(void)
 {
 	test_names();
@@ -231,6 +276,7 @@ int main(void)
 	test_resolve();
 	test_event_gametes();
 	test_near_gametes();
+	test_concordant_hits();
 	printf("test_pairing: %d passed, %d failed\n", n_pass, n_fail);
 	return n_fail > 0;
 }

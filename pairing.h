@@ -69,6 +69,22 @@ void rb3_pe_resolve(const rb3_pe_mate_t m[2], int64_t max_dist, int trust_exact,
 // fragment. Returns 0 when b has no projections or no proj_gid.
 int32_t rb3_pe_near_gametes(const rb3_pe_mate_t *b, int64_t rsid, int64_t pos, int64_t max_dist, int32_t *out);
 
+// One located hit of a read (mem): contig id, the read's implied start on the contig's forward
+// strand, and the strand the read aligns to.
+typedef struct {
+	int64_t sid, start;
+	int8_t strand;
+} rb3_pe_hit_t;
+
+// Concordant hits of two mates: same contig, opposite strands, implied starts at most max_dist
+// apart. Sets keep_a[i] / keep_b[j] (either may be NULL; not cleared first) for every hit with
+// such a partner, and returns the number of distinct contigs with a concordant pair -- in a
+// pangenome, the assemblies carrying the whole fragment. If span is not NULL, *span gets the
+// fragment span of the first concordant pair (by contig, then position) given read lengths la/lb,
+// or -1 if none.
+int32_t rb3_pe_concordant_hits(const rb3_pe_hit_t *a, int32_t na, const rb3_pe_hit_t *b, int32_t nb,
+							   int64_t max_dist, int32_t la, int32_t lb, uint8_t *keep_a, uint8_t *keep_b, int64_t *span);
+
 // Founder (gamete) set of a single pair event: sorted, deduplicated intersection of the
 // anchor's set a[] and the mate's set b[]. Falls back to a[] (sorted, deduped) when b[] is
 // empty or capped (an incomplete occurrence sample cannot veto founders), and to b[] when
