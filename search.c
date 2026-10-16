@@ -42,7 +42,7 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_R
 // This should scale with the #samples in the index (a locus can be shared by up to
 // N assemblies); capped at 256 to keep counts byte-sized (Ed). For N>256 the extra
 // assemblies are truncated (accepted). See docs/sample-relative-thresholds.md (#3).
-#define RB3_RM_MAX_ASSEMBLY 256
+#define RB3_RM_MAX_ASSEMBLY 256 // refmap: default --max-locate (occurrences located per read)
 
 typedef struct {
 	uint32_t flag;
@@ -98,6 +98,7 @@ typedef struct {
 	int8_t paired;         // --paired: reads are mate pairs (two files R1/R2, or one interleaved file); 0 = single-end
 	double pe_mean, pe_sd; // --pe-isize=MEAN,SD: fixed insert-size distribution (pe_mean <= 0: estimate per batch)
 	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
+	int32_t max_locate;    // refmap: occurrences of a read located per read (the rest are not sampled) [256]
 	int8_t pe_slack_set;   // --pe-slack given explicitly (else mem uses 0: SMEM positions are exact)
 	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
 	rb3_swopt_t swo;
@@ -138,6 +139,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
 	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
 	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
+	opt->max_locate = RB3_RM_MAX_ASSEMBLY;
 	opt->paired = 0, opt->pe_mean = 0.0, opt->pe_sd = 0.0; // single-end by default; insert size estimated per batch
 	opt->pe_slack = 2000;  // lift projections are typically within ~2kb (the --anchor-dist-thresh scale)
 	rb3_swopt_init(&opt->swo);
@@ -215,7 +217,7 @@ typedef struct refmap_rst_s {
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
 	int32_t core_len; // length of the exact interval used (s->len, or the SMEM core)
-	int8_t capped;    // the occurrence sample hit RB3_RM_MAX_ASSEMBLY: gametes may be incomplete
+	int8_t capped;    // the occurrence sample hit --max-locate: gametes may be incomplete
 	int32_t n_proj;   // --paired: alternative reference positions for mate rescue -- per-assembly lift
 	                  // projections (PLACED) or every reference copy (EXACT)
 	int64_t *proj_rsid, *proj_pos; // allocated with RB3_MALLOC; NULL when n_proj == 0
@@ -572,9 +574,10 @@ static int refmap_place_debug = 0; // RB3_PLACE_DEBUG=1: per-assembly projection
 static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
-	int64_t rsids[RB3_RM_MAX_ASSEMBLY], rposs[RB3_RM_MAX_ASSEMBLY], best_rsid = -1, med, v[RB3_RM_MAX_ASSEMBLY];
-	int32_t n = 0, k, j, bestn, m, gids[RB3_RM_MAX_ASSEMBLY];
-	for (k = 0; k < r->n_asm_list && n < RB3_RM_MAX_ASSEMBLY; ++k) {
+	int32_t L = r->n_asm_list > 0? r->n_asm_list : 1; // at most --max-locate
+	int64_t *rsids = Kmalloc(km, int64_t, L), *rposs = Kmalloc(km, int64_t, L), *v = Kmalloc(km, int64_t, L), best_rsid = -1, med;
+	int32_t n = 0, k, j, bestn, m, *gids = Kmalloc(km, int32_t, L);
+	for (k = 0; k < r->n_asm_list; ++k) {
 		int64_t clen, st, en, rsid, rpos;
 		pos_stranded(f->sid, &r->assemblies[k], s->len, &clen, &st, &en);
 		if (rb3_lift_project(p->lift, km, (int32_t)(r->assemblies[k].sid >> 1), st,
@@ -586,7 +589,7 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 					f->sid->name[r->assemblies[k].sid >> 1], (long)st, rb3_lift_last_path,
 					rsid >= 0? f->sid->name[rsid] : ".", (long)rpos);
 	}
-	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
+	if (n == 0) { r->status = RB3_RM_UNPLACED; goto lift_end; }
 	if (p->opt->paired) { // keep every projection: a mate placed far from this one may find one near it
 		r->n_proj = n;
 		r->proj_rsid = RB3_MALLOC(int64_t, n), r->proj_pos = RB3_MALLOC(int64_t, n);
@@ -603,6 +606,8 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 	med = v[m >> 1];
 	r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
 	r->cL = r->cR = med, r->ins_size = 0;
+lift_end:
+	kfree(km, rsids), kfree(km, rposs), kfree(km, v), kfree(km, gids);
 }
 
 // One reference-coordinate vote from a k-mer. sx = the physical source sequence
@@ -734,7 +739,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	if (p->opt->kmer_len > 0) { refmap_query_kmer(km, p, s, r); return; }
 	rb3_pos_t *pos;
 	int64_t np, i;
-	int asm_seen[RB3_RM_MAX_ASSEMBLY], n_asm = 0;
+	int32_t L = p->opt->max_locate, *asm_seen, n_asm = 0;
 
 	memset(r, 0, sizeof(*r));
 	r->status = RB3_RM_UNPLACED, r->strand = 0, r->qlen = s->len;
@@ -765,9 +770,9 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 
 	// locate a sample of occurrences; separate reference hits (exact) from assemblies
-	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
-	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_ASSEMBLY, pos);
-	r->capped = (np >= RB3_RM_MAX_ASSEMBLY);
+	pos = Kmalloc(km, rb3_pos_t, L);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, L, pos);
+	r->capped = (np >= L);
 	{
 		int ref_found = 0;
 		for (i = 0; i < np; ++i) {
@@ -792,18 +797,17 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		}
 		if (ref_found) {
 			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
-				int32_t tmp[RB3_RM_MAX_ASSEMBLY], m;
-				for (i = 0, m = 0; i < np; ++i) tmp[m++] = p->gtab->sid2g[pos[i].sid>>1];
-				r->gametes = RB3_MALLOC(int32_t, m);
-				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
-				r->n_gametes = m;
+				r->gametes = RB3_MALLOC(int32_t, np > 0? np : 1); // rb3_ps4g_acc_add sorts+dedupes on ingestion
+				for (i = 0; i < np; ++i) r->gametes[i] = p->gtab->sid2g[pos[i].sid>>1];
+				r->n_gametes = (int32_t)np;
 			}
 			kfree(km, pos);
 			return;
 		}
 	}
-	r->assemblies = RB3_CALLOC(rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
-	for (i = 0; i < np && n_asm < RB3_RM_MAX_ASSEMBLY; ++i) { // keep distinct assembly sequences for reporting
+	r->assemblies = RB3_CALLOC(rb3_pos_t, L);
+	asm_seen = Kmalloc(km, int32_t, L);
+	for (i = 0; i < np && n_asm < L; ++i) { // keep distinct assembly sequences for reporting
 		int32_t j, dup = 0;
 		for (j = 0; j < n_asm; ++j)
 			if (asm_seen[j] == (int)(pos[i].sid>>1)) { dup = 1; break; }
@@ -812,6 +816,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		r->assemblies[n_asm++] = pos[i];
 	}
 	r->n_asm_list = n_asm, r->n_assembly = n_asm;
+	kfree(km, asm_seen);
 	kfree(km, pos);
 	if (p->gtab && n_asm > 0) { // PS4G/npy: assembly samples backing a (possible) PLACED call below
 		int32_t k;
@@ -2080,6 +2085,7 @@ static ko_longopt_t long_options[] = {
 	{ "pe-isize",            ko_required_argument, 371 },
 	{ "pe-slack",            ko_required_argument, 372 },
 	{ "pe-trust-exact",      ko_no_argument,       373 },
+	{ "max-locate",          ko_required_argument, 374 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -2214,6 +2220,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg), opt.pe_slack_set = 1; // --paired: discordance slack (bp)
+		else if (c == 374) opt.max_locate = atoi(o.arg);             // refmap: occurrences located per read
 		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
@@ -2270,6 +2277,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --max-walk=NUM    DEPRECATED (--walk only) max bases to walk per flank [%d]\n", opt.max_walk);
 			fprintf(stderr, "  --walk-mode=STR   DEPRECATED (--walk only) consensus|strict|per-assembly [consensus]\n");
 			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
+			fprintf(stderr, "  --max-locate=INT  locate at most INT occurrences of each read; the rest are not\n");
+			fprintf(stderr, "                    sampled, so a repetitive read's gameteSet / reference copies may be\n");
+			fprintf(stderr, "                    incomplete, and a read whose reference copy is not sampled is called\n");
+			fprintf(stderr, "                    PLACED instead of EXACT (refmap's analogue of mem -p) [%d]\n", opt.max_locate);
 			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
 			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
 			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
@@ -2302,8 +2313,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    better-placed mate; a projected mate far from its mate is moved next\n");
 			fprintf(stderr, "                    to it when one of its assembly projections lands there; stdout gains\n");
 			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC).\n");
-			fprintf(stderr, "                    -p does not apply to refmap (fixed 256-occurrence sample); for\n");
-			fprintf(stderr, "                    repeat-heavy recall use mem --paired -p 1024\n");
+			fprintf(stderr, "                    -p does not apply to refmap; raise --max-locate instead\n");
 			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
 			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
 			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
@@ -2401,6 +2411,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		return 0;
 	}
 
+	if (opt.max_locate < 1) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --max-locate must be >= 1\n");
+		return 1;
+	}
+	if (opt.max_locate != RB3_RM_MAX_ASSEMBLY && opt.algo != RB3_SA_REFMAP) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --max-locate applies to refmap only (mem/chain: use -p)\n");
+		return 1;
+	}
 	if (opt.paired) { // check the paired-end setup before the (slow) index load
 		int n_files = argc - o.ind - 1;
 		const char *err = 0;

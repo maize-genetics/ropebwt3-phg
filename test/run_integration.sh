@@ -618,6 +618,22 @@ pe_err "--paired: -L has no read names" "not -L" $PRM --paired -L "$PIDX" "$PE/i
 pe_err "--pe-isize without --paired" "need --paired" $PRM --pe-isize=400,10 "$PIDX" "$PE/r1.fa"
 pe_err "--pe-isize malformed" "MEAN,SD" $PRM --paired --pe-isize=400 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
+# --max-locate: refmap's per-read occurrence sample (default 256, the former fixed limit)
+"$RB" $PRM --max-locate=256 --paired --ps4g="$TMP/ml256.ps4g" --npy="$TMP/ml256.npy" --ps4g-per-read="$TMP/ml256.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ml256.tsv" 2>/dev/null
+check_eq "--max-locate=256 (the default) reproduces the default run exactly" \
+	"$(cmp -s "$TMP/pe.tsv" "$TMP/ml256.tsv" && cmp -s "$TMP/pe.npy" "$TMP/ml256.npy" && cmp -s "$TMP/pe.pr" "$TMP/ml256.pr" && diff <(grep -v '^#Command' "$TMP/pe.ps4g") <(grep -v '^#Command' "$TMP/ml256.ps4g") >/dev/null && echo same)" "same"
+"$RB" $PRM --max-locate=1 --ps4g-per-read="$TMP/ml1.pr" "$PIDX" "$PE/r1.fa" > "$TMP/ml1.tsv" 2>/dev/null
+check_eq "--max-locate=1: an exact read shared by all 4 genomes carries one sampled gamete (iso00/1)" \
+	"$(awk -F'\t' '$1=="iso00/1"{n=split($4,a,","); print n}' "$TMP/ml1.pr")" "1"
+# with one occurrence sampled, the B73 copy can be missed: the read is then PLACED, not EXACT
+check_eq "--max-locate=1: iso00/1's only sampled occurrence is an assembly copy -> PLACED" \
+	"$(awk -F'\t' '$1=="iso00/1"{print $3}' "$TMP/ml1.tsv")" "PLACED"
+"$RB" $PRM --max-locate=4 --ps4g-per-read="$TMP/ml4.pr" "$PIDX" "$PE/r1.fa" > "$TMP/ml4.tsv" 2>/dev/null
+check_eq "--max-locate=4 (all 4 occurrences): iso00/1 is EXACT with all four gametes" \
+	"$(awk -F'\t' '$1=="iso00/1"{print $3}' "$TMP/ml4.tsv")/$(awk -F'\t' '$1=="iso00/1"{n=split($4,a,","); print n}' "$TMP/ml4.pr")" "EXACT/4"
+pe_err "--max-locate=0 rejected" "max-locate must be >= 1" $PRM --max-locate=0 "$PIDX" "$PE/r1.fa"
+pe_err "--max-locate is refmap-only" "refmap only (mem/chain: use -p)" mem --max-locate=512 -p 64 "$PIDX" "$PE/r1.fa"
+
 if [ -n "$NPY_PY" ]; then
 	if "$NPY_PY" verify_ps4g_npy.py "$TMP/pe.ps4g" "$TMP/pe.npy" > "$TMP/pe_verify.log" 2>&1; then pass
 	else fail "verify_ps4g_npy.py: --paired PS4G and npy disagree"; cat "$TMP/pe_verify.log" >&2; fi
@@ -684,6 +700,12 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --ps4g "$TMP/vg_pe.ps4g" --npy "$TMP/vg_pe.npy" --ps4g-per-read "$TMP/vg_pe.pr" -K 2000 -t2 \
 		"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --paired; see $TMP/valgrind_pe.log"; cat "$TMP/valgrind_pe.log" >&2; fi
+	for ml in 1 5000; do
+		valgrind --error-exitcode=99 --leak-check=full -q \
+			"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --max-locate=$ml --ps4g "$TMP/vg_ml.ps4g" -t2 \
+			"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ml$ml.log"
+		if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --max-locate=$ml"; cat "$TMP/valgrind_ml$ml.log" >&2; fi
+	done
 	valgrind --error-exitcode=99 --leak-check=full -q \
 		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
