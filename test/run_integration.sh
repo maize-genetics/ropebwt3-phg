@@ -741,6 +741,289 @@ check_eq "sw --paired: DISC lines identical to single-end apart from the tag" \
 pe_err "sw --paired without -p" "sw --paired needs -p INT" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "sw --paired with --all-e2e" "cannot be combined with --all-e2e" sw --paired -p 64 --all-e2e "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
+# --- 15. isa + extract: coordinate-based sequence extraction ---
+# Truth for the tiny fixture comes straight from the FASTA (awk substr), so these checks
+# need no python. Coordinates are 0-based half-open; ':-' is the reverse complement.
+fa_seq() { # fa_seq <fasta> <name> -> the whole sequence on one line
+	awk -v n="$2" '/^>/{p=(substr($1,2)==n); next} p{printf "%s", $0} END{print ""}' "$1"
+}
+fa_sub() { # fa_sub <fasta> <name> <start> <end> [-]
+	local s; s=$(fa_seq "$1" "$2" | awk -v a="$3" -v b="$4" '{print substr($0, a+1, b-a)}')
+	if [ "${5:-+}" = "-" ]; then echo "$s" | rev | tr ACGTN TGCAN; else echo "$s"; fi
+}
+fa_rec() { # fa_rec <fasta-out> <qid> -> the record's sequence joined onto one line
+	awk -v q="$2" '/^>/{p=(substr($1,2)==q); next} p{printf "%s", $0} END{print ""}' "$1"
+}
+FA="$DIR/pangenome.fa"
+
+"$RB" isa -b 3 "$IDX" 2>"$TMP/isa.log"
+check_eq "isa exits 0" "$?" "0"
+check_eq "isa writes <idx>.isa by default" "$([ -s "$IDX.isa" ] && echo yes || echo no)" "yes"
+"$RB" isa 2>/dev/null; check_eq "isa without an index prints usage and exits 1" "$?" "1"
+
+REGS="B73_chr1:0-1 B73_chr1:599-600 B73_chr1:0-600 Oh43_chr1:100-1100 Oh43_chr1:1099-1100 Mo17_chr1:250-260:- Tx303_chr1:1099-1100:- Ki3_chr1:0-1100:- CML247_chr1:290-310:+ B97_chr1:512-777"
+"$RB" extract "$IDX" $REGS > "$TMP/ext.fa" 2>"$TMP/ext.log"
+check_eq "extract exits 0 (direct regions)" "$?" "0"
+check_eq "extract: one record per region" "$(grep -c '^>' "$TMP/ext.fa")" "10"
+nbad=0
+for r in $REGS; do
+	strand=+; reg=$r
+	case "$r" in *:-) strand=-; reg=${r%:-} ;; *:+) reg=${r%:+} ;; esac
+	ctg=${reg%:*}; rng=${reg##*:}
+	want=$(fa_sub "$FA" "$ctg" "${rng%-*}" "${rng#*-}" "$strand")
+	got=$(fa_rec "$TMP/ext.fa" "$r")
+	[ "$got" = "$want" ] || { nbad=$((nbad+1)); echo "  mismatch $r: got $got want $want" >&2; }
+done
+check_eq "extract: every region equals the FASTA substring (revcomp for '-')" "$nbad" "0"
+check_eq "extract: '-' of a full sequence is its reverse complement" "$(fa_rec "$TMP/ext.fa" Ki3_chr1:0-1100:-)" "$(fa_seq "$FA" Ki3_chr1 | rev | tr ACGT TGCA)"
+check_eq "extract: '+' suffix is accepted and equals no suffix" "$(fa_rec "$TMP/ext.fa" CML247_chr1:290-310:+)" "$(fa_sub "$FA" CML247_chr1 290 310)"
+
+# errors: reported per query on stderr, other queries still printed, exit status 1
+"$RB" extract "$IDX" B73_chr1:0-5 Nope_chr1:0-5 B73_chr1:0-601 B73_chr1:10-10 B73_chr1:10-5 B73_chr1:abc B73_chr1:5-10:x B73_chr1:1-3 \
+	> "$TMP/ext_err.fa" 2>"$TMP/ext_err.log"
+check_eq "extract: input errors -> exit status 1" "$?" "1"
+check_eq "extract: valid queries still written alongside errors" "$(grep -c '^>' "$TMP/ext_err.fa")" "2"
+check_eq "extract: unknown contig reported" "$(grep -c "query 'Nope_chr1:0-5': unknown contig" "$TMP/ext_err.log")" "1"
+check_eq "extract: past-the-end reported (no silent clamp)" "$(grep -c "query 'B73_chr1:0-601': interval extends past the contig end" "$TMP/ext_err.log")" "1"
+check_eq "extract: start == end reported" "$(grep -c "'B73_chr1:10-10': empty interval (start == end)" "$TMP/ext_err.log")" "1"
+check_eq "extract: start > end reported" "$(grep -c "'B73_chr1:10-5': empty interval (start > end)" "$TMP/ext_err.log")" "1"
+check_eq "extract: unparsable regions reported" "$(grep -c 'cannot parse region' "$TMP/ext_err.log")" "2"
+"$RB" extract --clamp "$IDX" B73_chr1:590-700 B73_chr1:700-800 > "$TMP/ext_clamp.fa" 2>"$TMP/ext_clamp.log"
+check_eq "extract --clamp: an interval that is empty after clamping is still an error" "$?" "1"
+check_line_in "extract --clamp: header marks a clamped interval" "$TMP/ext_clamp.fa" ">B73_chr1:590-700 clamped"
+check_eq "extract --clamp: clipped to the contig end" "$(fa_rec "$TMP/ext_clamp.fa" B73_chr1:590-700)" "$(fa_sub "$FA" B73_chr1 590 600)"
+"$RB" extract "$IDX" 2>/dev/null >/dev/null; check_eq "extract with no queries -> exit 1" "$?" "1"
+
+# TSV input: header, comment, strand column, bad strand
+printf 'qid\tcontig\tstart\tend\tstrand\n# a comment\nq1\tOh43_chr1\t295\t810\t-\nq2\tB73_chr1\t5\t9\t+\nq3\tB73_chr1\t5\t9\n' > "$TMP/q.tsv"
+"$RB" extract -f "$TMP/q.tsv" "$IDX" > "$TMP/ext_tsv.fa" 2>/dev/null
+check_eq "extract -f: exits 0" "$?" "0"
+check_eq "extract -f: header line and comment skipped, 3 records" "$(grep -c '^>' "$TMP/ext_tsv.fa")" "3"
+check_eq "extract -f: '-' strand column" "$(fa_rec "$TMP/ext_tsv.fa" q1)" "$(fa_sub "$FA" Oh43_chr1 295 810 -)"
+check_eq "extract -f: strand column optional (+)" "$(fa_rec "$TMP/ext_tsv.fa" q3)" "$(fa_sub "$FA" B73_chr1 5 9)"
+printf 'q1\tB73_chr1\t5\t9\t*\nq2\tB73_chr1\tx\t9\t+\n' | "$RB" extract -f - "$IDX" > /dev/null 2>"$TMP/ext_tsv_bad.log"
+check_eq "extract -f -: bad strand / non-numeric start after line 1 -> exit 1" "$?" "1"
+check_eq "extract -f: bad strand reported" "$(grep -c "strand column must be" "$TMP/ext_tsv_bad.log")" "1"
+
+# many random queries: -t4 == -t1, line wrapping, in-memory ISA == .isa file, -I
+awk 'BEGIN{srand(7); split("B73_chr1 Oh43_chr1 Mo17_chr1 Ki3_chr1",c," "); L["B73_chr1"]=600;
+	for(i=0;i<300;i++){ n=c[int(rand()*4)+1]; len=(n=="B73_chr1")?600:1100; a=int(rand()*len); b=a+1+int(rand()*(len-a));
+	print "r"i"\t"n"\t"a"\t"b"\t"(rand()<.5?"+":"-") }}' > "$TMP/rand.tsv"
+"$RB" extract -t1 -f "$TMP/rand.tsv" "$IDX" > "$TMP/rand1.fa" 2>/dev/null
+"$RB" extract -t4 -f "$TMP/rand.tsv" "$IDX" > "$TMP/rand4.fa" 2>/dev/null
+check_eq "extract: -t4 output identical to -t1 (300 random queries)" "$(cmp -s "$TMP/rand1.fa" "$TMP/rand4.fa" && echo same)" "same"
+nbad=$(awk -F'\t' '{print $1, $2, $3, $4, $5}' "$TMP/rand.tsv" | head -60 | while read q c a b s; do
+	[ "$(fa_rec "$TMP/rand1.fa" "$q")" = "$(fa_sub "$FA" "$c" "$a" "$b" "$s")" ] || echo bad; done | wc -l | tr -d ' ')
+check_eq "extract: random queries equal the FASTA (first 60 checked)" "$nbad" "0"
+"$RB" extract -w 7 -f "$TMP/rand.tsv" "$IDX" > "$TMP/randw.fa" 2>/dev/null
+check_eq "extract -w 7: no sequence line longer than 7" "$(awk '!/^>/ && length($0)>7' "$TMP/randw.fa" | wc -l | tr -d ' ')" "0"
+check_eq "extract -w 7: same records once unwrapped" "$(awk '/^>/{if(s)print s; print; s=""; next}{s=s $0} END{print s}' "$TMP/randw.fa" | md5sum)" "$(md5sum < "$TMP/rand1.fa")"
+mv "$IDX.isa" "$TMP/moved.isa"
+"$RB" extract -f "$TMP/rand.tsv" "$IDX" > "$TMP/rand_lazy.fa" 2>/dev/null
+check_eq "extract: no .isa -> entry points derived from the .ssa in memory, same output" "$(cmp -s "$TMP/rand1.fa" "$TMP/rand_lazy.fa" && echo same)" "same"
+"$RB" extract -I "$TMP/moved.isa" -f "$TMP/rand.tsv" "$IDX" > "$TMP/rand_I.fa" 2>/dev/null
+check_eq "extract -I FILE: same output" "$(cmp -s "$TMP/rand1.fa" "$TMP/rand_I.fa" && echo same)" "same"
+"$RB" extract -I /nonexistent.isa "$IDX" B73_chr1:0-5 > /dev/null 2>&1
+check_eq "extract -I missing file -> exit 1" "$?" "1"
+mv "$TMP/moved.isa" "$IDX.isa"
+check_eq "get is unchanged: sequence 0 is B73_chr1" "$("$RB" get "$IDX" 0 2>/dev/null | tail -1)" "$(fa_seq "$FA" B73_chr1)"
+check_eq "get is unchanged: sequence 1 is its reverse complement" "$("$RB" get "$IDX" 1 2>/dev/null | tail -1)" "$(fa_seq "$FA" B73_chr1 | rev | tr ACGT TGCA)"
+
+# --lift projection on the tiny fixture: every founder = B73 + a 500 bp insertion at 300
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 --project-only "$IDX" B73_chr1:100-250 B73_chr1:250-400 B73_chr1:350-500 \
+	> "$TMP/proj.tsv" 2>"$TMP/proj.log"
+check_eq "extract --project-only exits 0" "$?" "0"
+check_line_in "project-only: TSV header" "$TMP/proj.tsv" "$(printf 'qid\tref_contig\tref_start\tref_end\tassembly\tcontig\tstart\tend\tstrand\tstatus\tmethod\tsnap\tsnap_shift\traw_start\traw_end')"
+check_line_in "project-only: collinear stretch before the insertion maps 1:1" "$TMP/proj.tsv" \
+	"$(printf 'B73_chr1:100-250\tB73_chr1\t100\t250\tOh43\tOh43_chr1\t100\t250\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:100:+\tOh43_chr1:250:+')"
+check_line_in "project-only: an interval spanning the 500 bp insertion grows by 500" "$TMP/proj.tsv" \
+	"$(printf 'B73_chr1:250-400\tB73_chr1\t250\t400\tOh43\tOh43_chr1\t250\t900\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:250:+\tOh43_chr1:900:+')"
+check_line_in "project-only: after the insertion, offset +500" "$TMP/proj.tsv" \
+	"$(printf 'B73_chr1:350-500\tB73_chr1\t350\t500\tOh43\tOh43_chr1\t850\t1000\t+\tok\tlocal,local\tsnap,snap\t0,0\tOh43_chr1:850:+\tOh43_chr1:1000:+')"
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to B73 --project-only "$IDX" B73_chr1:10-20 > "$TMP/proj_id.tsv" 2>/dev/null
+check_line_in "project-only: the reference itself is the identity" "$TMP/proj_id.tsv" \
+	"$(printf 'B73_chr1:10-20\tB73_chr1\t10\t20\tB73\tB73_chr1\t10\t20\t+\tok\tidentity,identity\tidentity,identity\t0,0\tB73_chr1:10:+\tB73_chr1:20:+')"
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 "$IDX" B73_chr1:250-400 > "$TMP/proj.fa" 2>/dev/null
+check_line_in "extract --lift: FASTA header carries the projected and the reference interval" "$TMP/proj.fa" ">B73_chr1:250-400 Oh43_chr1:250-900:+ ref=B73_chr1:250-400 snap=snap,snap"
+check_eq "extract --lift: sequence = the founder at the projected interval" "$(fa_rec "$TMP/proj.fa" B73_chr1:250-400)" "$(fa_sub "$FA" Oh43_chr1 250 900)"
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 --lift-local-win=0 --project-only "$IDX" B73_chr1:100-250 > "$TMP/proj_med.tsv" 2>/dev/null
+check_eq "extract --lift-local-win=0: falls back to refmap's wide median" "$(awk -F'\t' 'NR==2{print $11}' "$TMP/proj_med.tsv")" "median,median"
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Nope "$IDX" B73_chr1:0-5 > /dev/null 2>&1
+check_eq "extract --to unknown assembly -> exit 1" "$?" "1"
+"$RB" extract --project-only "$IDX" B73_chr1:0-5 > /dev/null 2>&1
+check_eq "extract --project-only without --lift -> exit 1" "$?" "1"
+"$RB" extract --lift="$LIFT" --to Oh43 "$IDX" B73_chr1:0-5 > /dev/null 2>&1
+check_eq "extract --lift without --ref-prefix -> exit 1" "$?" "1"
+"$RB" extract --lift="$LIFT" --ref-prefix=B73 --to Oh43 --project-only "$IDX" B73_chr1:0-5:- Oh43_chr1:0-5 > "$TMP/proj_bad.tsv" 2>"$TMP/proj_bad.log"
+check_eq "extract --lift: strand suffix / non-reference contig -> exit 1" "$?" "1"
+check_eq "extract --lift: input errors still get a TSV row" "$(awk -F'\t' 'NR>1 && $10 ~ /^input_error/' "$TMP/proj_bad.tsv" | wc -l | tr -d ' ')" "2"
+
+# inverted and split founders: projection decides the strand, and refuses to guess
+awk 'BEGIN{srand(3); s=""; for(i=0;i<3000;i++) s=s substr("ACGT",int(rand()*4)+1,1);
+	print ">B73_chr1"; print s; print ">Fwd_chr1"; print s; print ">Spl_a"; print substr(s,1,1500); print ">Spl_b"; print substr(s,1501);
+	t=""; for(i=0;i<3000;i++) t=t substr("ACGT",int(rand()*4)+1,1); print ">Far_chr1"; print t}' > "$TMP/inv.fa"
+fa_seq "$TMP/inv.fa" B73_chr1 | rev | tr ACGT TGCA | awk '{print ">Inv_chr1"; print}' >> "$TMP/inv.fa"
+"$RB" build -d -o "$TMP/inv.fmd" "$TMP/inv.fa" 2>/dev/null && "$RB" ssa -s4 -o "$TMP/inv.fmd.ssa" "$TMP/inv.fmd" 2>/dev/null
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$TMP/inv.fa" | gzip > "$TMP/inv.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$TMP/inv.lift" "$TMP/inv.fmd" "$TMP/inv.fa" 2>/dev/null
+"$RB" isa -b 4 "$TMP/inv.fmd" 2>/dev/null
+printf 'qid\tref_contig\tref_start\tref_end\tassembly\nfwd\tB73_chr1\t1000\t1500\tFwd\ninv\tB73_chr1\t1000\t1500\tInv\nsplit\tB73_chr1\t1000\t2000\tSpl\nfar\tB73_chr1\t1000\t1500\tFar\n' > "$TMP/inv_q.tsv"
+"$RB" extract --lift="$TMP/inv.lift" --lift-k 31 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_proj.tsv" 2>"$TMP/inv_proj.log"
+check_eq "extract --project-only: projection failures do not set the exit status" "$?" "0"
+check_line_in "projection: an identical founder maps 1:1" "$TMP/inv_proj.tsv" "$(printf 'fwd\tB73_chr1\t1000\t1500\tFwd\tFwd_chr1\t1000\t1500\t+\tok\tlocal,local\tsnap,snap\t0,0\tFwd_chr1:1000:+\tFwd_chr1:1500:+')"
+check_line_in "projection: a reverse-complemented founder maps to [L-end, L-start) on '-'" "$TMP/inv_proj.tsv" "$(printf 'inv\tB73_chr1\t1000\t1500\tInv\tInv_chr1\t1500\t2000\t-\tok\tlocal,local\tsnap,snap\t0,0\tInv_chr1:2000:-\tInv_chr1:1500:-')"
+check_eq "projection: ends on different contigs -> explicit failure, no guess" "$(awk -F'\t' '$1=="split"{print $6"|"$10}' "$TMP/inv_proj.tsv")" ".|projection_failed: start and end project to different contigs"
+check_eq "projection: no anchors -> explicit failure" "$(awk -F'\t' '$1=="far"{print $6"|"$10}' "$TMP/inv_proj.tsv")" ".|projection_failed: no confident projection for the start"
+check_eq "projection failures are also reported on stderr" "$(grep -c 'projection failed' "$TMP/inv_proj.log")" "2"
+"$RB" extract --lift="$TMP/inv.lift" --lift-k 31 --ref-prefix=B73 -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_proj.fa" 2>/dev/null
+check_eq "extract --lift: only the projected queries get a FASTA record" "$(grep -c '^>' "$TMP/inv_proj.fa")" "2"
+check_eq "extract --lift: an inverted founder's '-' extraction reads in reference orientation" \
+	"$(fa_rec "$TMP/inv_proj.fa" inv)" "$(fa_sub "$TMP/inv.fa" B73_chr1 1000 1500)"
+# snapping repairs a wrong --lift-k on the inverted founder; --no-snap shows the raw projection
+"$RB" extract --lift="$TMP/inv.lift" --lift-k 1 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_k1.tsv" 2>/dev/null
+check_eq "snap: an inverted locus projected with the wrong k is snapped back to the homologous bases" \
+	"$(awk -F'\t' '$1=="inv"{print $6":"$7"-"$8":"$9" "$12" "$13}' "$TMP/inv_k1.tsv")" "Inv_chr1:1500-2000:- snap,snap 30,30"
+"$RB" extract --lift="$TMP/inv.lift" --lift-k 1 --no-snap --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > "$TMP/inv_k1_nosnap.tsv" 2>/dev/null
+check_eq "--no-snap: the raw projection (off by k-1 = 30 here), labelled proj" \
+	"$(awk -F'\t' '$1=="inv"{print $6":"$7"-"$8":"$9" "$12" "$13}' "$TMP/inv_k1_nosnap.tsv")" "Inv_chr1:1470-1970:- proj,proj 0,0"
+check_eq "--no-snap: 15 columns on every row" "$(awk -F'\t' 'NR>1{print NF}' "$TMP/inv_k1_nosnap.tsv" | sort -u)" "15"
+# raw_start / raw_end: the unsnapped per-end projection, also on failed rows
+check_eq "raw: '-' locus, forward fenceposts in reference-end order (interval = [raw_end, raw_start))" \
+	"$(awk -F'\t' '$1=="inv"{print $14" "$15}' "$TMP/inv_k1_nosnap.tsv")" "Inv_chr1:1970:- Inv_chr1:1470:-"
+check_eq "raw: a failed row (ends on different contigs) still reports each end's raw projection" \
+	"$(awk -F'\t' '$1=="split"{print $10" | "$14" "$15}' "$TMP/inv_k1_nosnap.tsv")" "projection_failed: start and end project to different contigs | Spl_a:1000:+ Spl_b:500:+"
+check_eq "raw: an end that did not project is '.'" "$(awk -F'\t' '$1=="far"{print $14" "$15}' "$TMP/inv_k1_nosnap.tsv")" ". ."
+check_eq "raw: snapping does not change the raw columns" "$(cut -f1,14,15 "$TMP/inv_k1.tsv")" "$(cut -f1,14,15 "$TMP/inv_k1_nosnap.tsv")"
+"$RB" extract --lift="$TMP/inv.lift" --snap-flank=8 --ref-prefix=B73 --project-only -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > /dev/null 2>&1
+check_eq "--snap-flank below the minimum aligned length -> exit 1" "$?" "1"
+# projected-span sanity check (--max-span-excess / --max-span-ratio, after snapping):
+# Ins = B73[0,50k) + 60 kb insertion + B73[50k,100k); Clp = the first 112 kb of Ins
+awk 'BEGIN{srand(5); s=""; for(i=0;i<100000;i++) s=s substr("ACGT",int(rand()*4)+1,1); x=""; for(i=0;i<60000;i++) x=x substr("ACGT",int(rand()*4)+1,1);
+	ins=substr(s,1,50000) x substr(s,50001); print ">B73_chr1"; print s; print ">Ins_chr1"; print ins; print ">Clp_chr1"; print substr(ins,1,112000)}' > "$TMP/span.fa"
+"$RB" build -d -o "$TMP/span.fmd" "$TMP/span.fa" 2>/dev/null && "$RB" ssa -s4 -o "$TMP/span.fmd.ssa" "$TMP/span.fmd" 2>/dev/null
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$TMP/span.fa" | gzip > "$TMP/span.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$TMP/span.lift" "$TMP/span.fmd" "$TMP/span.fa" 2>/dev/null
+"$RB" isa -b 6 "$TMP/span.fmd" 2>/dev/null
+span() { # span <extra options...> -> "status-or-interval" for the two Ins queries and the Clp one
+	"$RB" extract --lift="$TMP/span.lift" --lift-k 31 --ref-prefix=B73 --project-only "$@" \
+		-f "$TMP/span_q.tsv" "$TMP/span.fmd" 2>/dev/null | awk -F'\t' 'NR>1{printf "%s=%s ", $1, ($10 ~ /^ok/? $6":"$7"-"$8":"$10 : $10)}'
+}
+printf 'trip\tB73_chr1\t49000\t51000\tIns\nplausible\tB73_chr1\t30000\t70000\tIns\nclamped\tB73_chr1\t49000\t60000\tClp\n' > "$TMP/span_q.tsv"
+check_eq "span check: 2 kb -> 62 kb fails, 40 kb -> 100 kb (big but plausible insertion) passes, a clamped 63 kb span fails" "$(span)" \
+	"trip=projection_failed: projected span implausibly long (62000 bp for 2000 bp) plausible=Ins_chr1:30000-130000:ok clamped=projection_failed: projected span implausibly long (63000 bp for 11000 bp) "
+check_eq "span check: --max-span-excess=0 turns it off" "$(span --max-span-excess=0)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: --max-span-ratio=0 turns it off" "$(span --max-span-ratio=0)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: BOTH conditions needed (ratios 31/5.7 < 40; excesses 60/52 kb < 70 kb)" "$(span --max-span-ratio=40) $(span --max-span-excess=70000)" \
+	"trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped  trip=Ins_chr1:49000-111000:ok plausible=Ins_chr1:30000-130000:ok clamped=Clp_chr1:49000-112000:ok_clamped "
+check_eq "span check: also applies with --no-snap" "$(span --no-snap | cut -d' ' -f1-2)" \
+	"trip=projection_failed: projected"
+"$RB" extract --lift="$TMP/span.lift" --lift-k 31 --ref-prefix=B73 -f "$TMP/span_q.tsv" "$TMP/span.fmd" > "$TMP/span.fa.out" 2>"$TMP/span.log"
+check_eq "span check: exit status unchanged (0), only the plausible query gets a record" "$?:$(grep '^>' "$TMP/span.fa.out" | cut -d' ' -f1 | tr '\n' ' ')" "0:>plausible "
+check_eq "span check: failures reported on stderr" "$(grep -c 'projection failed: projected span implausibly long' "$TMP/span.log")" "2"
+"$RB" extract --lift="$TMP/span.lift" --ref-prefix=B73 --max-span-ratio=-1 -f "$TMP/span_q.tsv" "$TMP/span.fmd" > /dev/null 2>&1
+check_eq "span check: a negative value is an error" "$?" "1"
+
+# boundary consistency: [5000,m) and [m,16000) projected into the same founder must meet
+# at m (end of the left piece == start of the right piece), except for founder bases
+# inserted exactly at m, which belong to neither piece (truth convention).
+#   Del = B73 minus [9000,12000); Ins = 500 bp inserted at 10000; Rep = [9000,12000)
+#   replaced by 2 kb of other sequence; Div = every 3rd base of [9930,10000) changed (a
+#   low-identity left flank at m = 10000); Inv = the reverse complement of Del
+awk 'function rnd(n,  s,i){s=""; for(i=0;i<n;i++) s=s substr("ACGT",int(rand()*4)+1,1); return s}
+function rc(s,  t,i,c){t=""; for(i=length(s);i>0;i--){c=substr(s,i,1); t=t (c=="A"?"T":c=="C"?"G":c=="G"?"C":"A")} return t}
+function mut(s,  t,i,c){t=""; for(i=1;i<=length(s);i++){c=substr(s,i,1); if(i%3==0) c=(c=="A"?"C":"A"); t=t c} return t}
+BEGIN{srand(11); r=rnd(20000);
+	print ">B73_chr1"; print r;
+	print ">Del_chr1"; print substr(r,1,9000) substr(r,12001);
+	print ">Ins_chr1"; print substr(r,1,10000) rnd(500) substr(r,10001);
+	print ">Rep_chr1"; print substr(r,1,9000) rnd(2000) substr(r,12001);
+	print ">Div_chr1"; print substr(r,1,9930) mut(substr(r,9931,70)) substr(r,10001);
+	print ">Inv_chr1"; print rc(substr(r,1,9000) substr(r,12001)) }' > "$TMP/junc.fa"
+"$RB" build -d -o "$TMP/junc.fmd" "$TMP/junc.fa" 2>/dev/null && "$RB" ssa -s4 -o "$TMP/junc.fmd.ssa" "$TMP/junc.fmd" 2>/dev/null
+awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$TMP/junc.fa" | gzip > "$TMP/junc.fmd.len.gz"
+"$RB" lift --ref-prefix=B73 -k 31 -s 50 -o "$TMP/junc.lift" "$TMP/junc.fmd" "$TMP/junc.fa" 2>/dev/null
+"$RB" isa -b 6 "$TMP/junc.fmd" 2>/dev/null
+{ printf 'qid\tref_contig\tref_start\tref_end\tassembly\n'
+  for A in Del Ins Rep Div Inv; do for m in 10000 9000 12000 9010 11990 9990; do
+	printf '%s|%s|L\tB73_chr1\t5000\t%s\t%s\n%s|%s|R\tB73_chr1\t%s\t16000\t%s\n' $A $m $m $A $A $m $m $A; done; done; } > "$TMP/junc_q.tsv"
+junc() { # junc <extra options> -> one "founder|m:junction_offset" per split, sorted
+	"$RB" extract --lift="$TMP/junc.lift" --lift-k 31 --ref-prefix=B73 --project-only "$@" -f "$TMP/junc_q.tsv" "$TMP/junc.fmd" 2>/dev/null |
+	awk -F'\t' 'NR>1{split($1,k,"|"); key=k[1]"|"k[2]; ok=($10 ~ /^ok/); if(k[3]=="L"){Ls[key]=$7; Le[key]=$8; lo[key]=ok} else {Rs[key]=$7; Re[key]=$8; sd[key]=$9; ro[key]=ok}}
+		END{for(key in Ls) if(lo[key] && ro[key]) print key":"((sd[key]=="+")? Rs[key]-Le[key] : Ls[key]-Re[key]); else print key":failed"}' | sort | tr '\n' ' '
+}
+J=$(junc)
+check_eq "boundary consistency (snap): every split meets at m; only the 500 bp inserted at m is between the pieces" "$J" \
+	"Del|10000:0 Del|11990:0 Del|12000:0 Del|9000:0 Del|9010:0 Del|9990:0 Div|10000:0 Div|11990:0 Div|12000:0 Div|9000:0 Div|9010:0 Div|9990:0 Ins|10000:500 Ins|11990:0 Ins|12000:0 Ins|9000:0 Ins|9010:0 Ins|9990:0 Inv|10000:0 Inv|11990:failed Inv|12000:failed Inv|9000:0 Inv|9010:0 Inv|9990:0 Rep|10000:0 Rep|11990:0 Rep|12000:0 Rep|9000:0 Rep|9010:0 Rep|9990:0 "
+check_eq "boundary consistency (--no-snap): the lift projection of m is shared too" "$(junc --no-snap | tr ' ' '\n' | grep -v ':0$' | grep . | tr '\n' ' ')" \
+	"Inv|11990:failed Inv|12000:failed "
+"$RB" extract --lift="$TMP/junc.lift" --lift-k 31 --ref-prefix=B73 --project-only -f "$TMP/junc_q.tsv" "$TMP/junc.fmd" 2>/dev/null > "$TMP/junc.tsv"
+check_eq "junction: a deletion containing m -> both pieces at the junction (Del 10000: left end 9000, right start 9000)" \
+	"$(awk -F'\t' '$1=="Del|10000|L"{e=$8} $1=="Del|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "9000 9000"
+check_eq "junction: a replacement containing m -> the replacement goes to the right piece" \
+	"$(awk -F'\t' '$1=="Rep|10000|L"{e=$8} $1=="Rep|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "9000 9000"
+check_eq "junction: an insertion at m belongs to neither piece (truth convention): left end 10000, right start 10500" \
+	"$(awk -F'\t' '$1=="Ins|10000|L"{e=$8} $1=="Ins|10000|R"{s=$7} END{print e" "s}' "$TMP/junc.tsv")" "10000 10500"
+check_eq "junction: low-identity left flank -> both sides placed by the right flank (end labelled snap_x)" \
+	"$(awk -F'\t' '$1=="Div|10000|L"{split($12,a,","); e=$8" "a[2]} $1=="Div|10000|R"{split($12,a,","); s=$7" "a[1]} END{print e" | "s}' "$TMP/junc.tsv")" "10000 snap_x | 10000 snap"
+check_eq "junction: '-' strand, deletion containing m (Inv: reference 9000 = founder 8000)" \
+	"$(awk -F'\t' '$1=="Inv|10000|L"{print $7" "$9} $1=="Inv|10000|R"{print $8" "$9}' "$TMP/junc.tsv" | tr '\n' ' ')" "8000 - 8000 - "
+
+"$RB" extract -I "$TMP/inv.fmd.isa" "$IDX" B73_chr1:0-5 > /dev/null 2>"$TMP/ext_wrongisa.log"
+check_eq "extract: an .isa from another index is rejected" "$(grep -c 'not built from this index' "$TMP/ext_wrongisa.log")" "1"
+
+# the shared simulated fixture (simulate_pangenome.py), scaled down: SNPs, small and
+# large indels, a multi-copy element; needs numpy for the simulator and the checker
+if [ -n "$NPY_PY" ]; then
+	SIM="$TMP/sim"
+	"$NPY_PY" simulate_pangenome.py --out "$SIM" --seed 7 --chrom-lens 40000 25000 --founders Oh43 Mo17 Ki3 \
+		--n-direct 150 --n-ref 150 --window 2000 --te-copies 3 --large-rate 5e-5 > "$TMP/sim.log" 2>&1
+	check_eq "simulated fixture generated" "$?" "0"
+	"$RB" build -d -o "$SIM/p.fmd" "$SIM/pangenome.fa" 2>/dev/null && "$RB" ssa -s4 -o "$SIM/p.fmd.ssa" "$SIM/p.fmd" 2>/dev/null
+	awk '/^>/{if(n)print n"\t"l; n=substr($1,2); l=0; next}{l+=length($0)} END{if(n)print n"\t"l}' "$SIM/pangenome.fa" | gzip > "$SIM/p.fmd.len.gz"
+	"$RB" isa -b 6 "$SIM/p.fmd" 2>/dev/null
+	"$RB" lift --ref-prefix=B73 -s 200 -o "$SIM/p.lift" "$SIM/p.fmd" "$SIM/B73.fa" 2>/dev/null
+	"$RB" extract -f "$SIM/direct_queries.tsv" "$SIM/p.fmd" > "$SIM/direct.fa" 2>/dev/null
+	check_eq "sim: extract exits 0 on the direct queries (incl. edge cases)" "$?" "0"
+	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --project-only -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj.tsv" 2>/dev/null
+	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --no-snap --project-only -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj_nosnap.tsv" 2>/dev/null
+	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 --no-snap -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj_nosnap.fa" 2>/dev/null
+	check_eq "sim: raw_start/raw_end reproduce every successful --no-snap interval" \
+		"$(awk -F'\t' 'NR>1 && $10 ~ /^ok$/{n++; split($14,a,":"); split($15,b,":"); iv=($9=="+")? a[2]"-"b[2] : b[2]"-"a[2]; if(iv != $7"-"$8 || a[1] != $6 || a[3] != $9) bad++} END{print (n>0), bad+0}' "$SIM/proj_nosnap.tsv")" "1 0"
+	"$RB" extract --lift="$SIM/p.lift" --ref-prefix=B73 -f "$SIM/ref_queries.tsv" "$SIM/p.fmd" > "$SIM/proj.fa" 2>/dev/null
+	# hard: every direct query exact; every projected record exact at its projected interval;
+	# without snapping (lift anchor density limits it): >= 85% within 100 bp at both ends;
+	# with snapping (default): >= 90% of intervals base-exact and >= 97% within 5 bp
+	if "$NPY_PY" check_extract_fixture.py "$SIM" "$SIM/direct.fa" "$SIM/proj_nosnap.tsv" "$SIM/proj_nosnap.fa" --min-proj-within 0.85 100 > "$TMP/sim_check_nosnap.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture check (--no-snap) failed; see $TMP/sim_check_nosnap.log"; cat "$TMP/sim_check_nosnap.log" >&2
+	fi
+	if "$NPY_PY" check_extract_fixture.py "$SIM" "$SIM/direct.fa" "$SIM/proj.tsv" "$SIM/proj.fa" --min-proj-exact 0.90 --min-proj-within 0.97 5 > "$TMP/sim_check.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture check (snap) failed; see $TMP/sim_check.log"; cat "$TMP/sim_check.log" >&2
+	fi
+	# X -> X switches: each reference query split at its midpoint, both halves into the same
+	# founder; the junction must equal the truth gap (0 unless bases were inserted at m)
+	if "$NPY_PY" check_extract_junctions.py "$SIM" "$RB" "$SIM/p.fmd" "$SIM/p.lift" --min-consistent 0.99 > "$TMP/sim_junc.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture junction check failed; see $TMP/sim_junc.log"; cat "$TMP/sim_junc.log" >&2
+	fi
+	# boundaries strictly inside >= 2 bp deletions / exactly at insertions: both pieces must land
+	# on the true junction (or an equivalent placement of the same deletion)
+	if "$NPY_PY" check_extract_boundaries.py "$SIM" "$RB" "$SIM/p.fmd" "$SIM/p.lift" --flank 1500 --min-del 0.9 --min-ins 0.95 \
+		> "$TMP/sim_bound.log" 2>&1; then
+		pass
+	else
+		fail "simulated fixture boundary check failed; see $TMP/sim_bound.log"; cat "$TMP/sim_bound.log" >&2
+	fi
+else
+	echo "SKIP: simulated-pangenome extract check needs a python3 with numpy" >&2
+fi
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -782,6 +1065,18 @@ if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
 		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
+	# extract: multi-threaded direct extraction, and --lift projection incl. failures
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" extract -t2 -f "$TMP/rand.tsv" "$IDX" > /dev/null 2>"$TMP/valgrind_extract.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on extract; see $TMP/valgrind_extract.log"; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" extract --lift="$TMP/inv.lift" --lift-k 31 --ref-prefix=B73 -f "$TMP/inv_q.tsv" "$TMP/inv.fmd" > /dev/null 2>"$TMP/valgrind_extract_lift.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on extract --lift; see $TMP/valgrind_extract_lift.log"; fi
+	if [ -s "$TMP/sim/p.lift" ]; then # snapping incl. the wide retry and walk-inward paths
+		valgrind --error-exitcode=99 --leak-check=full -q \
+			"$RB" extract --lift="$TMP/sim/p.lift" --ref-prefix=B73 -t2 -f "$TMP/sim/ref_queries.tsv" "$TMP/sim/p.fmd" > /dev/null 2>"$TMP/valgrind_extract_snap.log"
+		if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on extract snapping; see $TMP/valgrind_extract_snap.log"; fi
+	fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi
