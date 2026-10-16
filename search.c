@@ -1843,6 +1843,19 @@ static int32_t mem_read_hits(const pipeline_t *p, const m_seq_t *s, int full_onl
 	return n;
 }
 
+// 1 if every occurrence of the read's longest SMEM was located (-p did not truncate it). A mate
+// whose hits are only a sample cannot veto its partner's hits: the missing occurrence may be the
+// partner's true locus.
+static int mem_fully_located(const m_seq_t *s)
+{
+	int32_t i, best = -1, bl = -1;
+	for (i = 0; i < s->n_mem; ++i) {
+		int32_t l = (int32_t)s->mem[i].mem.info - (int32_t)(s->mem[i].mem.info>>32);
+		if (l > bl) bl = l, best = i;
+	}
+	return best >= 0 && s->mem[best].n_pos >= s->mem[best].mem.size;
+}
+
 static int32_t mem_n_pos(const m_seq_t *s)
 {
 	int32_t i, n = 0;
@@ -1866,6 +1879,9 @@ static void mem_pair_worker(void *data, long i, int tid)
 		n[c] = mem_read_hits(t->p, s[c], 0, h[c]);
 	}
 	nc = rb3_pe_concordant_hits(h[0], n[0], h[1], n[1], t->pe_max_dist, s[0]->len, s[1]->len, k[0], k[1], 0);
+	for (c = 0; c < 2 && nc > 0; ++c)
+		if (!mem_fully_located(s[c^1])) // the mate's hits are a -p sample: keep all of this read's positions
+			memset(k[c], 1, n[c] > 0? n[c] : 1);
 	e->anchor = e->rescued = -1;
 	e->cls = nc > 0? RB3_PE_CONC : n[0] > 0 && n[1] > 0? RB3_PE_DISC : n[0] > 0 || n[1] > 0? RB3_PE_SOLO : RB3_PE_NONE;
 	e->resc_support = nc; // mem: number of contigs carrying the fragment

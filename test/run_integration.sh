@@ -650,6 +650,10 @@ check_eq "mem without --paired: the same SMEM rows (files read one after another
 check_eq "mem without --paired: P6/1 lists both copies (8 positions)" "$(awk -F'\t' '$1=="P6/1"{print $5}' "$TMP/mem_se.tsv")" "8"
 "$RB" mem --paired --pe-isize=400,10 -p 64 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > /dev/null 2>"$TMP/mem_fix.log"
 if grep -q 'insert size (fixed) mean 400.0 sd 10.0 max 440 (+0 slack)' "$TMP/mem_fix.log"; then pass; else fail "mem --pe-isize: fixed insert, no slack by default"; fi
+# -p 2 locates only 2 of each SMEM's 4-8 occurrences: no mate is fully located, so nothing is filtered
+"$RB" mem --paired -p 2 -t2 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/mem_p2.tsv" 2>/dev/null
+check_eq "mem --paired -p 2: sampled mates cannot veto -- every row keeps all its located positions" \
+	"$(awk -F'\t' 'NF>5 && $5!=NF-6' "$TMP/mem_p2.tsv" | wc -l | tr -d ' ')/$([ "$(grep -c 'CONC$' "$TMP/mem_p2.tsv")" -gt 0 ] && echo conc)" "0/conc"
 pe_err "mem --paired without -p" "needs -p INT" mem --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "mem --paired with --cov" "cannot be combined" mem --paired --cov -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "mem --pe-trust-exact" "refmap only" mem --paired --pe-trust-exact -p 64 "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
