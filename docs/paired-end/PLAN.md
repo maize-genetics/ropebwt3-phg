@@ -162,6 +162,44 @@ minimap2's index build took 9.3 min and 179 GB; the ropebwt3 index already exist
 - `b73_ok`/`b73_none` are not founder-correctness metrics: B73 hits are dropped exactly when B73
   does not carry the whole fragment.
 
+### How much of the read a mem "hit" rests on; -p sampling; dropping discordant pairs (2026-10-16)
+
+**What counts as a hit.** The founder set is the longest SMEM's hits, at least `-l 31` bp. The
+longest SMEM covers the whole 150 bp read for 86.3% of Oh43 reads and 80.7% of Ia453 reads. For
+Oh43 the rest is almost exactly the expected share of reads with a wgsim sequencing error (13.9%).
+
+| Requiring the longest SMEM to cover ≥ (Oh43, mem PE, -p 128) | 31 bp | 75 bp | 120 bp | 150 bp |
+|---|---|---|---|---|
+| true founder at true locus | 91.40 | 91.22 | 84.48 | 79.70 |
+| no hit | 0.63 | 0.83 | 8.4 | 13.7 |
+
+**Where -p 128 misses come from.** 10.2% of reads have a longest SMEM with more than 128
+occurrences, so only a sample is located. 72% of those miss the true locus: 7.3 pp of all reads.
+Fully located reads miss only 1.35% of the time.
+
+**-p 1024 and dropping DISC pairs**, Oh43, % of all reads (`scratch/paired_end/psweep/`,
+`pe_filter_eval.py`):
+
+| | at locus | mean set | wrong B73 | locus precision (kept) | kept | wall |
+|---|---|---|---|---|---|---|
+| mem SE -p 128 | 91.51 | 12.23 | 7.16 | — | 100 | 77 s |
+| mem PE -p 128 | 91.40 | 9.08 | 3.78 | 91.98 | 99.4 | 77 s |
+| mem PE -p 128, drop DISC | 89.22 | 8.20 | 2.00 | 94.90 | 94.0 | |
+| mem SE -p 1024 | 96.26 | 12.25 | 4.49 | — | 100 | 169 s |
+| **mem PE -p 1024** | **96.18** | **8.81** | **1.79** | 96.88 | 99.3 | 171 s |
+| mem PE -p 1024, drop DISC | 95.47 | 8.61 | 1.47 | 97.68 | 97.7 | |
+| minimap2 PE | 90.21 | 9.60 | 1.81 | 95.89 | 94.1 | 122 s + index |
+| minimap2 PE, proper pairs only | 87.45 | 9.20 | 1.38 | 97.86 | 89.4 | |
+
+**Takeaways:**
+- At `-p 1024`, mem PE beats minimap2 PE on recall (+6 pp) with smaller founder sets.
+- Dropping DISC pairs at `-p 1024` matches minimap2's proper-pair precision (97.7 vs 97.9) at
+  +8 pp recall.
+- With a fully located mate there are fewer discordant pairs: DISC falls from 29.5k to 8.9k.
+- Remaining misses at `-p 1024`: 2.5 pp still capped, and 1.2 pp among fully located reads.
+- There is no discard flag yet. DISC rows are printed with their pair class, so they can be
+  filtered downstream.
+
 ## Next phases
 
 - **Phase 2, chain:**
