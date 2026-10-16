@@ -258,6 +258,20 @@ ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=p
   pan.fmd R1.fq R2.fq > pe.tsv
 ```
 
+#### Paired-end `mem` (`--paired`)
+
+`mem --paired -p INT` takes the same inputs as `refmap --paired`. Each SMEM hit implies where the
+whole read starts on that contig. Two mates are concordant on a contig when they hit it on
+opposite strands with implied starts within the insert size. In a pangenome, the concordant
+contigs are the assemblies that carry the whole fragment. A concordant pair (`CONC`) prints only
+its concordant positions; `DISC`, `SOLO` and `NONE` pairs print everything. Every row gets a
+trailing class column.
+
+One exception: if a mate's longest SMEM has more occurrences than `-p` located, that mate's hits
+are only a sample. It cannot rule out its partner's hits, so the partner keeps all of its
+positions. The insert size is estimated from mates with whole-read SMEMs, or set with
+`--pe-isize`. `--pe-slack` defaults to 0 here, because SMEM positions are exact.
+
 ### <a name="chain"></a>RNAseq: chaining and PAV placement
 
 `refmap` places a read as a whole, which suits DNA. An RNAseq read is different:

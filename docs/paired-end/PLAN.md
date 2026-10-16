@@ -114,6 +114,54 @@ Pair classes, Oh43 default: 317k CONC, 17k RESC, 98k SOLO (mostly MULTI + one pl
 - **Not yet measured:** the effect on GRITS model accuracy. The model was trained on
   single-end event statistics (see Next phases).
 
+## mem (2026-10-16): per-assembly concordance, compared with minimap2
+
+**Why mem next:** refmap's pair intersection lost about 1.5 pp of true-founder recall. In
+`mem --paired`, founders are matched by location. A contig counts as carrying the fragment when
+both mates hit it on opposite strands with implied read starts within the insert size
+(`rb3_pe_concordant_hits`). CONC pairs print only those positions.
+
+**The cause of the recall loss:** `-p` locates only a *sample* of a repetitive SMEM's
+occurrences. A mate whose sample missed the true locus vetoed its partner's correct hit. On a
+2k-pair smoke test that dropped at-locus recall from 91.1% to 88.5%. The fix is that a mate whose
+longest SMEM was not fully located cannot filter its partner. Refmap's drop is probably the same
+effect (sampled sets), which is untested.
+
+**Comparison:**
+- Reads: the same 500k wgsim pairs per sample as above.
+- `mem`: `-p 128`, single-end vs `--paired`.
+- minimap2 2.30: `-ax sr --secondary=yes -N 50` against all 25 assemblies (one-part index),
+  single-end (R1 and R2 run separately) vs paired.
+- Per-read founder set: the longest SMEM's printed positions (mem), or the alignments tied for
+  the best `AS` (minimap2).
+- Scorer: `scratch/paired_end/compare_eval.py`. Driver: `compare_mem_mm2.sh`.
+- Percentages are of all reads.
+
+| | mem SE | mem PE | minimap2 SE | minimap2 PE |
+|---|---|---|---|---|
+| Oh43: true founder at true locus (±1 kb) | 91.51 | **91.40** | 79.80 | 90.21 |
+| Oh43: true founder anywhere in set | 99.00 | 96.59 | 84.12 | 91.99 |
+| Oh43: mean founder set (assemblies) | 12.23 | 9.08 | 9.14 | 9.60 |
+| Oh43: wrong B73 placement (collinear) | 7.16 | 3.78 | 3.49 | 1.81 |
+| Oh43: no hit | 0.00 | 0.63 | 7.48 | 5.92 |
+| Ia453: mean founder set | 11.82 | 8.78 | 8.48 | 8.88 |
+| Ia453: wrong B73 placement | 7.37 | 4.01 | 3.47 | 1.96 |
+| Ia453: no hit | 0.01 | 1.39 | 7.98 | 6.39 |
+| Wall time / RAM (Oh43 paired, 16 threads) | 77 s / 9 GB | 77 s / 9 GB | 193 s / 109 GB | 122 s / 109 GB |
+
+minimap2's index build took 9.3 min and 179 GB; the ropebwt3 index already existed.
+
+**Reading the table:**
+- mem pairing keeps locus recall (-0.11 pp) and cuts founder sets by 26%.
+- "Anywhere in set" falls by design: those are Oh43 hits at TE or paralog copies elsewhere.
+- Wrong B73 placements halve.
+- minimap2 gains far more from pairing (+10.4 pp locus recall), because single-end it reports
+  incomplete tie sets in a 25-copy pangenome. Paired, it is close to mem on recall and set size,
+  with fewer wrong B73 placements but 6–8% of reads unmapped (repetitive minimizers are
+  filtered).
+- `b73_ok`/`b73_none` are not founder-correctness metrics: B73 hits are dropped exactly when B73
+  does not carry the whole fragment.
+
 ## Next phases
 
 - **Phase 2, chain:**
