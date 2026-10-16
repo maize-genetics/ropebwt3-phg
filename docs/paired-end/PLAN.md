@@ -295,6 +295,39 @@ Flags: `--lift --lift-local-win=20000 --insertion-rows=ordinary`.
   fragment stays misplaced. Refmap-style rescue is the next lever if that matters.
 - 22% of pairs are NONE: neither mate chains, as in single-end mode.
 
+## sw --paired (2026-10-16, commit 4f7c07a)
+
+**Design.** The same per-assembly concordance as mem (`rb3_pe_concordant_hits`), over every
+located position of every PAF hit:
+- CONC lines keep only concordant positions; a hit with none is dropped.
+- Every line gets a `pe:Z:` tag.
+- A mate whose best hit was only partly located cannot veto.
+- Needs `-p`: `sw`'s `-p` is a per-read budget, and 0 locates one position per hit.
+
+**Checks.** Single-end output is byte-identical on real data (20/20, including a new `sw -p 64`
+arm). The identity script now `cmp`s npy files directly: `grep` treats them as binary and passes
+their content through only partly, so earlier npy checks were re-verified, all 8 runs identical.
+
+**Maize wgsim, 500k pairs, `-p 1024`** (`scratch/paired_end/sw_4f7c07a/`, `sw_pe_eval.sh`),
+% of reads:
+
+| | Oh43 at locus | Oh43 set | Oh43 wrong B73 | Oh43 prec (kept) | Oh43 kept | Ia453 set | Ia453 wrong B73 | Ia453 kept |
+|---|---|---|---|---|---|---|---|---|
+| sw SE | 96.69 | 12.04 | 4.19 | — | 100 | 11.49 | 4.60 | 100 |
+| sw PE | 96.64 | 8.66 | 1.77 | 96.64 | 100 | 8.30 | 2.19 | 100 |
+| sw PE, drop DISC | 95.47 | 8.37 | 1.33 | 97.95 | 97.5 | 7.47 | 1.32 | 91.6 |
+| mem PE -p 1024 | 96.18 | 8.81 | 1.79 | 96.88 | 99.3 | 8.46 | 2.17 | 98.4 |
+| mem PE, drop DISC | 95.47 | 8.61 | 1.47 | 97.68 | 97.7 | 7.87 | 1.53 | 93.1 |
+| mm2 tuned PE proper, pair-filtered | 96.23 | 8.37 | 1.63 | 97.28 | 98.9 | 7.81 | 1.75 | 97.9 |
+
+**Reading the table:**
+- sw PE keeps recall (−0.05 pp).
+- On in-panel reads sw PE has the best recall of the three tools, and with DISC dropped the
+  lowest wrong-B73 rate and the highest precision.
+- sw has the most DISC pairs on the held-out line (42k vs mem 26k), so dropping them costs the
+  most reads there (91.6% kept).
+- Cost: sw ~240 s, 17–20 GB; mem 171–210 s, 9 GB; minimap2 366–388 s, 113 GB plus index.
+
 ## Next phases
 
 - **Phase 2, chain:** done (see above). Originally planned:

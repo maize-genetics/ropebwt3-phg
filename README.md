@@ -449,6 +449,32 @@ Options:
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
 
+#### Paired-end `sw` (`--paired`)
+
+`sw --paired -p INT` uses the same inputs and the same per-assembly concordance as
+`mem --paired`. Each PAF hit's located positions imply where the whole read starts on each
+contig. Two mates are concordant on a contig when they hit it on opposite strands with implied
+starts within the insert. A `CONC` pair's lines keep only concordant positions: a concordant
+one becomes the primary (columns 6–9) and the rest go in `ap:Z`. A hit left with none is
+dropped. `rh:i` still reports the hit's full occurrence count. Every line gets a `pe:Z:` tag
+(`CONC`/`DISC`/`SOLO`/`NONE`); `DISC` pairs keep all their positions.
+
+**Use a large `-p`; start with `-p 1024`.** In `sw`, `-p` is a per-read *budget* of positions,
+and `-p 0` (the default) locates just one occurrence per hit. A mate whose best hit was only
+partly located cannot veto its partner's positions. `--paired` without `-p` is an error, and so
+is `--paired` with `--all-e2e`. `--pe-slack` defaults to 0.
+
+Measured on 500k simulated 150 bp pairs, `-p 1024`, 16 threads. For an in-panel line, the true
+founder was at the true locus for 96.69% of reads single-end and 96.64% paired. Mean founder set
+fell from 12.0 to 8.7 assemblies, and wrong B73 placements from 4.2% to 1.8% of reads. Dropping
+`DISC` pairs gives 97.95% locus precision and 1.33% wrong B73, at the cost of 2.5% of reads
+(8.4% for a held-out line). Runtime is about 240 s per 500k pairs and 17–20 GB RAM, about 1.4×
+slower than `mem --paired`.
+
+```sh
+ropebwt3 sw --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.paf
+```
+
 #### Paired-end `chain` (`--paired`)
 
 `chain --paired` takes the same inputs as `refmap --paired` (R1 R2, or one interleaved file).

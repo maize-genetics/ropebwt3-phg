@@ -22,7 +22,8 @@ STAGES = [  # (title, detail, kind)
 ]
 LATER = [("mem --paired: done", "per-assembly concordance", "new", False),
          ("chain --paired: done", "one event per concordant pair", "new", False),
-         ("sw / simulator: not started", "pairing + paired training reads", "later", True)]
+         ("sw --paired: done", "concordance, as mem", "new", False),
+         ("simulator: not started", "paired training reads", "later", True)]
 
 W, BX, BW, BH, GAP, TOP = 980, 40, 560, 54, 18, 90
 H = TOP + len(STAGES) * (BH + GAP) + 150
