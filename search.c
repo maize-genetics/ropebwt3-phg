@@ -2604,6 +2604,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
 		puts("CC");
 	}
+	if (opt.algo == RB3_SA_REFMAP && opt.max_locate != RB3_RM_MAX_ASSEMBLY && opt.max_occ > 0
+		&& opt.max_occ <= opt.max_locate && opt.kmer_len <= 0 && rb3_verbose >= 2)
+		fprintf(stderr, "WARNING: --max-locate=%d has no effect: --max-occ=%ld already drops (MULTI) every read with more "
+						"occurrences, so all occurrences of the reads kept are located\n", opt.max_locate, (long)opt.max_occ);
 	if (opt.paired) { // one pass over R1 (+ R2, or interleaved)
 		p.fp = rb3_seq_open(argv[o.ind + 1], is_line);
 		if (p.fp && argc - o.ind - 1 == 2) p.fp2 = rb3_seq_open(argv[o.ind + 2], is_line);

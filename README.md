@@ -253,11 +253,19 @@ alternative positions too, so pairing also picks the right copy of a duplicated 
 EXACT mate. The PS4G/npy layout is unchanged. `--paired` works with `refmap` and `mem`; `chain`
 and `sw` reject it.
 
-**`-p` has no effect on `refmap`.** refmap locates up to 256 occurrences per read, a
-compile-time limit (`RB3_RM_MAX_ASSEMBLY`). A read whose sample was capped can't veto its mate's
-founders. On simulated maize pairs, pairing cost refmap about 1.5 pp of true-founder recall. If
-recall on repetitive reads matters, use `mem --paired` with a large `-p` (below), which was
-measured not to lose recall.
+**`-p` has no effect on `refmap`; use `--max-locate=INT` [256].** It sets how many occurrences of
+each read refmap locates; the rest are not sampled. Too small a value truncates a read's
+gameteSet, and if the read's reference copy isn't sampled, the read is called PLACED instead of
+EXACT. A read whose sample was capped can't veto its mate's founders under `--paired`.
+
+`--max-locate` only matters when `--max-occ` lets reads through with more occurrences than the
+sample holds: `--max-occ=0` (off, the default) or `--max-occ` > `--max-locate`. With the usual
+`--max-occ=-1` (auto = one per genome, 25 for the maize index), every read with more
+occurrences is dropped as MULTI first. Every kept read is then located in full and
+`--max-locate` changes nothing; refmap warns about this. On the simulated maize pairs, output at
+`--max-locate=1024` was byte-identical to 256 under `--max-occ=-1`. So refmap's ~1.5 pp
+paired-mode loss of true-founder recall does not come from sampling. Raise `--max-locate` with
+`--paired` only if you run with `--max-occ=0` or a large `--max-occ`.
 
 ```sh
 ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=pe.npy \

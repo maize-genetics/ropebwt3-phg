@@ -230,6 +230,16 @@ sides: minimap2's tied-best hits are kept on a contig only if the mate has a tie
   index, against 366–388 s and 113 GB plus a 9-minute index build (179 GB peak) for minimap2.
   Pair-aware founder sets are also built in.
 
+### refmap `--max-locate` (2026-10-16)
+
+refmap's fixed 256-occurrence sample is now `--max-locate=INT` (default 256, so default output
+is byte-identical). Rerunning the maize sims at `--max-locate=1024` with the production flags
+(`--max-occ=-1`) gave **byte-identical output**. `--max-occ=-1` resolves to 25 (one per genome),
+and every read with more occurrences is MULTI before anything is located, so the sample never
+binds. The option matters only with `--max-occ=0` or a large `--max-occ`; refmap warns
+otherwise. This rules out sampling as the cause of refmap's ~1.5 pp paired recall loss; the
+cause is still open.
+
 ## Next phases
 
 - **Phase 2, chain:**

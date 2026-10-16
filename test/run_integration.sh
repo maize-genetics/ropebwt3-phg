@@ -631,6 +631,10 @@ check_eq "--max-locate=1: iso00/1's only sampled occurrence is an assembly copy 
 "$RB" $PRM --max-locate=4 --ps4g-per-read="$TMP/ml4.pr" "$PIDX" "$PE/r1.fa" > "$TMP/ml4.tsv" 2>/dev/null
 check_eq "--max-locate=4 (all 4 occurrences): iso00/1 is EXACT with all four gametes" \
 	"$(awk -F'\t' '$1=="iso00/1"{print $3}' "$TMP/ml4.tsv")/$(awk -F'\t' '$1=="iso00/1"{n=split($4,a,","); print n}' "$TMP/ml4.pr")" "EXACT/4"
+"$RB" $PRM --max-occ=-1 --max-locate=512 "$PIDX" "$PE/r1.fa" > /dev/null 2>"$TMP/ml_warn.log"
+if grep -q 'max-locate=512 has no effect: --max-occ=4' "$TMP/ml_warn.log"; then pass; else fail "--max-locate under an auto --max-occ (4 taxa) warns that it cannot act"; fi
+"$RB" $PRM --max-locate=512 "$PIDX" "$PE/r1.fa" > /dev/null 2>"$TMP/ml_nowarn.log"
+check_eq "--max-locate with --max-occ off: no warning" "$(grep -c 'has no effect' "$TMP/ml_nowarn.log")" "0"
 pe_err "--max-locate=0 rejected" "max-locate must be >= 1" $PRM --max-locate=0 "$PIDX" "$PE/r1.fa"
 pe_err "--max-locate is refmap-only" "refmap only (mem/chain: use -p)" mem --max-locate=512 -p 64 "$PIDX" "$PE/r1.fa"
 
