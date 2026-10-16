@@ -2259,6 +2259,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "              with hits on the same contig, opposite strands, implied starts within the\n");
 			fprintf(stderr, "              insert is CONC and prints only those positions; a trailing column gives\n");
 			fprintf(stderr, "              the pair class (CONC/DISC/SOLO/NONE). --pe-isize=MEAN,SD, --pe-slack=NUM [0]\n");
+			fprintf(stderr, "              With --paired use a LARGE -p (start at -p 1024): a small cap locates only a\n");
+			fprintf(stderr, "              sample of a repetitive SMEM's hits and misses the true locus (maize: -p 128\n");
+			fprintf(stderr, "              91.4%% vs -p 1024 96.2%% true-founder recall; pairing keeps the sets small)\n");
 		}
 		if (strcmp(argv[0], "refmap") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -2298,7 +2301,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    pair adds ONE PS4G/npy event (the founders both mates share) at the\n");
 			fprintf(stderr, "                    better-placed mate; a projected mate far from its mate is moved next\n");
 			fprintf(stderr, "                    to it when one of its assembly projections lands there; stdout gains\n");
-			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC)\n");
+			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC).\n");
+			fprintf(stderr, "                    -p does not apply to refmap (fixed 256-occurrence sample); for\n");
+			fprintf(stderr, "                    repeat-heavy recall use mem --paired -p 1024\n");
 			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
 			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
 			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
@@ -2401,7 +2406,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		const char *err = 0;
 		int is_mem = (opt.algo == RB3_SA_MEM_TG || opt.algo == RB3_SA_MEM_ORI);
 		if (opt.algo != RB3_SA_REFMAP && !is_mem) err = "--paired is implemented for refmap and mem only so far";
-		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM)";
+		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM); use a large value, e.g. -p 1024";
 		else if (is_mem && (opt.min_gap_len > 0 || (opt.flag & RB3_MF_WRITE_COV))) err = "mem --paired cannot be combined with --gap/--cov";
 		else if (is_mem && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";

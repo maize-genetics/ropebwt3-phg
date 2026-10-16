@@ -250,8 +250,14 @@ pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defa
 the lift-projection error scale. An EXACT mate's other reference copies count as
 alternative positions too, so pairing also picks the right copy of a duplicated sequence.
 `--pe-trust-exact` (opt-in) moves the PLACED mate of an unrescuable EXACT + PLACED pair onto the
-EXACT mate. The PS4G/npy layout is unchanged. `--paired` is refmap-only for
-now; chain and mem/sw reject it.
+EXACT mate. The PS4G/npy layout is unchanged. `--paired` works with `refmap` and `mem`; `chain`
+and `sw` reject it.
+
+**`-p` has no effect on `refmap`.** refmap locates up to 256 occurrences per read, a
+compile-time limit (`RB3_RM_MAX_ASSEMBLY`). A read whose sample was capped can't veto its mate's
+founders. On simulated maize pairs, pairing cost refmap about 1.5 pp of true-founder recall. If
+recall on repetitive reads matters, use `mem --paired` with a large `-p` (below), which was
+measured not to lose recall.
 
 ```sh
 ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=pe.npy \
@@ -271,6 +277,33 @@ One exception: if a mate's longest SMEM has more occurrences than `-p` located, 
 are only a sample. It cannot rule out its partner's hits, so the partner keeps all of its
 positions. The insert size is estimated from mates with whole-read SMEMs, or set with
 `--pe-isize`. `--pe-slack` defaults to 0 here, because SMEM positions are exact.
+
+**With `--paired`, raise `-p` well above what you would use single-end.** `-p` caps how many
+occurrences of each SMEM are located. In a pangenome, even a low-copy repeat exceeds a small cap.
+The located positions are then only a sample, which often misses the read's true locus, and the
+mate can't confirm the locus. Pairing is what makes a large `-p` affordable: the concordance
+filter prunes a repetitive read's extra copies down to the one next to its mate, so founder sets
+don't grow. `-p` keeps its usual default (`--paired` without `-p` is an error). Measured on 500k
+simulated 150 bp pairs from an in-panel maize line, 25-genome index, 16 threads:
+
+| `-p` | true founder at true locus | mean founder set | wrong B73 placement | discordant pairs | wall time |
+|---|---|---|---|---|---|
+| 128 | 91.4% | 9.1 | 3.8% | 29.5k | 77 s |
+| 1024 | **96.2%** | **8.8** | **1.8%** | 8.9k | 171 s |
+
+At `-p 128`, reads whose longest SMEM was only partly located caused 7.3 of the 8.5 pp of misses;
+fully located reads miss 1.3% of the time. **Start with `-p 1024`.** Go higher only if many reads
+are still capped: in a single-end run, compare column 4 (the SMEM's occurrence count) with column 5
+(positions located). In paired `CONC` rows, column 5 counts only the concordant positions. The cost is time and output size; memory barely changes (about 9 GB).
+
+`DISC` pairs, whose mates have no concordant contig, are printed and labelled rather than
+dropped. Filtering them downstream works like minimap2's proper-pair filter: wrong B73
+placements fall from 1.8% to 1.5% of reads, at the cost of 1.5% of reads in-panel and 5% for a
+held-out line (whose divergence from every founder yields more discordant pairs).
+
+```sh
+ropebwt3 mem --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.mem.tsv
+```
 
 ### <a name="chain"></a>RNAseq: chaining and PAV placement
 
