@@ -267,9 +267,37 @@ Oh43 results; positions and wrong events are unchanged in every row:
   same contig, which is what excludes TE copies elsewhere.
 - 17%: the intersection legitimately lacks the founder because one mate's set did.
 
+## chain --paired (2026-10-16, commit fb311bf)
+
+**Decisions:**
+- Mate gap ≤ max insert + `--max-intron` (+ `--pe-slack`, 0 for chain; +2 kb per lift-placed mate).
+- One row and one event per CONC/SOLO pair, at the anchor's first segment.
+- Founder set = intersection of the mates' sets; under `--support=best`, of their best sets.
+- DISC mates are emitted single-end.
+- Chain's three row paths go through `chain_put_row`; single-end output is byte-identical on
+  real data (19/19).
+
+**Maize wgsim, 500k pairs** (`scratch/paired_end/chain_fb311bf/`, `chain_pe_eval.sh`).
+Flags: `--lift --lift-local-win=20000 --insertion-rows=ordinary`.
+
+| | Oh43 def SE | Oh43 def PE | Oh43 best SE | Oh43 best PE | Ia453 def SE | Ia453 def PE | Ia453 best SE | Ia453 best PE |
+|---|---|---|---|---|---|---|---|---|
+| fragments with true founder in an event | 98.58 | 98.57 | 98.57 | 98.53 | — | — | — | — |
+| mean founder set | 10.48 | 8.91 | 10.39 | 8.84 | 10.01 | 8.66 | 9.89 | 8.57 |
+| wrong events (≥20 kb / chr) | 21,301 | 18,163 | 21,301 | 18,163 | 25,377 | 21,902 | 25,377 | 21,902 |
+| fragments with any wrong event | 6.39 | 6.39 | 6.39 | 6.39 | 8.45 | 8.44 | 8.45 | 8.44 |
+| wall time (16 threads) | 66 s | 63 s | 96 s | 79 s | 73 s | 71 s | 132 s | 104 s |
+
+**Reading the table:**
+- Recall is kept (≤0.04 pp).
+- Founder sets are 14–15% smaller, and there are about 14% fewer wrong events.
+- The fragment-level wrong rate is unchanged: chain has no rescue step, so a misplaced
+  fragment stays misplaced. Refmap-style rescue is the next lever if that matters.
+- 22% of pairs are NONE: neither mate chains, as in single-end mode.
+
 ## Next phases
 
-- **Phase 2, chain:**
+- **Phase 2, chain:** done (see above). Originally planned:
   - Link SMEM chains across mates: a mate's chain that is colinear with the other's within the
     insert counts as one fragment.
   - One event per pair, with the founder set = intersection.

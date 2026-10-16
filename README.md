@@ -449,6 +449,35 @@ Options:
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
 
+#### Paired-end `chain` (`--paired`)
+
+`chain --paired` takes the same inputs as `refmap --paired` (R1 R2, or one interleaved file).
+Each mate is chained as in single-end mode, then the pair is classified:
+
+* **`CONC`.** Both mates have rows on the same contig, on opposite strands (when both are
+  reference chains), and the gap between their spans is at most max insert + `--max-intron` +
+  `--pe-slack`. `--pe-slack` defaults to 0 here, because chain positions are exact. A
+  lift-placed (PAV-path) mate gets 2 kb extra, since its position is a projection. The gap is
+  measured between the mates' spans, so a spliced mate's own intron doesn't count. The
+  `--max-intron` allowance lets RNAseq mates that straddle an intron still pair.
+* **`SOLO`.** Only one mate has rows.
+* **`DISC`.** Both mates have rows but no concordant placement. Each mate is emitted as in
+  single-end mode.
+
+`CONC` and `SOLO` pairs give **one row and one PS4G/npy event**, named after the fragment
+(`/1` and `/2` dropped), at the anchor mate's first segment. The anchor is a reference chain over
+a lift row, then the mate with more chained bases. The founder set is the intersection of the
+mates' sets, falling back to the anchor's set if they share none. With `--support=best` it is the
+intersection of the two mates' best sets. `--dup-count` takes `;x=N` from mate 1's name, so name a
+collapsed pair `<frag>;x=N/1` and `<frag>;x=N/2`. Every row gets a trailing pair-class column,
+after the `pav:` rows' 5th column. The insert size is estimated from pairs whose mates are both
+single-segment reference chains, or set with `--pe-isize`.
+
+```sh
+ropebwt3 chain --ref-prefix=B73 --lift=pan.lift --paired --support=best --ps4g=pe.ps4g \
+  pan.fmd R1.fq R2.fq > pe.chain.tsv
+```
+
 ### <a name="deprecated"></a>Deprecated
 
 These paths are superseded and will be removed. They are documented here only so

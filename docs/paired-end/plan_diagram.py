@@ -20,9 +20,9 @@ STAGES = [  # (title, detail, kind)
     ("1 event per pair, founders = intersection", "refmap_pair_event", "mod"),
     ("PS4G / npy finalize (layout unchanged)", "rb3_ps4g_npy_finalize", "reused"),
 ]
-LATER = [("Phase 2: chain", "link SMEM chains across mates"),
-         ("Phase 3: mem / sw", "bwa-style mate rescue + pair score"),
-         ("Simulator", "paired training reads (separate)")]
+LATER = [("mem --paired: done", "per-assembly concordance", "new", False),
+         ("chain --paired: done", "one event per concordant pair", "new", False),
+         ("sw / simulator: not started", "pairing + paired training reads", "later", True)]
 
 W, BX, BW, BH, GAP, TOP = 980, 40, 560, 54, 18, 90
 H = TOP + len(STAGES) * (BH + GAP) + 150
@@ -55,10 +55,10 @@ for i, (t, d, k) in enumerate(STAGES):
 
 # later phases
 LX, LW = 640, 300
-svg.append(f'<text x="{LX}" y="{TOP-10}" font-family="Liberation Sans" font-size="14" font-weight="bold" fill="#78909c">Not in phase 1</text>')
-for i, (t, d) in enumerate(LATER):
+svg.append(f'<text x="{LX}" y="{TOP-10}" font-family="Liberation Sans" font-size="14" font-weight="bold" fill="#78909c">Other modes</text>')
+for i, (t, d, k, dash) in enumerate(LATER):
     y = TOP + i * (BH + GAP)
-    svg.append(box(LX, y, LW, BH, "later", t, d, dashed=True))
+    svg.append(box(LX, y, LW, BH, k, t, d, dashed=dash))
 
 # legend
 ly = TOP + 4 * (BH + GAP) + 10
@@ -72,8 +72,8 @@ for i, k in enumerate(["reused", "new", "mod"]):
 gy = TOP + len(STAGES) * (BH + GAP) + 6
 svg.append(f'<rect x="{BX}" y="{gy}" width="{W-2*BX}" height="96" rx="9" fill="#fff8e1" stroke="#f9a825" stroke-width="2"/>')
 for i, line in enumerate(["Acceptance",
-                          "Single-end output byte-identical to the parent binaries (refmap + chain, real reads)",
-                          "Unit tests (test_pairing) + fixture integration (run_integration section 11, valgrind)",
+                          "Single-end output byte-identical to the parent binaries (refmap, mem, chain; real reads)",
+                          "Unit tests (test_pairing) + fixture integration (run_integration sections 11-13, valgrind)",
                           "Maize wgsim pairs (Oh43 in-panel, Ia453 held-out): placement + event scoring, SE vs PE"]):
     bold = 'font-weight="bold" ' if i == 0 else ""
     svg.append(f'<text x="{BX+16}" y="{gy+24+i*21}" font-family="Liberation Sans" font-size="{15 if i == 0 else 13}" '
