@@ -60,16 +60,23 @@ test/test_pairing.o:test/test_pairing.c pairing.h
 test/test_pairing:test/test_pairing.o pairing.o
 		$(CC) $(CFLAGS) $^ -o $@ -lm
 
-test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing
+test/test_errprof.o:test/test_errprof.c errprof.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+test/test_errprof:test/test_errprof.o errprof.o
+		$(CC) $(CFLAGS) $^ -o $@ -lm
+
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_errprof
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
 		./test/test_lift
 		./test/test_pairing
+		./test/test_errprof
 		cd test && ./run_integration.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_errprof test/output test/tmp
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)

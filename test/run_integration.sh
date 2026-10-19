@@ -741,6 +741,54 @@ check_eq "sw --paired: DISC lines identical to single-end apart from the tag" \
 pe_err "sw --paired without -p" "sw --paired needs -p INT" sw --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 pe_err "sw --paired with --all-e2e" "cannot be combined with --all-e2e" sw --paired -p 64 --all-e2e "$PIDX" "$PE/r1.fa" "$PE/r2.fa"
 
+# --- 12. refmap error-profile / span filters (--err-*, --max-ref-span, --pe-drop-disc) ---
+# docs/examples/err/ (make_err_fixture.py): 150 bp B73 reads hand-edited to a known number of
+# events, on the --paired fixture index. Every region used is identical in all four genomes.
+ERR="$DIR/err"; ERM="refmap --ref-prefix=B73 --lift=$PLIFT -t2"
+"$RB" $ERM --err-stats --ps4g="$TMP/err_off.ps4g" "$PIDX" "$ERR/se.fa" > "$TMP/err_se.tsv" 2>"$TMP/err_se.log"
+check_eq "--err-stats exits 0" "$?" "0"
+check_eq "--err-stats: three extra columns (14)" "$(awk -F'\t' '{print NF}' "$TMP/err_se.tsv" | sort -u | tr '\n' ' ')" "14 "
+check_eq "events: exact 0, subs 1/2/3, 1-bp insertion 1, 1-bp deletion 1, end substitutions 1/1" \
+	"$(awk -F'\t' '{printf "%s=%s ", $1, $12}' "$TMP/err_se.tsv")" "E0=0 E1=1 E2=2 E3=3 I1=1 D1=1 L1=1 R1=1 "
+"$RB" $ERM --err-stats --err-max-events=1 --ps4g="$TMP/err_k1.ps4g" --ps4g-per-read="$TMP/err_k1.pr" "$PIDX" "$ERR/se.fa" > "$TMP/err_k1.tsv" 2>"$TMP/err_k1.log"
+check_eq "--err-max-events=1: E2 and E3 FILTERED (reason e), the rest kept" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/err_k1.tsv")" "E2/e E3/e "
+check_eq "--err-max-events=1: PS4G total 8 -> 6, per-read file 6 events" \
+	"$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/err_off.ps4g") $(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/err_k1.ps4g") $(($(wc -l < "$TMP/err_k1.pr") - 1))" "8 6 6"
+if grep -q 'FILTERED reads: 2 by events (> 1)' "$TMP/err_k1.log"; then pass; else fail "--err-max-events: FILTERED summary not logged"; fi
+"$RB" $ERM --err-stats --err-max-events=2 --paired --ps4g="$TMP/err_pe.ps4g" "$PIDX" "$ERR/r1.fa" "$ERR/r2.fa" > "$TMP/err_pe.tsv" 2>/dev/null
+check_eq "--paired --err-max-events=2 is per pair (sum): only Q3 (2+1) FILTERED, both mates" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s ", $1}' "$TMP/err_pe.tsv")" "Q3/1 Q3/2 "
+check_eq "--paired --err-max-events=2: 3 pair events left" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/err_pe.ps4g")" "3"
+"$RB" $ERM --paired --err-max-events=auto --err-hist="$TMP/err.hist" "$PIDX" "$ERR/r1.fa" "$ERR/r2.fa" > "$TMP/err_auto.tsv" 2>"$TMP/err_auto.log"
+check_eq "--err-max-events=auto exits 0" "$?" "0"
+check_eq "--err-hist: read and pair histograms (4 pairs: one each of 0..3 events per pair)" \
+	"$(grep -c '^#unit=' "$TMP/err.hist") $(awk -F'\t' '$1=="pair" && $2 ~ /^[0-3]$/{printf "%s ", $3}' "$TMP/err.hist")" "2 1 1 1 1 "
+check_eq "--err-hist: read histogram = 8 mates, 3 with 0 events, 4 with 1, 1 with 2" \
+	"$(awk -F'\t' '$1=="read"{n+=$3; if($2 ~ /^[0-2]$/) printf "%s ", $3} END{print n}' "$TMP/err.hist")" "3 4 1 8"
+"$RB" $ERM --err-stats --paired --err-max-events=5 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/err_junk.tsv" 2>/dev/null
+check_eq "--paired: a mate with no exact core at all (P3's junk) counts as the cap: P3 FILTERED" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/err_junk.tsv")" "P3/1/e "
+# span: P4 (exact mates 17 kb apart) and P7 (Ki3-only mate projecting 10 kb from its mate) are DISC
+"$RB" $ERM --err-stats --paired --max-ref-span=5000 --ps4g="$TMP/span_pe.ps4g" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/span_pe.tsv" 2>/dev/null
+check_eq "--paired --max-ref-span=5000: the two DISC pairs FILTERED (reason S); CONC/RESC/SOLO kept" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/span_pe.tsv")" "P4/1/S P4/2/S P7/1/S P7/2/S "
+check_eq "--paired --max-ref-span=5000: PS4G 49 -> 45 (two events per DISC pair gone)" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/span_pe.ps4g")" "45"
+"$RB" $ERM --err-stats --paired --pe-drop-disc "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/disc_pe.tsv" 2>/dev/null
+check_eq "--pe-drop-disc: both DISC pairs FILTERED (reason D)" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/disc_pe.tsv")" "P4/1/D P4/2/D P7/1/D P7/2/D "
+"$RB" $ERM --err-stats --max-ref-span=5000 "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/span_se.tsv" 2>/dev/null
+check_eq "single-end --max-ref-span=5000: P5/1 (projections 6.9 kb apart) and P6/1 (B73 copies 8.1 kb apart)" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s/%s ", $1, $13, $14}' "$TMP/span_se.tsv")" "P5/1/6900/S P6/1/8100/S "
+"$RB" $ERM --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/err_none.tsv" 2>/dev/null
+check_eq "filters off: stdout identical to the plain --paired run" "$(cmp -s "$TMP/err_none.tsv" "$TMP/pe.tsv" && echo same)" "same"
+"$RB" chain --ref-prefix=B73 --err-max-events=2 "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/err_e1.log"
+check_eq "--err-max-events on chain is an error" "$?$(grep -c 'apply to refmap only' "$TMP/err_e1.log")" "11"
+"$RB" $ERM --err-max-events=auto "$PIDX" - < "$ERR/se.fa" > /dev/null 2>"$TMP/err_e2.log"
+check_eq "--err-max-events=auto on stdin is an error" "$?$(grep -c 'not stdin' "$TMP/err_e2.log")" "11"
+"$RB" $ERM --pe-drop-disc "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/err_e3.log"
+check_eq "--pe-drop-disc without --paired is an error" "$?" "1"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -779,6 +827,10 @@ if command -v valgrind >/dev/null 2>&1; then
 			"$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ml$ml.log"
 		if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --max-locate=$ml"; cat "$TMP/valgrind_ml$ml.log" >&2; fi
 	done
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --err-max-events=auto --err-hist="$TMP/vg_err.hist" --err-stats \
+		--max-ref-span=5000 --pe-drop-disc --ps4g "$TMP/vg_err.ps4g" -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_err.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --err-*"; cat "$TMP/valgrind_err.log" >&2; fi
 	valgrind --error-exitcode=99 --leak-check=full -q \
 		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
