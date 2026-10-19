@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="760" viewBox="0 0 980 760" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="980" height="760" fill="#ffffff"/>
+  <defs>
+    <marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#546e7a"/></marker>
+  </defs>
+  <text x="40" y="40" font-size="22" font-weight="bold" fill="#263238">refmap error-profile + span filter</text>
+  <text x="40" y="64" font-size="13" fill="#546e7a">all flags off by default; off = byte-identical to ropebwt3_pe_4f7c07a</text>
+
+  <!-- calibration pre-pass (new) -->
+  <rect x="40" y="90" width="560" height="96" rx="8" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/>
+  <text x="56" y="114" font-size="15" font-weight="bold" fill="#1b5e20">Calibration pre-pass: first --err-calib reads / pairs</text>
+  <text x="56" y="136" font-size="13" fill="#263238">core -> events -> histogram (read, pair)</text>
+  <text x="56" y="156" font-size="13" fill="#263238">2-Poisson EM: error mu0 + divergence tail mu1</text>
+  <text x="56" y="176" font-size="13" fill="#263238">K = min k with P(Pois(mu0) &gt; k) &lt;= alpha</text>
+  <text x="612" y="130" font-size="12" fill="#546e7a">refmap_err_calibrate, errprof.c</text>
+  <text x="612" y="148" font-size="12" fill="#546e7a">--err-max-events=auto, --err-hist</text>
+
+  <!-- main pass -->
+  <rect x="40" y="214" width="560" height="54" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="246" font-size="15" fill="#263238">Read batch (single-end, or whole pairs)</text>
+  <text x="612" y="246" font-size="12" fill="#546e7a">worker_pipeline step 0</text>
+
+  <rect x="40" y="286" width="560" height="74" rx="8" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/>
+  <text x="56" y="310" font-size="15" fill="#263238">Per-read placement, exact core shared</text>
+  <text x="56" y="332" font-size="13" fill="#263238">+ events: edits vs ONE carrier of the core</text>
+  <text x="56" y="350" font-size="13" fill="#263238">+ span: EXACT copies / PLACED projections</text>
+  <text x="612" y="316" font-size="12" fill="#546e7a">refmap_query, refmap_core,</text>
+  <text x="612" y="334" font-size="12" fill="#546e7a">refmap_err_events, refmap_place_lift</text>
+
+  <rect x="40" y="378" width="560" height="54" rx="8" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/>
+  <text x="56" y="404" font-size="15" fill="#263238">Event filter: read &gt; K, or pair sum &gt; K</text>
+  <text x="56" y="422" font-size="12" fill="#546e7a">single-end: also span cap here</text>
+  <text x="612" y="410" font-size="12" fill="#546e7a">refmap_filter_pre</text>
+
+  <rect x="40" y="450" width="560" height="54" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="482" font-size="15" fill="#263238">--paired: classify + rescue (filtered mate = unplaced)</text>
+  <text x="612" y="482" font-size="12" fill="#546e7a">refmap_pair_batch</text>
+
+  <rect x="40" y="522" width="560" height="54" rx="8" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/>
+  <text x="56" y="548" font-size="15" fill="#263238">Pair span cap / --pe-drop-disc</text>
+  <text x="56" y="566" font-size="12" fill="#546e7a">first-to-last coordinate of both mates</text>
+  <text x="612" y="554" font-size="12" fill="#546e7a">refmap_filter_pairs</text>
+
+  <rect x="40" y="594" width="560" height="54" rx="8" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/>
+  <text x="56" y="626" font-size="15" fill="#263238">stdout: status FILTERED; --err-stats columns</text>
+  <text x="612" y="626" font-size="12" fill="#546e7a">write_refmap1, refmap_pair_event</text>
+
+  <rect x="40" y="666" width="560" height="54" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="698" font-size="15" fill="#263238">PS4G / npy: FILTERED reads add nothing</text>
+  <text x="612" y="698" font-size="12" fill="#546e7a">rb3_ps4g_acc_add (unchanged)</text>
+
+  <g stroke="#546e7a" stroke-width="2" marker-end="url(#ar)">
+    <line x1="320" y1="186" x2="320" y2="212"/>
+    <line x1="320" y1="268" x2="320" y2="284"/>
+    <line x1="320" y1="360" x2="320" y2="376"/>
+    <line x1="320" y1="432" x2="320" y2="448"/>
+    <line x1="320" y1="504" x2="320" y2="520"/>
+    <line x1="320" y1="576" x2="320" y2="592"/>
+    <line x1="320" y1="648" x2="320" y2="664"/>
+  </g>
+
+  <!-- legend -->
+  <rect x="780" y="18" width="22" height="16" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/><text x="810" y="31" font-size="13" fill="#263238">reused</text>
+  <rect x="780" y="40" width="22" height="16" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/><text x="810" y="53" font-size="13" fill="#263238">new</text>
+  <rect x="780" y="62" width="22" height="16" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/><text x="810" y="75" font-size="13" fill="#263238">modified</text>
+</svg>
