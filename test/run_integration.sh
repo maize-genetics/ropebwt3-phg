@@ -789,6 +789,55 @@ check_eq "--err-max-events=auto on stdin is an error" "$?$(grep -c 'not stdin' "
 "$RB" $ERM --pe-drop-disc "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/err_e3.log"
 check_eq "--pe-drop-disc without --paired is an error" "$?" "1"
 
+# --- 15. refmap --ed-stats / --ed-hist: best edit distance to each assembly ---
+# Same fixtures: the err reads come from a region every genome carries unchanged, so each
+# assembly's value is the read's known edit count; P1/1 is Mo17+Ki3-only sequence, P1/2 sits on
+# three Ki3 SNPs, P3/2 is junk.
+EDM="refmap --ref-prefix=B73 --lift=$PLIFT -t2"
+"$RB" $EDM --ed-stats="$TMP/ed_se.tsv" --ed-hist="$TMP/ed_se.hist" "$PIDX" "$ERR/se.fa" > "$TMP/ed_se.out" 2>"$TMP/ed_se.log"
+check_eq "--ed-stats exits 0" "$?" "0"
+"$RB" $EDM "$PIDX" "$ERR/se.fa" > "$TMP/ed_off.out" 2>/dev/null
+check_eq "--ed-stats: refmap stdout unchanged" "$(cmp -s "$TMP/ed_se.out" "$TMP/ed_off.out" && echo same)" "same"
+check_eq "--ed-stats header: assemblies in gamete order" "$(grep '^read' "$TMP/ed_se.tsv" | cut -f8-)" "$(printf 'B73\tKi3\tMo17\tOh43')"
+check_eq "--ed-stats: every assembly at the known edit count (subs, 1-bp indels, end subs)" \
+	"$(awk -F'\t' '!/^#/ && $1!="read"{printf "%s=%s:%s,%s,%s,%s ", $1, $3, $8, $9, $10, $11}' "$TMP/ed_se.tsv")" \
+	"E0=0:0,0,0,0 E1=1:1,1,1,1 E2=2:2,2,2,2 E3=3:3,3,3,3 I1=1:1,1,1,1 D1=1:1,1,1,1 L1=1:1,1,1,1 R1=1:1,1,1,1 "
+check_eq "--ed-stats: four assemblies at best, no distinct wrong copy, no flags" \
+	"$(awk -F'\t' '!/^#/ && $1!="read"{print $4"/"$5"/"$6}' "$TMP/ed_se.tsv" | sort -u)" "4/NA/."
+check_eq "--ed-hist: best 0/1/2/3 = 1/5/1/1 reads; per assembly x4" \
+	"$(awk -F'\t' '$1=="read" && $2=="best" && $3<=3{printf "%s ", $4} $1=="read" && $2=="asm" && $3<=3{printf "%s ", $4}' "$TMP/ed_se.hist")" "1 5 1 1 4 20 4 4 "
+check_eq "--ed-hist: sequencing-error fit on the best (one #unit line)" "$(grep -c '^#unit=read' "$TMP/ed_se.hist")" "1"
+"$RB" $EDM --ed-max=2 --ed-stats="$TMP/ed_c2.tsv" "$PIDX" "$ERR/se.fa" > /dev/null 2>&1
+check_eq "--ed-max=2: E3 (3 edits) is NA everywhere, E2 still 2" \
+	"$(awk -F'\t' '$1=="E3"||$1=="E2"{printf "%s=%s:%s,%s ", $1, $3, $8, $11}' "$TMP/ed_c2.tsv")" "E2=2:2,2 E3=NA:NA,NA "
+"$RB" $EDM --ed-stats="$TMP/ed_se.npy" "$PIDX" "$ERR/se.fa" > /dev/null 2>&1
+check_eq "--ed-stats .npy: uint8, 8 reads x (4 assemblies + best + flags)" \
+	"$(head -c 128 "$TMP/ed_se.npy" | tr -d '\0' | grep -ao "'descr': '|u1', 'fortran_order': False, 'shape': (8, 6)")" "'descr': '|u1', 'fortran_order': False, 'shape': (8, 6)"
+check_eq "--ed-stats .npy: E3 row = 3 3 3 3, best 3" "$(od -An -tu1 -j $((128 + 3 * 6)) -N 5 "$TMP/ed_se.npy" | tr -s ' ')" " 3 3 3 3 3"
+check_eq "--ed-stats .npy: column sidecar" "$(cut -f2 "$TMP/ed_se.npy.cols.tsv" | tr '\n' ' ')" "B73 Ki3 Mo17 Oh43 best flags "
+"$RB" $EDM --paired --ed-stats="$TMP/ed_pe.tsv" --ed-hist="$TMP/ed_pe.hist" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ed_pe.out" 2>/dev/null
+check_eq "--paired --ed-stats: 94 mate rows + 47 pair rows" "$(awk -F'\t' '!/^#/ && $1!="read"{n[$2]++} END{print n[1]+0, n[2]+0, n["P"]+0}' "$TMP/ed_pe.tsv")" "47 47 47"
+ed_row() { awk -F'\t' -v n="$1" -v m="$2" '$1==n && $2==m{print $8","$9","$10","$11}' "$TMP/ed_pe.tsv"; }
+check_eq "P1/1: Mo17+Ki3 insertion sequence, NA elsewhere" "$(ed_row P1/1 1)" "NA,0,0,NA"
+check_eq "P1/2: three Ki3 SNPs" "$(ed_row P1/2 2)" "0,3,0,0"
+check_eq "P1 pair: per-assembly sum, NA if a mate is NA" "$(ed_row P1 P)" "NA,3,0,NA"
+check_eq "P3/2 junk: no copy anywhere" "$(ed_row P3/2 2)/$(awk -F'\t' '$1=="P3/2"{print $3}' "$TMP/ed_pe.tsv")" "NA,NA,NA,NA/NA"
+check_eq "--paired --ed-hist: 94 reads and 47 pairs" "$(grep -o '^#unit=[a-z]*	n=[0-9]*' "$TMP/ed_pe.hist" | tr '\n' ' ')" "#unit=read	n=94 #unit=pair	n=47 "
+"$RB" $EDM --paired "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/ed_pe_off.out" 2>/dev/null
+check_eq "--paired --ed-stats: refmap stdout unchanged" "$(cmp -s "$TMP/ed_pe.out" "$TMP/ed_pe_off.out" && echo same)" "same"
+"$RB" $EDM --paired --ed-frac=0.5 --ed-stats="$TMP/ed_frac.tsv" --ed-hist="$TMP/ed_frac.hist" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > /dev/null 2>&1
+nfr=$(awk -F'\t' '!/^#/ && $2=="P"' "$TMP/ed_frac.tsv" | wc -l | tr -d ' ')
+check_eq "--ed-frac=0.5: a subsample of whole pairs, the same in the histogram" \
+	"$([ "$nfr" -gt 5 ] && [ "$nfr" -lt 42 ] && echo ok)/$(awk -F'\t' '!/^#/ && $2=="1"' "$TMP/ed_frac.tsv" | wc -l | tr -d ' ')/$(grep -o '^#unit=pair	n=[0-9]*' "$TMP/ed_frac.hist" | cut -d= -f3)" "ok/$nfr/$nfr"
+check_eq "--ed-frac: sampled rows equal the full run's" \
+	"$(grep -v '^#' "$TMP/ed_frac.tsv" | grep -vxFf <(grep -v '^#' "$TMP/ed_pe.tsv") | wc -l | tr -d ' ')" "0"
+"$RB" chain --ref-prefix=B73 --ed-stats="$TMP/x.tsv" "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/ed_e1.log"
+check_eq "--ed-stats on chain is an error" "$?$(grep -c 'apply to refmap only' "$TMP/ed_e1.log")" "11"
+"$RB" $EDM --ed-hist="$TMP/x.hist" --ed-max=61 "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/ed_e2.log"
+check_eq "--ed-max above 60 is an error" "$?$(grep -c 'ed-max must be' "$TMP/ed_e2.log")" "11"
+"$RB" $EDM --ed-hist="$TMP/x.hist" --ed-frac=0 "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/ed_e3.log"
+check_eq "--ed-frac=0 is an error" "$?" "1"
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
@@ -834,6 +883,10 @@ if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
 		"$RB" mem --paired -p 64 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_mem_pe.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on mem --paired; see $TMP/valgrind_mem_pe.log"; cat "$TMP/valgrind_mem_pe.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --ed-stats="$TMP/vg_ed.npy" --ed-hist="$TMP/vg_ed.hist" --ed-tiles=6 \
+		--ed-budget=50 --ed-max-loc=1 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ed.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --ed-stats"; cat "$TMP/valgrind_ed.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi
