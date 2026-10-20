@@ -40,3 +40,4 @@ experiments/ref-sensitivity/e4/*.log
 /test/tmp/
 test/test_pairing
 test/test_errprof
+test/test_edstats
