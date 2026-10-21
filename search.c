@@ -113,6 +113,13 @@ typedef struct {
 	int8_t err_stats;      // --err-stats: append the events and reference-span columns to each row
 	int64_t max_ref_span;  // --max-ref-span: max reference span of a read (pair with --paired), bp; 0 = off
 	int8_t pe_drop_disc;   // --pe-drop-disc: discordant pairs are FILTERED instead of two single-end events
+	// edit mode (--err-noclip and everything that implies it): read ends are never free -- a contig-end
+	// overhang costs its length, a k-bp indel costs k, and the extension's carrier gives an extended
+	// CIGAR and match_frac = '=' bases / read length. Off (all 0): the legacy event count, byte-identical.
+	int8_t err_noclip;     // --err-noclip: count edits per base (overhang = its length) instead of events
+	int8_t err_clip_rej;   // --err-clip-reject: FILTER a read (both mates with --paired) whose carrier ends inside it
+	int8_t err_cigar;      // --err-cigar: append the extended CIGAR against the carrier to each row
+	double min_match_frac; // --min-match-frac: FILTER reads (pairs: sum '=' / sum length) below this; 0 = off
 	// refmap read filters (all 0 = off; opt-in). A read failing any enabled filter is reported
 	// as FILTERED and contributes nothing to --ps4g/--npy/--ps4g-per-read/--target-hits.
 	double placed_min_chr_agree; // PLACED: min fraction of projecting assemblies on the majority ref seq
@@ -217,7 +224,8 @@ typedef struct {
 	int pe_warned;           // --paired: the "too few pairs to estimate" warning was printed
 	int8_t err_on;           // refmap: count mismatch events per read (any --err-* filter/stats flag)
 	int32_t err_cut;         // refmap --err-max-events in force (fixed, or calibrated); -1 = off
-	int64_t err_nfilt[3];    // refmap: reads (mates) FILTERED by events / span / --pe-drop-disc
+	int64_t err_nfilt[5];    // refmap: reads (mates) FILTERED by events / span / --pe-drop-disc / match_frac / overhang
+	int8_t err_edit;         // refmap edit mode (--err-noclip, --err-clip-reject, --err-cigar, --min-match-frac)
 } pipeline_t;
 
 typedef struct {
@@ -273,7 +281,11 @@ typedef struct refmap_rst_s {
 	int32_t n_ref_hits;  // EXACT: reference occurrences
 	int32_t a_proj, a_agree; // EXACT: assembly hits projecting / agreeing with the reported ref hit
 	char filt;     // FILTERED reason: 'c' chr-agree, 'n' min-proj, 's' spread, 'r' ref-hits, 'a' asm-agree,
-	               // 'l' core-len (read filters); 'e' events, 'S' span, 'D' --pe-drop-disc; 0 = kept
+	               // 'l' core-len (read filters); 'e' events, 'S' span, 'D' --pe-drop-disc, 'm' --min-match-frac,
+	               // 'C' --err-clip-reject; 0 = kept
+	int32_t n_eq;  // edit mode: read bases that are '=' against the carrier (-1 = not computed / no core)
+	int32_t ovh;   // edit mode: read bases past the carrier's end (contig-end overhang, CIGAR 'S')
+	char *cigar;   // --err-cigar: extended CIGAR against the carrier (RB3_MALLOC; NULL = none)
 } refmap_rst_t;
 
 typedef struct {
@@ -904,6 +916,137 @@ static int32_t refmap_err_events(const rb3_fmi_t *f, int32_t len, const uint8_t 
 	return ev < RB3_ERR_CAP? ev : RB3_ERR_CAP;
 }
 
+/*
+ * Edit mode (--err-noclip, --err-clip-reject, --err-cigar, --min-match-frac): the same extension
+ * from the same exact core, but every read base outside the carrier's '=' bases is paid for and
+ * the path is recorded as an extended CIGAR relative to the read:
+ *   '=' read base matches the carrier          X  substitution (1 edit)
+ *   I   read base absent from the carrier (k-bp insertion = k edits)
+ *   D   carrier base absent from the read (k-bp deletion = k edits; no read base)
+ *   S   read base past the end of the carrier (contig-end overhang = 1 edit per base)
+ * edits = X + I + D + S bases; match_frac = '=' bases / read length (D is in neither). There is no
+ * free clipping: the extension always runs to both read ends. At each non-extending base the edit
+ * is chosen greedily among a substitution, a 1..RB3_ERR_MAXINDEL bp read insertion and a
+ * 1..RB3_ERR_MAXINDEL bp read deletion (every carrier path of that length, RB3_ERR_DEL_BUDGET
+ * interval extensions per event), scored as (read bases matched in the next RB3_ERR_LOOK) - (cost - 1);
+ * ties go to the substitution, then the shorter indel. Only when no base at all extends (every
+ * carrier in the interval ends: contig end / assembly gap) is the rest of the read an overhang.
+ */
+#define RB3_ERR_MAXINDEL   8
+#define RB3_ERR_DEL_BUDGET 256
+enum { RB3_EOP_EQ = 0, RB3_EOP_X, RB3_EOP_I, RB3_EOP_D, RB3_EOP_S };
+
+typedef struct { int32_t n, m; uint32_t *a; } err_ops_t; // run-length ops: len<<3 | op, in extension order
+
+static void err_ops_push(err_ops_t *o, int op, int32_t l)
+{
+	if (l <= 0) return;
+	if (o->n > 0 && (int)(o->a[o->n-1] & 7) == op) { o->a[o->n-1] += (uint32_t)l << 3; return; }
+	if (o->n == o->m) o->m = o->m? o->m << 1 : 16, o->a = (uint32_t*)realloc(o->a, o->m * sizeof(uint32_t));
+	o->a[o->n++] = (uint32_t)l << 3 | op;
+}
+
+typedef struct { // best edit so far at one event
+	int32_t sc, op, k;
+	rb3_sai_t ik;
+} err_pick_t;
+
+static inline void err_pick(err_pick_t *b, int32_t sc, int op, int32_t k, const rb3_sai_t *ik)
+{
+	if (sc > b->sc) b->sc = sc, b->op = op, b->k = k, b->ik = *ik;
+}
+
+// read deletion of k = depth bases: x = the carrier after `depth` extra bases; then q[i] must follow
+static void err_del_dfs(const rb3_fmi_t *f, const rb3_sai_t *x, int32_t depth, const uint8_t *q, int32_t len, int32_t i, int d,
+						int32_t lim, int32_t *budget, err_pick_t *b)
+{
+	rb3_sai_t ok[RB3_ASIZE];
+	int back = d < 0, c;
+	if (*budget <= 0) return;
+	--*budget;
+	rb3_fmd_extend(f, x, ok, back);
+	if (q[i] >= 1 && q[i] <= 4) {
+		const rb3_sai_t *y = &ok[back? q[i] : rb3_comp(q[i])];
+		if (y->size > 0) err_pick(b, err_run(f, *y, q, len, i + d, d, lim) - (depth - 1), RB3_EOP_D, depth, y);
+	}
+	if (depth < RB3_ERR_MAXINDEL)
+		for (c = 1; c <= 4; ++c) {
+			const rb3_sai_t *y = &ok[back? c : rb3_comp(c)];
+			if (y->size > 0) err_del_dfs(f, y, depth + 1, q, len, i, d, lim, budget, b);
+		}
+}
+
+// extend from q[i] in direction d to the read end; returns the edits; ops in extension order
+static int32_t err_extend_ed(const rb3_fmi_t *f, rb3_sai_t *ik, const uint8_t *q, int32_t len, int32_t i, int d,
+							 err_ops_t *ops, int32_t *ovh)
+{
+	int32_t ed = 0, back = d < 0;
+	while (i >= 0 && i < len) {
+		rb3_sai_t ok[RB3_ASIZE];
+		int32_t c, rem, lim, k, budget = RB3_ERR_DEL_BUDGET;
+		err_pick_t b;
+		rb3_fmd_extend(f, ik, ok, back);
+		if (q[i] >= 1 && q[i] <= 4 && ok[back? q[i] : rb3_comp(q[i])].size > 0) { // still matching
+			*ik = ok[back? q[i] : rb3_comp(q[i])], i += d;
+			err_ops_push(ops, RB3_EOP_EQ, 1);
+			continue;
+		}
+		rem = d > 0? len - i - 1 : i; // read bases beyond q[i]
+		lim = rem < RB3_ERR_LOOK? rem : RB3_ERR_LOOK;
+		b.sc = INT32_MIN, b.op = -1, b.k = 0;
+		for (c = 1; c <= 4; ++c) { // substitution
+			const rb3_sai_t *x = &ok[back? c : rb3_comp(c)];
+			if (c == q[i] || x->size == 0) continue;
+			err_pick(&b, err_run(f, *x, q, len, i + d, d, lim), RB3_EOP_X, 1, x);
+		}
+		if (b.op < 0) { // no base extends: every carrier ends here; the rest of the read is overhang
+			int32_t l = rem + 1;
+			err_ops_push(ops, RB3_EOP_S, l), ed += l, *ovh += l;
+			break;
+		}
+		for (k = 1; k <= RB3_ERR_MAXINDEL && k <= rem; ++k) { // read insertion: q[i..i+k) are extra
+			int32_t lk = rem - k + 1 < RB3_ERR_LOOK? rem - k + 1 : RB3_ERR_LOOK;
+			err_pick(&b, err_run(f, *ik, q, len, i + k * d, d, lk) - (k - 1), RB3_EOP_I, k, ik);
+		}
+		if (rem > 0) // read deletion: the carrier has k extra bases, then q[i]
+			for (c = 1; c <= 4; ++c) {
+				const rb3_sai_t *x = &ok[back? c : rb3_comp(c)];
+				if (x->size > 0) err_del_dfs(f, x, 1, q, len, i, d, lim, &budget, &b);
+			}
+		*ik = b.ik, ed += b.k;
+		if (b.op == RB3_EOP_X) err_ops_push(ops, RB3_EOP_X, 1), i += d;
+		else if (b.op == RB3_EOP_I) err_ops_push(ops, RB3_EOP_I, b.k), i += b.k * d;
+		else err_ops_push(ops, RB3_EOP_D, b.k), err_ops_push(ops, RB3_EOP_EQ, 1), i += d; // ik already holds q[i]
+	}
+	return ed;
+}
+
+typedef struct { int32_t ed, n_eq, ovh; } err_ed_t;
+
+// Edit-mode count of read q[0..len) from the core interval over q[st..en); *cigar (if non-NULL) =
+// the extended CIGAR (RB3_MALLOC'd)
+static void refmap_err_edits(const rb3_fmi_t *f, int32_t len, const uint8_t *q, const rb3_sai_t *core, int32_t st, int32_t en,
+							 err_ed_t *e, char **cigar)
+{
+	rb3_sai_t ik = *core;
+	err_ops_t R = {0,0,0}, L = {0,0,0}, A = {0,0,0};
+	int32_t j;
+	e->ed = e->ovh = 0;
+	e->ed += err_extend_ed(f, &ik, q, len, en, +1, &R, &e->ovh);
+	e->ed += err_extend_ed(f, &ik, q, len, st - 1, -1, &L, &e->ovh);
+	for (j = L.n - 1; j >= 0; --j) err_ops_push(&A, L.a[j] & 7, L.a[j] >> 3); // left part, read order
+	err_ops_push(&A, RB3_EOP_EQ, en - st);
+	for (j = 0; j < R.n; ++j) err_ops_push(&A, R.a[j] & 7, R.a[j] >> 3);
+	e->n_eq = 0;
+	for (j = 0; j < A.n; ++j) if ((A.a[j] & 7) == RB3_EOP_EQ) e->n_eq += A.a[j] >> 3;
+	if (cigar) {
+		kstring_t str = {0,0,0};
+		for (j = 0; j < A.n; ++j) rb3_sprintf_lite(&str, "%d%c", A.a[j] >> 3, "=XIDS"[A.a[j] & 7]);
+		*cigar = str.s;
+	}
+	free(R.a), free(L.a), free(A.a);
+}
+
 // The exact core refmap places a read with: the whole read, else its longest SMEM (first one on
 // ties). Returns 0 if nothing of the read occurs in any genome; *st/*en = the core's read span.
 static int refmap_core(void *km, const pipeline_t *p, const m_seq_t *s, rb3_sai_t *Iq, int32_t *st, int32_t *en)
@@ -939,12 +1082,16 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	r->ref_sid = -1, r->cL = r->cR = -1;
 	r->core_len = s->len, r->n_lproj = r->n_chr_agree = r->n_ref_hits = r->a_proj = r->a_agree = -1, r->spread = -1;
 
-	r->n_ev = -1, r->span = -1;
+	r->n_ev = -1, r->span = -1, r->n_eq = -1;
 	{
 		int32_t st = 0, en = 0;
 		if (!refmap_core(km, p, s, &Iq, &st, &en)) return; // nothing of the query occurs in any genome
 		r->core_len = en - st;
-		if (p->err_on) r->n_ev = refmap_err_events(f, s->len, s->seq, &Iq, st, en);
+		if (p->err_edit) { // edit mode: per-base edits, '=' count, overhang, CIGAR
+			err_ed_t e;
+			refmap_err_edits(f, s->len, s->seq, &Iq, st, en, &e, p->opt->err_cigar? &r->cigar : 0);
+			r->n_ev = e.ed < RB3_ERR_CAP? e.ed : RB3_ERR_CAP, r->n_eq = e.n_eq, r->ovh = e.ovh;
+		} else if (p->err_on) r->n_ev = refmap_err_events(f, s->len, s->seq, &Iq, st, en);
 	}
 	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/assembly-cap truncation
 	                  // below, so MULTI/EXACT/PLACED rows all carry the true occurrence count
@@ -1125,7 +1272,8 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 	rb3_sprintf_lite(out, "//\n");
 }
 
-static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ, int err_stats, int filter_stats)
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ, int err_stats,
+						  int err_edit, int err_cigar, int filter_stats)
 {
 	static const char *status_str[6] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI", "FILTERED" };
 	int32_t k;
@@ -1158,7 +1306,14 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 		else if (r->span < 0) rb3_sprintf_lite(out, "\t.");
 		else rb3_sprintf_lite(out, "\t%ld", (long)r->span);
 		rb3_sprintf_lite(out, "\t%c", r->filt? r->filt : '.');
+		if (err_edit) { // edit mode: match_frac ('=' bases / read length; . = no core)
+			char buf[32];
+			if (r->n_eq >= 0) snprintf(buf, sizeof(buf), "%.4f", r->qlen > 0? (double)r->n_eq / r->qlen : 0.0);
+			else strcpy(buf, ".");
+			rb3_sprintf_lite(out, "\t%s", buf);
+		}
 	}
+	if (err_cigar) rb3_sprintf_lite(out, "\t%s", r->cigar? r->cigar : "*"); // --err-cigar: extended CIGAR vs the carrier
 	if (filter_stats) // --filter-stats: core_len n_lproj n_chr_agree spread n_ref_hits a_proj a_agree filt
 		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%ld\t%d\t%d\t%d\t%c", r->core_len, r->n_lproj, r->n_chr_agree, (long)r->spread,
 						 r->n_ref_hits, r->a_proj, r->a_agree, r->filt? r->filt : '.');
@@ -1233,7 +1388,7 @@ static void write_refmap(step_t *t)
 		int kmer = p->opt->kmer_len > 0;
 		if (r->n_sub > 0) { // per-assembly mode: one line per assembly (sub->assemblies borrows r->assemblies)
 			for (k = 0; k < r->n_sub; ++k) {
-				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ, p->opt->err_stats, p->opt->filter_stats);
+				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ, p->opt->err_stats, p->err_edit, p->opt->err_cigar, p->opt->filter_stats);
 				fputs(out.s, stdout);
 				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
 				write_ps4g_read(p->ps4g_per_read_fp, f, s, &r->sub[k]);
@@ -1242,7 +1397,7 @@ static void write_refmap(step_t *t)
 			}
 			free(r->sub);
 		} else {
-			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ, p->opt->err_stats, p->opt->filter_stats);
+			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ, p->opt->err_stats, p->err_edit, p->opt->err_cigar, p->opt->filter_stats);
 			if (t->pe) { // --paired: one extra column, the pair class (MOVED = this mate was rescued)
 				const rb3_pe_res_t *e = &t->pe[j >> 1];
 				out.l--; // drop the newline
@@ -1265,6 +1420,7 @@ static void write_refmap(step_t *t)
 		free(r->proj_pos);
 		free(r->proj_gid);
 		free(r->proj_strand);
+		free(r->cigar);
 		free(t->seq[j].seq);
 		free(t->seq[j].name);
 	}
@@ -1293,21 +1449,37 @@ static inline int32_t refmap_pair_ev(const refmap_rst_t *a, const refmap_rst_t *
 	return e < RB3_ERR_CAP? e : RB3_ERR_CAP;
 }
 
-// Step 1, before pairing: single-end event + span filters, or the pair-sum event filter.
+// edit mode: '=' bases (0 without a core) and their match_frac test; per pair = sum '=' / sum length
+static inline int refmap_mf_fail(int64_t n_eq, int64_t len, double min_mf)
+{
+	return min_mf > 0.0 && (len <= 0 || (double)n_eq < min_mf * (double)len - 1e-9);
+}
+
+// Step 1, before pairing: single-end event + match_frac + overhang + span filters, or the pair-sum
+// event / match_frac filters and the pair overhang filter (both mates).
 static void refmap_filter_pre(pipeline_t *p, step_t *t)
 {
 	int32_t j;
+	double mmf = p->opt->min_match_frac;
 	if (!p->opt->paired) {
 		for (j = 0; j < t->n_seq; ++j) {
 			refmap_rst_t *r = &t->refmap[j];
 			if (!refmap_is_placed(r)) continue;
 			if (p->err_cut >= 0 && (r->n_ev < 0 || r->n_ev > p->err_cut)) refmap_filter1(p, r, 'e', 0);
+			else if (refmap_mf_fail(r->n_eq > 0? r->n_eq : 0, r->qlen, mmf)) refmap_filter1(p, r, 'm', 3);
+			else if (p->opt->err_clip_rej && r->ovh > 0) refmap_filter1(p, r, 'C', 4);
 			else if (p->opt->max_ref_span > 0 && refmap_se_span(r) > p->opt->max_ref_span) refmap_filter1(p, r, 'S', 1);
 		}
-	} else if (p->err_cut >= 0) {
-		for (j = 0; j + 1 < t->n_seq; j += 2)
-			if (refmap_pair_ev(&t->refmap[j], &t->refmap[j+1]) > p->err_cut)
-				refmap_filter1(p, &t->refmap[j], 'e', 0), refmap_filter1(p, &t->refmap[j+1], 'e', 0);
+	} else if (p->err_cut >= 0 || mmf > 0.0 || p->opt->err_clip_rej) {
+		for (j = 0; j + 1 < t->n_seq; j += 2) {
+			refmap_rst_t *a = &t->refmap[j], *b = &t->refmap[j+1];
+			if (p->err_cut >= 0 && refmap_pair_ev(a, b) > p->err_cut)
+				refmap_filter1(p, a, 'e', 0), refmap_filter1(p, b, 'e', 0);
+			else if (refmap_mf_fail((int64_t)(a->n_eq > 0? a->n_eq : 0) + (b->n_eq > 0? b->n_eq : 0), (int64_t)a->qlen + b->qlen, mmf))
+				refmap_filter1(p, a, 'm', 3), refmap_filter1(p, b, 'm', 3);
+			else if (p->opt->err_clip_rej && (a->ovh > 0 || b->ovh > 0))
+				refmap_filter1(p, a, 'C', 4), refmap_filter1(p, b, 'C', 4);
+		}
 	}
 }
 
@@ -1343,6 +1515,7 @@ typedef struct {
 	const pipeline_t *p;
 	m_seq_t *seq;
 	int16_t *ev;
+	int32_t *eq; // edit mode: '=' bases (-1 = no core)
 	void **km;
 } err_cal_t;
 
@@ -1354,24 +1527,51 @@ static void err_cal_worker(void *data, long i, int tid)
 	int32_t st = 0, en = 0;
 	rb3_char2nt6(s->len, s->seq);
 	if (c->p->opt->trim_polya > 0) m_trim_polya(s, c->p->opt->trim_polya);
-	c->ev[i] = refmap_core(c->km[tid], c->p, s, &Iq, &st, &en)? refmap_err_events(&c->p->fmi, s->len, s->seq, &Iq, st, en) : -1;
+	if (!refmap_core(c->km[tid], c->p, s, &Iq, &st, &en)) c->ev[i] = -1, c->eq[i] = -1;
+	else if (c->p->err_edit) {
+		err_ed_t e;
+		refmap_err_edits(&c->p->fmi, s->len, s->seq, &Iq, st, en, &e, 0);
+		c->ev[i] = e.ed < RB3_ERR_CAP? e.ed : RB3_ERR_CAP, c->eq[i] = e.n_eq;
+	} else c->ev[i] = refmap_err_events(&c->p->fmi, s->len, s->seq, &Iq, st, en), c->eq[i] = -1;
+}
+
+// edit mode --err-hist: match_frac histogram, bin = floor(100 * match_frac) in 0..100
+#define RB3_MF_NBIN 101
+static inline int32_t err_mf_bin(int64_t eq, int64_t len)
+{
+	int32_t b = len > 0? (int32_t)((double)eq * 100.0 / (double)len + 1e-9) : 0;
+	return b < 0? 0 : b > 100? 100 : b;
+}
+
+static void err_write_mf_hist(FILE *fp, const char *unit, const int64_t *h)
+{
+	int64_t n = 0, ge = 0;
+	int32_t k;
+	for (k = 0; k < RB3_MF_NBIN; ++k) n += h[k];
+	fprintf(fp, "#unit=%s\tn=%ld\tbin = floor(100 * match_frac); cum_ge = fraction with match_frac >= bin/100\n", unit, (long)n);
+	for (k = RB3_MF_NBIN - 1; k >= 0; --k) {
+		ge += h[k];
+		fprintf(fp, "%s\t%d\t%ld\t%.6f\t%.6f\n", unit, k, (long)h[k], n? (double)h[k] / n : 0.0, n? (double)ge / n : 0.0);
+	}
 }
 
 static int refmap_err_calibrate(pipeline_t *p, const char *fn1, const char *fn2, int is_line)
 {
 	const rb3_mopt_t *o = p->opt;
 	int32_t nm = o->paired? 2 : 1, chunk = 200000, k, cut, i;
-	int64_t n_frag = 0, hist_r[RB3_ERR_CAP+1], hist_p[RB3_ERR_CAP+1];
+	int64_t n_frag = 0, hist_r[RB3_ERR_CAP+1], hist_p[RB3_ERR_CAP+1], mf_r[RB3_MF_NBIN], mf_p[RB3_MF_NBIN];
+	int32_t *qlen;
 	rb3_seqio_t *fp, *fp2 = 0;
 	err_cal_t c;
 	rb3_errfit_t fit_r, fit_p;
-	memset(hist_r, 0, sizeof(hist_r)), memset(hist_p, 0, sizeof(hist_p));
+	memset(hist_r, 0, sizeof(hist_r)), memset(hist_p, 0, sizeof(hist_p)), memset(mf_r, 0, sizeof(mf_r)), memset(mf_p, 0, sizeof(mf_p));
 	if ((fp = rb3_seq_open(fn1, is_line)) == 0 || (fn2 && (fp2 = rb3_seq_open(fn2, is_line)) == 0)) {
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --err-*: failed to open '%s' for calibration\n", fp? fn2 : fn1);
 		if (fp) rb3_seq_close(fp);
 		return -1;
 	}
 	c.p = p, c.seq = RB3_CALLOC(m_seq_t, chunk), c.ev = RB3_CALLOC(int16_t, chunk), c.km = RB3_CALLOC(void*, o->n_threads);
+	c.eq = RB3_CALLOC(int32_t, chunk), qlen = RB3_CALLOC(int32_t, chunk);
 	for (i = 0; i < o->n_threads; ++i) c.km[i] = km_init();
 	while (n_frag < o->err_calib) {
 		int32_t n = 0;
@@ -1390,6 +1590,8 @@ static int refmap_err_calibrate(pipeline_t *p, const char *fn1, const char *fn2,
 		kt_for(o->n_threads, err_cal_worker, &c, n);
 		for (i = 0; i < n; ++i) {
 			if (c.ev[i] >= 0) ++hist_r[c.ev[i] < RB3_ERR_CAP? c.ev[i] : RB3_ERR_CAP];
+			if (p->err_edit && c.eq[i] >= 0) ++mf_r[err_mf_bin(c.eq[i], c.seq[i].len)];
+			qlen[i] = c.seq[i].len;
 			free(c.seq[i].seq);
 		}
 		if (nm == 2)
@@ -1397,11 +1599,13 @@ static int refmap_err_calibrate(pipeline_t *p, const char *fn1, const char *fn2,
 				refmap_rst_t a, b;
 				a.n_ev = c.ev[i], b.n_ev = c.ev[i+1];
 				++hist_p[refmap_pair_ev(&a, &b)];
+				if (p->err_edit) // a coreless mate adds its length and no '=' bases
+					++mf_p[err_mf_bin((int64_t)(c.eq[i] > 0? c.eq[i] : 0) + (c.eq[i+1] > 0? c.eq[i+1] : 0), (int64_t)qlen[i] + qlen[i+1])];
 			}
 		if (n < chunk - nm + 1 && n_frag < o->err_calib) break; // input exhausted
 	}
 	for (i = 0; i < o->n_threads; ++i) km_destroy(c.km[i]);
-	free(c.km), free(c.seq), free(c.ev);
+	free(c.km), free(c.seq), free(c.ev), free(c.eq), free(qlen);
 	rb3_seq_close(fp);
 	if (fp2) rb3_seq_close(fp2);
 	rb3_err_fit(hist_r, RB3_ERR_CAP, &fit_r);
@@ -1421,11 +1625,18 @@ static int refmap_err_calibrate(pipeline_t *p, const char *fn1, const char *fn2,
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to open --err-hist file '%s'\n", o->err_hist_fn);
 			return -1;
 		}
-		fprintf(hf, "#ropebwt3 refmap error profile: events = edits explaining the read against one carrier of its exact core\n");
+		fprintf(hf, "#ropebwt3 refmap error profile: events = edits explaining the read against one carrier of its exact core%s\n",
+				p->err_edit? " (edit mode: per base, overhang = its length)" : "");
 		fprintf(hf, "#calibration %s=%ld\n", nm == 2? "pairs" : "reads", (long)n_frag);
 		fprintf(hf, "unit\tk\tcount\tfrac\tcum_frac\terr_expected\tpost_err\n");
 		rb3_err_write_hist(hf, "read", hist_r, RB3_ERR_CAP, &fit_r, o->err_alpha, rb3_err_cutoff(fit_r.mu0, o->err_alpha, RB3_ERR_CAP));
 		if (nm == 2) rb3_err_write_hist(hf, "pair", hist_p, RB3_ERR_CAP, &fit_p, o->err_alpha, rb3_err_cutoff(fit_p.mu0, o->err_alpha, RB3_ERR_CAP));
+		if (p->err_edit) { // edit mode: events above are edits; then the match_frac histograms
+			fprintf(hf, "#match_frac = '=' bases / read length against the extension's carrier (pair: sum / sum)\n");
+			fprintf(hf, "unit\tbin\tcount\tfrac\tcum_ge\n");
+			err_write_mf_hist(hf, "read_mf", mf_r);
+			if (nm == 2) err_write_mf_hist(hf, "pair_mf", mf_p);
+		}
 		fclose(hf);
 	}
 	return 0;
@@ -2594,7 +2805,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			kt_for(p->opt->n_threads, worker_for_hapdiv, in, t->n_hapdiv);
 		else
 			kt_for(p->opt->n_threads, worker_for_seq, in, t->n_seq);
-		if (p->opt->algo == RB3_SA_REFMAP && (p->err_cut >= 0 || p->opt->max_ref_span > 0))
+		if (p->opt->algo == RB3_SA_REFMAP && (p->err_cut >= 0 || p->opt->max_ref_span > 0 || p->opt->min_match_frac > 0.0 || p->opt->err_clip_rej))
 			refmap_filter_pre(p, t);
 		if (p->opt->paired && p->opt->algo == RB3_SA_REFMAP) {
 			refmap_pair_batch(p, t);
@@ -2687,6 +2898,10 @@ static ko_longopt_t long_options[] = {
 	{ "err-stats",           ko_no_argument,       384 },
 	{ "max-ref-span",        ko_required_argument, 385 },
 	{ "pe-drop-disc",        ko_no_argument,       386 },
+	{ "err-noclip",          ko_no_argument,       387 },
+	{ "err-clip-reject",     ko_no_argument,       388 },
+	{ "err-cigar",           ko_no_argument,       389 },
+	{ "min-match-frac",      ko_required_argument, 379 },
 	{ "placed-min-chr-agree", ko_required_argument, 390 },
 	{ "placed-min-proj",     ko_required_argument, 391 },
 	{ "placed-max-spread",   ko_required_argument, 392 },
@@ -2838,6 +3053,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 384) opt.err_stats = 1;                        // refmap: events/span/reason columns
 		else if (c == 385) opt.max_ref_span = rb3_parse_num(o.arg);  // refmap: reference span cap (bp)
 		else if (c == 386) opt.pe_drop_disc = 1;                     // refmap --paired: drop DISC pairs
+		else if (c == 387) opt.err_noclip = 1;                       // refmap: edit mode (no free read ends)
+		else if (c == 388) opt.err_clip_rej = 1;                     // refmap: FILTER reads with a contig-end overhang
+		else if (c == 389) opt.err_cigar = 1;                        // refmap: extended CIGAR column
+		else if (c == 379) opt.min_match_frac = atof(o.arg);         // refmap: min '=' bases / read length
 		else if (c == 374) opt.max_locate = atoi(o.arg);             // refmap: occurrences located per read
 		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 390) opt.placed_min_chr_agree = atof(o.arg);
@@ -2961,6 +3180,15 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    spread of all lift projections (another sequence = infinite); with\n");
 			fprintf(stderr, "                    --paired, first-to-last coordinate of both mates (0 = off)\n");
 			fprintf(stderr, "  --pe-drop-disc    --paired: FILTER discordant pairs instead of two single-end events\n");
+			fprintf(stderr, "  Edit mode (any of the next four; default off = legacy events): read ends are never free.\n");
+			fprintf(stderr, "  edits = substituted + inserted + deleted bases + bases past a contig end (each costs 1),\n");
+			fprintf(stderr, "  against the one carrier the extension of the exact core ends on; match_frac = '=' bases /\n");
+			fprintf(stderr, "  read length. --err-max-events then caps edits, and --err-stats/--err-hist add match_frac:\n");
+			fprintf(stderr, "  --err-noclip      count edits per base (a contig-end overhang costs its length)\n");
+			fprintf(stderr, "  --err-clip-reject FILTER a read (pair) whose carrier ends inside it (reason C)\n");
+			fprintf(stderr, "  --err-cigar       append the extended CIGAR (=XIDS) against that carrier to each row\n");
+			fprintf(stderr, "  --min-match-frac=FLOAT  FILTER reads below FLOAT (with --paired: sum '=' / sum length\n");
+			fprintf(stderr, "                    of both mates) (reason m) [0 = off]\n");
 			fprintf(stderr, "  Read filters (whole-read --lift mode; all off by default; a rejected read is\n");
 			fprintf(stderr, "  reported as FILTERED and adds nothing to --ps4g/--npy):\n");
 			fprintf(stderr, "  --placed-min-chr-agree=FRAC  PLACED: min fraction of projecting assemblies on the\n");
@@ -3104,10 +3332,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact/--pe-drop-disc need --paired\n");
 		return 1;
 	}
-	if (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || opt.max_ref_span > 0 || opt.pe_drop_disc) {
+	if (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || opt.max_ref_span > 0 || opt.pe_drop_disc
+		|| opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac != 0.0) {
 		const char *err = 0;
 		if (opt.algo != RB3_SA_REFMAP) err = "--err-*/--max-ref-span/--pe-drop-disc apply to refmap only";
 		else if (opt.err_max_ev < -2) err = "--err-max-events takes an integer >= 0 or 'auto'";
+		else if (opt.min_match_frac < 0.0 || opt.min_match_frac > 1.0) err = "--min-match-frac takes a value in [0,1]";
+		else if ((opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac > 0.0) && opt.trim_polya > 0)
+			err = "edit mode (--err-noclip/--err-clip-reject/--err-cigar/--min-match-frac) charges every read base: drop --trim-polya";
 		else if (opt.kmer_len > 0) err = "--err-*/--max-ref-span do not support --kmer";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--err-*/--max-ref-span do not support --walk-mode=per-assembly";
 		else if (opt.err_calib < 1 || opt.err_alpha <= 0.0 || opt.err_alpha >= 1.0) err = "--err-calib must be >= 1 and 0 < --err-alpha < 1";
@@ -3287,7 +3519,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		&& opt.max_occ <= opt.max_locate && opt.kmer_len <= 0 && rb3_verbose >= 2)
 		fprintf(stderr, "WARNING: --max-locate=%d has no effect: --max-occ=%ld already drops (MULTI) every read with more "
 						"occurrences, so all occurrences of the reads kept are located\n", opt.max_locate, (long)opt.max_occ);
-	p.err_on = (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats);
+	p.err_edit = (opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac > 0.0);
+	p.err_on = (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || p.err_edit);
 	p.err_cut = opt.err_max_ev >= 0? opt.err_max_ev : -1;
 	memset(p.err_nfilt, 0, sizeof(p.err_nfilt));
 	if (opt.algo == RB3_SA_REFMAP && (opt.err_max_ev == -2 || opt.err_hist_fn)) // calibration pre-pass
@@ -3330,6 +3563,9 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	if (opt.algo == RB3_SA_REFMAP && (p.err_cut >= 0 || opt.max_ref_span > 0 || opt.pe_drop_disc) && rb3_verbose >= 3)
 		fprintf(stderr, "[M::%s] FILTERED %s: %ld by events (> %d), %ld by span (> %ld bp), %ld by --pe-drop-disc\n", __func__,
 				opt.paired? "mates" : "reads", (long)p.err_nfilt[0], p.err_cut, (long)p.err_nfilt[1], (long)opt.max_ref_span, (long)p.err_nfilt[2]);
+	if (opt.algo == RB3_SA_REFMAP && (opt.min_match_frac > 0.0 || opt.err_clip_rej) && rb3_verbose >= 3)
+		fprintf(stderr, "[M::%s] FILTERED %s (edit mode): %ld by match_frac (< %g), %ld by contig-end overhang\n", __func__,
+				opt.paired? "mates" : "reads", (long)p.err_nfilt[3], opt.min_match_frac, (long)p.err_nfilt[4]);
 	if (p.ps4g_acc) {
 		kstring_t cmd = {0,0,0};
 		int32_t k;
