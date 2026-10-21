@@ -789,6 +789,56 @@ check_eq "--err-max-events=auto on stdin is an error" "$?$(grep -c 'not stdin' "
 "$RB" $ERM --pe-drop-disc "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/err_e3.log"
 check_eq "--pe-drop-disc without --paired is an error" "$?" "1"
 
+# --- 12b. edit mode (--err-noclip/--err-clip-reject/--err-cigar/--min-match-frac) ---
+# docs/examples/edit/ (make_edit_fixture.py): expected.tsv lists each read's edits, '=' bases and
+# extended CIGAR: 0/1/2 substitutions, 1- and 3-bp insertions/deletions, end-base substitutions,
+# contig-end overhangs of 1/5/20 bp at both ends of every genome.
+ED="$DIR/edit"
+"$RB" $ERM --err-stats --err-cigar "$PIDX" "$ED/se.fa" > "$TMP/ed_se.tsv" 2>/dev/null
+check_eq "edit mode: --err-stats gains match_frac, --err-cigar the CIGAR (16 columns)" "$(awk -F'\t' '{print NF}' "$TMP/ed_se.tsv" | sort -u | tr '\n' ' ')" "16 "
+check_eq "edit mode: edits and CIGAR of every fixture read match expected.tsv" \
+	"$(awk -F'\t' '{printf "%s %s %s\n", $1, $12, $16}' "$TMP/ed_se.tsv")" "$(awk -F'\t' 'NR>1{printf "%s %s %s\n", $1, $3, $5}' "$ED/expected.tsv")"
+check_eq "edit mode: match_frac = '=' bases / 150" \
+	"$(awk -F'\t' '{printf "%s %s\n", $1, $15}' "$TMP/ed_se.tsv")" "$(awk -F'\t' 'NR>1{printf "%s %.4f\n", $1, $4/150}' "$ED/expected.tsv")"
+"$RB" $ERM --err-stats "$PIDX" "$ED/se.fa" > "$TMP/ed_legacy.tsv" 2>/dev/null
+check_eq "legacy events (no edit flag): an overhang is one event, a 3-bp indel 8 / cap" \
+	"$(awk -F'\t' '$1 ~ /^(OR20|OL20|I3|D3)$/{printf "%s=%s ", $1, $12}' "$TMP/ed_legacy.tsv")" "I3=8 D3=20 OR20=1 OL20=1 "
+"$RB" $ERM --err-stats --err-noclip --err-max-events=1 "$PIDX" "$ED/se.fa" > "$TMP/ed_k1.tsv" 2>/dev/null
+check_eq "--err-noclip --err-max-events=1: every read with > 1 edit FILTERED (e)" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/ed_k1.tsv")" "S2/e I3/e D3/e OR5/e OR20/e OL5/e OL20/e "
+"$RB" $ERM --err-stats --err-clip-reject "$PIDX" "$ED/se.fa" > "$TMP/ed_clip.tsv" 2>/dev/null
+check_eq "--err-clip-reject: every contig-end overhang FILTERED (C)" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/ed_clip.tsv")" "OR1/C OR5/C OR20/C OL1/C OL5/C OL20/C "
+"$RB" $ERM --err-stats --min-match-frac=0.99 --ps4g="$TMP/ed_mf.ps4g" "$PIDX" "$ED/se.fa" > "$TMP/ed_mf.tsv" 2>"$TMP/ed_mf.log"
+check_eq "--min-match-frac=0.99: reads below 149/150 FILTERED (m); D3 (deletion, 150 '=') kept" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/ed_mf.tsv")" "S2/m I3/m OR5/m OR20/m OL5/m OL20/m "
+check_eq "--min-match-frac=0.99: PS4G 15 -> 9 events" "$(awk '/^#TotalUniqueCounts:/{print $2}' "$TMP/ed_mf.ps4g")" "9"
+if grep -q 'FILTERED reads (edit mode): 6 by match_frac' "$TMP/ed_mf.log"; then pass; else fail "--min-match-frac: FILTERED summary not logged"; fi
+"$RB" $ERM --paired --err-stats --min-match-frac=0.99 "$PIDX" "$ED/r1.fa" "$ED/r2.fa" > "$TMP/ed_pe.tsv" 2>/dev/null
+check_eq "--paired --min-match-frac=0.99 is per pair (sum '=' / 300): M3 (297) kept, C5 (295) FILTERED, both mates" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/ed_pe.tsv")" "C5/1/m C5/2/m "
+"$RB" $ERM --paired --err-stats --min-match-frac=0.995 "$PIDX" "$ED/r1.fa" "$ED/r2.fa" > "$TMP/ed_pe2.tsv" 2>/dev/null
+check_eq "--paired --min-match-frac=0.995: M2 (298/300), M3, C5 FILTERED" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s ", $1}' "$TMP/ed_pe2.tsv")" "M2/1 M2/2 M3/1 M3/2 C5/1 C5/2 "
+"$RB" $ERM --paired --err-stats --err-clip-reject "$PIDX" "$ED/r1.fa" "$ED/r2.fa" > "$TMP/ed_pec.tsv" 2>/dev/null
+check_eq "--paired --err-clip-reject: one overhanging mate rejects the pair (C, both mates)" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s/%s ", $1, $14}' "$TMP/ed_pec.tsv")" "C5/1/C C5/2/C "
+"$RB" $ERM --paired --err-noclip --err-max-events=2 "$PIDX" "$ED/r1.fa" "$ED/r2.fa" > "$TMP/ed_pek.tsv" 2>/dev/null
+check_eq "--paired --err-noclip --err-max-events=2: pair edits 0/2/3/5 -> M3 and C5 FILTERED" \
+	"$(awk -F'\t' '$3=="FILTERED"{printf "%s ", $1}' "$TMP/ed_pek.tsv")" "M3/1 M3/2 C5/1 C5/2 "
+"$RB" $ERM --paired --err-noclip --err-hist="$TMP/ed.hist" "$PIDX" "$ED/r1.fa" "$ED/r2.fa" > /dev/null 2>&1
+check_eq "edit-mode --err-hist: pair edits 0/2/3/5 and pair match_frac bins 100/99/99/98" \
+	"$(awk -F'\t' '$1=="pair" && $3>0{printf "%s ", $2} $1=="pair_mf" && $3>0{printf "%s:%s ", $2, $3}' "$TMP/ed.hist")" "0 2 3 5 100:1 99:2 98:1 "
+"$RB" $ERM --err-noclip --trim-polya=10 "$PIDX" "$ED/se.fa" > /dev/null 2>"$TMP/ed_e1.log"
+check_eq "edit mode + --trim-polya is an error (trimmed ends would be free)" "$?$(grep -c 'drop --trim-polya' "$TMP/ed_e1.log")" "11"
+"$RB" $ERM --min-match-frac=1.5 "$PIDX" "$ED/se.fa" > /dev/null 2>"$TMP/ed_e2.log"
+check_eq "--min-match-frac outside [0,1] is an error" "$?" "1"
+if command -v valgrind >/dev/null 2>&1; then
+	valgrind --error-exitcode=99 --leak-check=full -q "$RB" $ERM --paired --err-stats --err-cigar --min-match-frac=0.9 --err-hist="$TMP/ed_vg.hist" \
+		"$PIDX" "$ED/r1.fa" "$ED/r2.fa" > /dev/null 2>"$TMP/ed_vg.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind (edit mode) reported errors or leaks; see $TMP/ed_vg.log"; fi
+fi
+
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
 	valgrind --error-exitcode=99 --leak-check=full -q \
