@@ -85,7 +85,7 @@ code, 5, as refmap-read-filters, so the two compose) and adds nothing to `--ps4g
 
 - `test/test_errprof.c` (17): Poisson basics, cutoffs, EM recovery on pure, mixed and
   censored-tail histograms, sidecar writer.
-- `test/run_integration.sh` section 12 (21 checks + valgrind) on `docs/examples/err/`
+- `test/run_integration.sh` section 16 (21 checks + valgrind) on `docs/examples/err/`
   (`test/make_err_fixture.py`): exact event counts for 0-3 substitutions, a 1-bp insertion,
   a 1-bp deletion and end errors; per-read and per-pair cutoffs; auto + `--err-hist`; the
   junk-mate cap; `--max-ref-span` single-end and paired; `--pe-drop-disc`; filters-off

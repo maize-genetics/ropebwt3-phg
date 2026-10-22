@@ -11,6 +11,7 @@
 #include "hitcount.h"
 #include "pairing.h"
 #include "errprof.h"
+#include "edstats.h"
 #include "khashl-km.h"
 
 KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
@@ -132,6 +133,15 @@ typedef struct {
 	int64_t exact_agree_dist;    // EXACT: distance (bp) for an assembly projection to count as agreeing
 	int32_t min_core_len;        // EXACT/PLACED: min exact-match length (read length, or SMEM core on fallback)
 	int8_t filter_stats;         // append per-read filter features as extra TSV columns
+	// refmap --ed-stats / --ed-hist: per-read best edit distance to each assembly (off by default)
+	char *ed_stats_fn;     // --ed-stats: per-read (and per-pair) table; '.npy' suffix = uint8 matrix (NULL = off)
+	char *ed_hist_fn;      // --ed-hist: summary histograms + sequencing-error fit (NULL = off)
+	int32_t ed_cap;        // --ed-max: edit cap; larger = NA [8]
+	int32_t ed_tiles;      // --ed-tiles: disjoint exact seeds per read; exact up to ed_tiles-1 edits [4]
+	int32_t ed_max_loc;    // --ed-max-loc: rows located per aligned interval [64]
+	int64_t ed_max_occ;    // --ed-max-occ: skip a tile with more exact occurrences (repeats) [1000]
+	int64_t ed_budget;     // --ed-budget: expanded search states per tile [2000]
+	double ed_frac;        // --ed-frac: compute for this fraction of reads (pairs), a fixed hash subsample [1]
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -176,6 +186,8 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pe_slack = 2000;  // lift projections are typically within ~2kb (the --anchor-dist-thresh scale)
 	opt->err_max_ev = -1, opt->err_calib = 1000000, opt->err_alpha = 1e-3; // error-profile filter off by default
 	opt->exact_min_asm_proj = 1, opt->exact_agree_dist = 100000; // only used when --exact-min-asm-agree > 0
+	opt->ed_stats_fn = 0, opt->ed_hist_fn = 0; // edit-distance statistics off by default
+	opt->ed_cap = 8, opt->ed_tiles = 4, opt->ed_max_loc = 64, opt->ed_max_occ = 1000, opt->ed_budget = 2000, opt->ed_frac = 1.0;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -226,6 +238,11 @@ typedef struct {
 	int32_t err_cut;         // refmap --err-max-events in force (fixed, or calibrated); -1 = off
 	int64_t err_nfilt[5];    // refmap: reads (mates) FILTERED by events / span / --pe-drop-disc / match_frac / overhang
 	int8_t err_edit;         // refmap edit mode (--err-noclip, --err-clip-reject, --err-cigar, --min-match-frac)
+	rb3_gtab_t *ed_gtab;     // refmap --ed-stats/--ed-hist: assembly (sample) of each sequence; NULL = off
+	FILE *ed_fp;             // --ed-stats output (NULL: --ed-hist only)
+	int8_t ed_npy;           // --ed-stats file is a uint8 .npy matrix
+	int64_t ed_rows;         // --ed-stats .npy: rows written
+	rb3_edhist_t *ed_hist;   // --ed-hist accumulator
 } pipeline_t;
 
 typedef struct {
@@ -286,6 +303,9 @@ typedef struct refmap_rst_s {
 	int32_t n_eq;  // edit mode: read bases that are '=' against the carrier (-1 = not computed / no core)
 	int32_t ovh;   // edit mode: read bases past the carrier's end (contig-end overhang, CIGAR 'S')
 	char *cigar;   // --err-cigar: extended CIGAR against the carrier (RB3_MALLOC; NULL = none)
+	uint8_t *ed;   // --ed-stats/--ed-hist: best edit distance to each assembly (RB3_ED_NA = none); RB3_MALLOC
+	uint8_t ed_best;  // best over the panel, also when its assembly was not located (RB3_ED_NA = none)
+	int32_t ed_flags; // RB3_ED_F_* | complete tiles << 8 (values are exact up to that many - 1 edits)
 } refmap_rst_t;
 
 typedef struct {
@@ -302,6 +322,7 @@ typedef struct {
 } step_t;
 
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r);
+static int refmap_ed(void *km, const pipeline_t *p, int32_t len, const uint8_t *q, uint8_t *v, uint8_t *gbest);
 static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
 							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen);
 
@@ -370,6 +391,14 @@ static void worker_for_seq(void *data, long i, int tid)
 		}
 	} else if (p->opt->algo == RB3_SA_REFMAP) { // place the query on the reference genome
 		refmap_query(b->km, p, s, &t->refmap[i]);
+		if (p->ed_gtab) { // --ed-stats/--ed-hist: independent of the placement above
+			refmap_rst_t *r = &t->refmap[i];
+			uint64_t h = (uint64_t)(p->opt->paired? s->id >> 1 : s->id) * 0x9E3779B97F4A7C15ULL; // --ed-frac: mates stay together
+			r->ed = RB3_MALLOC(uint8_t, p->ed_gtab->n_gamete);
+			if (p->opt->ed_frac >= 1.0 || (double)(h >> 11) * (1.0 / 9007199254740992.0) < p->opt->ed_frac)
+				r->ed_flags = refmap_ed(b->km, p, s->len, s->seq, r->ed, &r->ed_best);
+			else memset(r->ed, RB3_ED_NA, p->ed_gtab->n_gamete), r->ed_flags = RB3_ED_F_SKIP, r->ed_best = RB3_ED_NA;
+		}
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
@@ -845,6 +874,7 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
  * is one event. Counting stops at RB3_ERR_CAP.
  */
 #define RB3_ERR_LOOK 12
+#define RB3_ED_MIN_TILE 12 // --ed-tiles: fewer tiles on reads shorter than tiles * this
 
 static inline int64_t err_step(const rb3_fmi_t *f, const rb3_sai_t *ik, int c, int back, rb3_sai_t *out)
 {
@@ -1066,6 +1096,259 @@ static int refmap_core(void *km, const pipeline_t *p, const m_seq_t *s, rb3_sai_
 		if (bestlen == 0 || Iq->size == 0) return 0; // nothing of the query occurs in any genome
 	} else *st = 0, *en = s->len;
 	return 1;
+}
+
+/*
+ * refmap --ed-stats / --ed-hist: best edit distance of a read to EACH assembly.
+ *
+ * Definition: the minimum number of edits -- substitutions, inserted or deleted bases (a k-bp
+ * indel costs k), and read bases left unaligned at a contig end -- that turn the whole read into
+ * a substring of the assembly (either strand). Unaligned bases cost the same as insertions, so
+ * this is the semi-global edit distance (read end to end, free ends on the assembly).
+ *
+ * Seeds: the read is cut into --ed-tiles disjoint tiles at the nominal boundaries; a tile that
+ * occurs more than --ed-max-occ times is extended to the right until it does not (repeats: fewer,
+ * longer tiles), and skipped if it still does at the read end. If the whole read occurs more than
+ * --ed-max-occ times, its first --ed-max-loc copies are located at cost 0 and nothing is searched.
+ *
+ * Search, per tile: best-first (Dijkstra over integer costs, a bucket queue) extension in the
+ * bidirectional FM-index from the tile's exact interval, first to the left (to the right for the
+ * first tile), then to the other side. A state is (FMD interval, read position, cost); moves are
+ * match (0), substitution, read insertion and read deletion (1 each). The interval holds the
+ * indexed copies whose text the path has spelled, so copies that agree share one state and the
+ * search branches only where copies differ or an edit is made. A popped state that has aligned the
+ * whole read is the cheapest alignment of the copies it holds; they are located (rb3_ssa_multi, at
+ * most --ed-max-loc) and give their assemblies that cost. Pruning:
+ *  - finished copies: during the first phase the intervals are sub-ranges of the tile's interval on
+ *    that side, during the second sub-ranges of the first-phase end interval on the other side, so
+ *    "every copy of this state already has its cost on this side" is a range check (union-find);
+ *  - complete tiles: a path that crosses an earlier complete tile without an edit inside it is an
+ *    alignment that tile's own search already covered (tiles go left to right and the first phase
+ *    goes left, so this cuts most paths of later tiles before their second phase);
+ *  - U: the search stops at a cost no assembly can improve on (the largest current value).
+ *
+ * Exactness: a copy within e edits of the read leaves at least one of e+1 disjoint tiles
+ * untouched, so up to (complete tiles - 1) edits nothing is missed (pigeonhole); beyond that a
+ * copy is found only if some tile occurs in it exactly. The tile loop stops once every value is
+ * <= the number of complete tiles so far, and an end state cheaper than that number is not
+ * located (its copies were found from an earlier tile). A tile is complete unless skipped as
+ * repetitive or truncated by --ed-budget expanded states (then only values below the cost it
+ * reached are proven). Values above --ed-max are NA. The best over the panel (ed_best) is the
+ * cheapest whole-read alignment seen, kept even when its copies were not all located.
+ */
+static int ed_prof = 0;   // environment RB3_ED_PROF set: work totals on stderr at the end (development aid)
+static int64_t ed_cnt[5]; // reads, tiles searched, expanded states, locate calls, located rows
+typedef struct { rb3_sai_t ik; int32_t i, fr, le; int16_t c; int8_t dir, stg; } ed_st_t; // dir: 0 right, 1 left; stg: phase 0/1; le: last edit position
+typedef struct { int64_t base; int32_t n; int32_t *nxt; } ed_frame_t;
+typedef struct { int64_t x0, x1, size; int32_t i; } ed_key_t; // x[0] alone does not tell text lengths apart
+static inline khint_t ed_key_hash(ed_key_t k) { return kh_hash_uint64((uint64_t)k.x0 * 0x9E3779B97F4A7C15ULL ^ (uint64_t)k.x1 ^ (uint64_t)k.size << 40 ^ (uint64_t)k.i << 20); }
+#define ed_key_eq(a, b) ((a).x0 == (b).x0 && (a).x1 == (b).x1 && (a).size == (b).size && (a).i == (b).i)
+KHASHL_SET_INIT(KH_LOCAL, ed_vis_t, ed_vis, ed_key_t, ed_key_hash, ed_key_eq)
+
+typedef struct {
+	void *km;
+	int32_t cap;
+	int32_t *n_q, *m_q; // bucket queue, one stack per cost 0..cap
+	ed_st_t **q;
+	ed_frame_t *fr;
+	int32_t n_fr, m_fr;
+	ed_vis_t *vis;
+	rb3_pos_t *pos;
+	int flags;        // RB3_ED_F_LOC
+	int32_t gbest;    // cheapest whole-read alignment seen
+	int32_t *lcross, *rcross; // [len+1]: lcross[st_u] = en_u and rcross[en_u] = st_u for every complete tile u, else -1
+} ed_ctx_t;
+
+static inline int32_t ed_uf_find(int32_t *nxt, int32_t x)
+{
+	int32_t r = x, y;
+	while (nxt[r] != r) r = nxt[r];
+	while (nxt[x] != r) y = nxt[x], nxt[x] = r, x = y; // path compression
+	return r;
+}
+
+static inline int ed_dominated(const ed_frame_t *f, int64_t x, int64_t size) // every row of [x,x+size) has its cost
+{
+	return ed_uf_find(f->nxt, (int32_t)(x - f->base)) >= x - f->base + size;
+}
+
+static inline void ed_finalize(ed_frame_t *f, int64_t x, int64_t size)
+{
+	int32_t r, hi = (int32_t)(x - f->base + size);
+	for (r = ed_uf_find(f->nxt, (int32_t)(x - f->base)); r < hi; r = ed_uf_find(f->nxt, r))
+		f->nxt[r] = r + 1;
+}
+
+static int32_t ed_new_frame(ed_ctx_t *e, int64_t base, int64_t n)
+{
+	ed_frame_t *f;
+	int32_t k;
+	Kgrow(e->km, ed_frame_t, e->fr, e->n_fr, e->m_fr);
+	f = &e->fr[e->n_fr];
+	f->base = base, f->n = (int32_t)n;
+	f->nxt = Kmalloc(e->km, int32_t, n + 1);
+	for (k = 0; k <= n; ++k) f->nxt[k] = k;
+	return e->n_fr++;
+}
+
+static inline void ed_push(ed_ctx_t *e, const rb3_sai_t *ik, int32_t i, int32_t c, int32_t le, int dir, int stg, int32_t fr)
+{
+	ed_st_t *s;
+	if (c > e->cap) return;
+	Kgrow(e->km, ed_st_t, e->q[c], e->n_q[c], e->m_q[c]);
+	s = &e->q[c][e->n_q[c]++];
+	s->ik = *ik, s->i = i, s->c = c, s->le = le, s->dir = dir, s->stg = stg, s->fr = fr;
+}
+
+static inline int32_t ed_max_val(const uint8_t *v, int32_t n, int32_t cap) // NA counts as cap+1
+{
+	int32_t a, m = 0;
+	for (a = 0; a < n; ++a) {
+		int32_t x = v[a] == RB3_ED_NA? cap + 1 : v[a];
+		m = x > m? x : m;
+	}
+	return m;
+}
+
+// One tile [st,en) with exact interval seed. Updates v[]; returns 1 if the search was truncated.
+static int ed_tile(ed_ctx_t *e, const pipeline_t *p, const uint8_t *q, int32_t len, const rb3_sai_t *seed,
+				   int32_t st, int32_t en, int32_t t_ok, uint8_t *v)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_mopt_t *o = p->opt;
+	int32_t n_g = p->ed_gtab->n_gamete, c, U, k, d0 = st > 0;
+	int64_t n_exp = 0;
+	int trunc = 0;
+	for (k = 0; k < e->n_fr; ++k) kfree(e->km, e->fr[k].nxt);
+	e->n_fr = 0;
+	ed_vis_clear(e->vis);
+	for (c = 0; c <= e->cap; ++c) e->n_q[c] = 0;
+	// The first phase goes left when there is anything to the left: complete tiles lie there (tiles are
+	// processed left to right), so alignments matching one of them exactly are dropped before the second phase.
+	ed_new_frame(e, seed->x[d0], seed->size); // frame 0: rows of the tile's x[0] (right first) or x[1] (left first)
+	ed_push(e, seed, d0? st - 1 : en, 0, d0? INT32_MAX : -1, d0, 0, 0);
+	U = ed_max_val(v, n_g, e->cap);
+	for (c = 0; c <= e->cap && c < U; ++c) {
+		while (e->n_q[c] > 0 && c < U) {
+			ed_st_t s = e->q[c][--e->n_q[c]];
+			rb3_sai_t ok[RB3_ASIZE];
+			ed_frame_t *fr = &e->fr[s.fr];
+			ed_key_t key;
+			int absent, b, back = s.dir, nd;
+			if (ed_dominated(fr, s.ik.x[back], s.ik.size)) continue;
+			if (s.dir? e->lcross[s.i + 1] >= 0 && s.le >= e->lcross[s.i + 1] : e->rcross[s.i] >= 0 && s.le < e->rcross[s.i])
+				continue; // matched a complete tile exactly: that tile's own search covered these alignments
+			key.x0 = s.ik.x[0], key.x1 = s.ik.x[1], key.size = s.ik.size, key.i = (s.i + 2) * 4 + s.stg * 2 + s.dir;
+			ed_vis_put(e->vis, key, &absent);
+			if (!absent) continue;
+			if (s.dir? s.i < 0 : s.i == len) { // this side is aligned: these copies' cost on it is c
+				ed_finalize(fr, s.ik.x[back], s.ik.size);
+				if (s.stg == 0 && (s.dir? en < len : st > 0)) { // the other side, in a frame over this interval's rows
+					int32_t nf = ed_new_frame(e, s.ik.x[!s.dir], s.ik.size);
+					ed_push(e, &s.ik, s.dir? en : st - 1, c, s.dir? -1 : INT32_MAX, !s.dir, 1, nf);
+					continue;
+				}
+				// the whole read is aligned: locate these copies
+				if (c < e->gbest) e->gbest = c;
+				if (c >= t_ok) { // (every copy within t_ok-1 edits was found from an earlier tile)
+					int64_t np, j;
+					np = rb3_ssa_multi(e->km, f, f->ssa, s.ik.x[0], s.ik.x[0] + s.ik.size, o->ed_max_loc, e->pos);
+					if (ed_prof) __sync_fetch_and_add(&ed_cnt[3], 1), __sync_fetch_and_add(&ed_cnt[4], np);
+					if (np < s.ik.size) e->flags |= RB3_ED_F_LOC;
+					for (j = 0; j < np; ++j) {
+						int32_t g = p->ed_gtab->sid2g[e->pos[j].sid >> 1];
+						if (g >= 0 && (v[g] == RB3_ED_NA || c < v[g])) v[g] = c;
+					}
+					U = ed_max_val(v, n_g, e->cap);
+				}
+				continue;
+			}
+			if (++n_exp > o->ed_budget) { trunc = 1; goto end_tile; }
+			rb3_fmd_extend(f, &s.ik, ok, back);
+			nd = s.dir? s.i - 1 : s.i + 1;
+			for (b = 1; b <= 4; ++b) {
+				const rb3_sai_t *ch = &ok[back? b : rb3_comp(b)];
+				if (ch->size == 0) continue;
+				if (b == q[s.i]) ed_push(e, ch, nd, c, s.le, s.dir, s.stg, s.fr); // match
+				else ed_push(e, ch, nd, c + 1, s.i, s.dir, s.stg, s.fr);       // substitution
+				ed_push(e, ch, s.i, c + 1, s.i, s.dir, s.stg, s.fr); // read deletion: the copy has an extra base b
+			}
+			ed_push(e, &s.ik, nd, c + 1, s.i, s.dir, s.stg, s.fr); // read insertion (or an unaligned base)
+		}
+	}
+end_tile:
+	if (ed_prof) __sync_fetch_and_add(&ed_cnt[1], 1), __sync_fetch_and_add(&ed_cnt[2], n_exp);
+	return trunc;
+}
+
+// Best edit distance of read q to every assembly (v[0..n_gamete), RB3_ED_NA = none); returns RB3_ED_F_* flags.
+static int refmap_ed(void *km, const pipeline_t *p, int32_t len, const uint8_t *q, uint8_t *v, uint8_t *gbest)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_mopt_t *o = p->opt;
+	int32_t n_g = p->ed_gtab->n_gamete, n_t = o->ed_tiles, pst, t_ok = 0, n_done = 0, c, k;
+	int flags = 0;
+	ed_ctx_t e;
+	if (ed_prof) __sync_fetch_and_add(&ed_cnt[0], 1);
+	memset(v, RB3_ED_NA, n_g);
+	*gbest = RB3_ED_NA;
+	if (n_t > len / RB3_ED_MIN_TILE) n_t = len / RB3_ED_MIN_TILE;
+	if (n_t <= 0) return RB3_ED_F_NOSEED;
+	memset(&e, 0, sizeof(e));
+	e.km = km, e.cap = o->ed_cap, e.gbest = RB3_ED_NA;
+	e.n_q = Kcalloc(km, int32_t, e.cap + 1), e.m_q = Kcalloc(km, int32_t, e.cap + 1);
+	e.q = Kcalloc(km, ed_st_t*, e.cap + 1);
+	e.vis = ed_vis_init2(km);
+	e.pos = Kmalloc(km, rb3_pos_t, o->ed_max_loc);
+	e.lcross = Kmalloc(km, int32_t, len + 1), e.rcross = Kmalloc(km, int32_t, len + 1);
+	for (k = 0; k <= len; ++k) e.lcross[k] = e.rcross[k] = -1;
+	for (pst = 0; len - pst >= RB3_ED_MIN_TILE; ) {
+		// tile [pst,en): up to the next of the n_t nominal boundaries, extended to the right while it occurs more
+		// than --ed-max-occ times (repeats); tiles stay disjoint
+		int32_t en0, en, i, a, bad = 0;
+		rb3_sai_t ik, ok[RB3_ASIZE];
+		for (k = 1; k <= n_t; ++k)
+			if ((en0 = (int32_t)((int64_t)len * k / n_t)) >= pst + RB3_ED_MIN_TILE) break;
+		if (k > n_t) en0 = len;
+		if (n_done > 0) { // stop once every value is proven: a cheaper copy would avoid one of the t_ok complete tiles
+			for (a = 0; a < n_g; ++a)
+				if (v[a] == RB3_ED_NA || v[a] > t_ok) break;
+			if (a == n_g) break;
+		}
+		ik.size = 0;
+		for (i = pst; i < len; ++i) { // the tile's exact interval, by forward extension
+			if (q[i] < 1 || q[i] > 4) { bad = 1; break; }
+			if (i == pst) rb3_fmd_set_intv(f, q[i], &ik);
+			else rb3_fmd_extend(f, &ik, ok, 0), ik = ok[rb3_comp(q[i])];
+			if (ik.size == 0 || (i + 1 >= en0 && ik.size <= o->ed_max_occ)) break;
+		}
+		en = i < len? i + 1 : len;
+		++n_done;
+		if (bad) { pst = en > en0? en : en0; continue; } // an N: not a usable seed
+		if (ik.size == 0 && en <= en0) { // no copy carries [pst,en0) exactly: complete with no work
+			e.lcross[pst] = en0, e.rcross[en0] = pst, ++t_ok, pst = en0;
+			continue;
+		}
+		if (pst == 0 && en == len && ik.size > o->ed_max_occ) { // the whole read occurs too often to search: cost 0, located in part
+			int64_t np = rb3_ssa_multi(km, f, f->ssa, ik.x[0], ik.x[0] + ik.size, o->ed_max_loc, e.pos), j;
+			for (j = 0; j < np; ++j)
+				if ((a = p->ed_gtab->sid2g[e.pos[j].sid >> 1]) >= 0) v[a] = 0;
+			e.gbest = 0, flags |= RB3_ED_F_REP | (np < ik.size? RB3_ED_F_LOC : 0);
+			break;
+		}
+		if (ik.size == 0 || ik.size > o->ed_max_occ) { flags |= RB3_ED_F_REP, pst = en > en0? en : en0; continue; }
+		if (ed_tile(&e, p, q, len, &ik, pst, en, t_ok, v)) flags |= RB3_ED_F_TRUNC;
+		else e.lcross[pst] = en, e.rcross[en] = pst, ++t_ok;
+		pst = en;
+	}
+	if (n_done == 0) flags |= RB3_ED_F_NOSEED;
+	flags |= e.flags | (t_ok < 255? t_ok : 255) << 8;
+	*gbest = e.gbest;
+	for (c = 0; c < e.n_fr; ++c) kfree(km, e.fr[c].nxt);
+	for (c = 0; c <= e.cap; ++c) kfree(km, e.q[c]);
+	kfree(km, e.fr); kfree(km, e.q); kfree(km, e.n_q); kfree(km, e.m_q); kfree(km, e.pos); kfree(km, e.lcross); kfree(km, e.rcross);
+	ed_vis_destroy(e.vis);
+	return flags;
 }
 
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
@@ -1376,6 +1659,109 @@ static void refmap_pair_event(const pipeline_t *p, const m_seq_t *s, const refma
 	free(g);
 }
 
+// --ed-stats / --ed-hist: one row per read (mate "1"/"2" with --paired, "." single-end), plus one
+// pair row (mate "P", fragment name, per-assembly sums) after mate 2. The .npy form has one row
+// per read (input order; no pair rows): the per-assembly values, then the flags.
+static void refmap_ed_row(pipeline_t *p, kstring_t *out, const char *name, int name_len, const char *mate, const uint8_t *v, int gbest, int flags)
+{
+	int32_t a, n = p->ed_gtab->n_gamete, nb, w, best;
+	char *nm;
+	if (p->ed_fp == 0) return;
+	if (p->ed_npy) { // every read gets a row (input order); pairs do not
+		if (mate[0] == 'P') return;
+		fwrite(v, 1, n, p->ed_fp);
+		fputc(gbest, p->ed_fp);
+		fputc((flags & 0x1f) | ((flags >> 8) < 7? flags >> 8 : 7) << 5, p->ed_fp); // flag bits, complete tiles (max 7) << 5
+		++p->ed_rows;
+		return;
+	}
+	if (flags & RB3_ED_F_SKIP) return; // not in the --ed-frac subsample
+	best = rb3_ed_summary(v, n, gbest, &nb, &w);
+	out->l = 0;
+	nm = RB3_MALLOC(char, name_len + 1); // rb3_sprintf_lite has no %.*s
+	memcpy(nm, name, name_len), nm[name_len] = 0;
+	rb3_sprintf_lite(out, "%s\t%s\t", nm, mate);
+	free(nm);
+	if (best == RB3_ED_NA) rb3_sprintf_lite(out, "NA\t0\t"); else rb3_sprintf_lite(out, "%d\t%d\t", best, nb);
+	if (w == RB3_ED_NA) rb3_sprintf_lite(out, "NA\t"); else rb3_sprintf_lite(out, "%d\t", w);
+	if ((flags & 0xff) == 0) rb3_sprintf_lite(out, ".");
+	if (flags & RB3_ED_F_TRUNC) rb3_sprintf_lite(out, "T");
+	if (flags & RB3_ED_F_REP) rb3_sprintf_lite(out, "R");
+	if (flags & RB3_ED_F_NOSEED) rb3_sprintf_lite(out, "N");
+	if (flags & RB3_ED_F_LOC) rb3_sprintf_lite(out, "L");
+	rb3_sprintf_lite(out, "\t%d", flags >> 8);
+	for (a = 0; a < n; ++a)
+		if (v[a] == RB3_ED_NA) rb3_sprintf_lite(out, "\tNA"); else rb3_sprintf_lite(out, "\t%d", v[a]);
+	rb3_sprintf_lite(out, "\n");
+	fputs(out->s, p->ed_fp);
+}
+
+static void refmap_ed_write(pipeline_t *p, const step_t *t, int32_t j)
+{
+	const m_seq_t *s = &t->seq[j];
+	const refmap_rst_t *r = &t->refmap[j];
+	kstring_t out = {0,0,0};
+	const char *nm = s->name? s->name : "?";
+	if (r->ed == 0) return;
+	refmap_ed_row(p, &out, nm, (int)strlen(nm), p->opt->paired? (j&1? "2" : "1") : ".", r->ed, r->ed_best, r->ed_flags);
+	if (p->ed_hist && !(r->ed_flags & RB3_ED_F_SKIP)) rb3_edhist_add(p->ed_hist, RB3_ED_UNIT_READ, r->ed, r->ed_best, r->ed_flags);
+	if (p->opt->paired && (j&1)) { // the pair: per-assembly sum of the mates
+		const refmap_rst_t *a = &t->refmap[j-1];
+		uint8_t *v = RB3_MALLOC(uint8_t, p->ed_gtab->n_gamete);
+		int32_t ta = a->ed_flags >> 8, tb = r->ed_flags >> 8, fl = ((a->ed_flags | r->ed_flags) & 0xff) | (ta < tb? ta : tb) << 8;
+		rb3_ed_pair(a->ed, r->ed, p->ed_gtab->n_gamete, v);
+		refmap_ed_row(p, &out, nm, s->name? rb3_pe_name_len(s->name) : 1, "P", v, RB3_ED_NA, fl); // pair best: one assembly for both mates
+		if (p->ed_hist && !(fl & RB3_ED_F_SKIP)) rb3_edhist_add(p->ed_hist, RB3_ED_UNIT_PAIR, v, RB3_ED_NA, fl);
+		free(v);
+	}
+	free(out.s);
+}
+
+// --ed-stats/--ed-hist: finish the .npy (header with the row count, column sidecar), write the
+// histograms, log the summary, free everything.
+static void refmap_ed_finish(pipeline_t *p)
+{
+	const rb3_mopt_t *o = p->opt;
+	int32_t a, n = p->ed_gtab->n_gamete;
+	if (p->ed_fp && p->ed_npy) {
+		char *fn = RB3_MALLOC(char, strlen(o->ed_stats_fn) + 16);
+		FILE *fp;
+		fflush(p->ed_fp);
+		if (fseek(p->ed_fp, 0, SEEK_SET) == 0) rb3_ed_npy_header(p->ed_fp, p->ed_rows, n + 2);
+		else if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ed-stats .npy is not seekable; the header is wrong\n");
+		sprintf(fn, "%s.cols.tsv", o->ed_stats_fn);
+		if ((fp = fopen(fn, "w")) != 0) {
+			for (a = 0; a < n; ++a) fprintf(fp, "%d\t%s\n", a, p->ed_gtab->name[a]);
+			fprintf(fp, "%d\tbest\n%d\tflags\n", n, n + 1);
+			fclose(fp);
+		}
+		free(fn);
+	}
+	if (p->ed_fp) fclose(p->ed_fp);
+	if (ed_prof > 0) fprintf(stderr, "EDPROF reads %ld tiles %ld expanded %ld locate_calls %ld located_rows %ld\n", (long)ed_cnt[0], (long)ed_cnt[1], (long)ed_cnt[2], (long)ed_cnt[3], (long)ed_cnt[4]);
+	if (p->ed_hist) {
+		FILE *fp = fopen(o->ed_hist_fn, "w");
+		if (fp == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write --ed-hist '%s'\n", o->ed_hist_fn);
+		} else {
+			rb3_edhist_write(fp, p->ed_hist, (const char *const*)p->ed_gtab->name, o->err_alpha);
+			fclose(fp);
+		}
+		if (rb3_verbose >= 3 && p->ed_hist->n[0] > 0) {
+			const rb3_edhist_t *h = p->ed_hist;
+			int64_t cum = 0;
+			int32_t k;
+			fprintf(stderr, "[M::%s] %ld reads, best edits <=k for k=0..3:", __func__, (long)h->n[0]);
+			for (k = 0; k <= 3 && k <= h->cap[0]; ++k)
+				cum += h->best[0][k], fprintf(stderr, " %.2f%%", 100.0 * cum / h->n[0]);
+			fprintf(stderr, "; NA %.2f%%; %ld truncated, %ld with a repetitive tile\n", 100.0 * h->best[0][h->cap[0] + 1] / h->n[0],
+					(long)h->n_trunc[0], (long)h->n_rep[0]);
+		}
+		rb3_edhist_destroy(p->ed_hist);
+	}
+	rb3_gtab_destroy(p->ed_gtab);
+}
+
 static void write_refmap(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -1411,9 +1797,11 @@ static void write_refmap(step_t *t)
 				refmap_pair_event(p, s, r, &t->refmap[j ^ 1]);
 			refmap_count_hit(p, r->status);
 		}
+		if (p->ed_gtab) refmap_ed_write((pipeline_t*)p, t, j);
 	}
 	for (j = 0; j < t->n_seq; ++j) { // after all rows: a pair event reads its mate's gametes
 		refmap_rst_t *r = &t->refmap[j];
+		free(r->ed);
 		free(r->assemblies);
 		free(r->gametes);
 		free(r->proj_rsid);
@@ -2911,6 +3299,14 @@ static ko_longopt_t long_options[] = {
 	{ "exact-agree-dist",    ko_required_argument, 396 },
 	{ "min-core-len",        ko_required_argument, 397 },
 	{ "filter-stats",        ko_no_argument,       398 },
+	{ "ed-stats",            ko_required_argument, 400 },
+	{ "ed-hist",             ko_required_argument, 401 },
+	{ "ed-max",              ko_required_argument, 402 },
+	{ "ed-tiles",            ko_required_argument, 403 },
+	{ "ed-max-occ",          ko_required_argument, 404 },
+	{ "ed-budget",           ko_required_argument, 405 },
+	{ "ed-max-loc",          ko_required_argument, 406 },
+	{ "ed-frac",             ko_required_argument, 407 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -3057,6 +3453,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 388) opt.err_clip_rej = 1;                     // refmap: FILTER reads with a contig-end overhang
 		else if (c == 389) opt.err_cigar = 1;                        // refmap: extended CIGAR column
 		else if (c == 379) opt.min_match_frac = atof(o.arg);         // refmap: min '=' bases / read length
+		else if (c == 400) opt.ed_stats_fn = o.arg;                  // refmap: per-read edit distance per assembly
+		else if (c == 401) opt.ed_hist_fn = o.arg;                   // refmap: edit-distance histograms
+		else if (c == 402) opt.ed_cap = atoi(o.arg);                 // refmap: edit cap
+		else if (c == 403) opt.ed_tiles = atoi(o.arg);               // refmap: exact tiles per read
+		else if (c == 404) opt.ed_max_occ = rb3_parse_num(o.arg);    // refmap: repetitive-tile cutoff
+		else if (c == 405) opt.ed_budget = rb3_parse_num(o.arg);     // refmap: search states per tile
+		else if (c == 406) opt.ed_max_loc = atoi(o.arg);             // refmap: rows located per aligned interval
+		else if (c == 407) opt.ed_frac = atof(o.arg);                // refmap: subsample fraction
 		else if (c == 374) opt.max_locate = atoi(o.arg);             // refmap: occurrences located per read
 		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
 		else if (c == 390) opt.placed_min_chr_agree = atof(o.arg);
@@ -3203,6 +3607,18 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --min-core-len=INT  EXACT/PLACED: min exact-match length (SMEM core on fallback) (0 = off)\n");
 			fprintf(stderr, "  --filter-stats    append core_len,n_proj,n_chr_agree,spread,n_ref_hits,a_proj,a_agree,\n");
 			fprintf(stderr, "                    filter-reason columns to each output row\n");
+			fprintf(stderr, "  Edit-distance statistics (off by default; placement output is unchanged):\n");
+			fprintf(stderr, "  --ed-stats=FILE   per read (and per pair with --paired): best edit distance (subs + indel bases\n");
+			fprintf(stderr, "                    + unaligned read bases) to EACH assembly, NA = none within --ed-max; TSV,\n");
+			fprintf(stderr, "                    or a uint8 matrix (255 = NA, last column = flags) if FILE ends in .npy\n");
+			fprintf(stderr, "  --ed-hist=FILE    histograms: best over the panel, per assembly, closest distinct wrong copy,\n");
+			fprintf(stderr, "                    assemblies at the best value, and a sequencing-error fit of the best\n");
+			fprintf(stderr, "  --ed-max=INT      edit cap [%d]\n", opt.ed_cap);
+			fprintf(stderr, "  --ed-tiles=INT    disjoint exact seeds per read; exact up to INT-1 edits [%d]\n", opt.ed_tiles);
+			fprintf(stderr, "  --ed-max-occ=NUM  skip a tile occurring more than NUM times (repeats) [%ld]\n", (long)opt.ed_max_occ);
+			fprintf(stderr, "  --ed-budget=NUM   expanded search states per tile [%ld]\n", (long)opt.ed_budget);
+			fprintf(stderr, "  --ed-max-loc=INT  occurrences located per aligned interval [%d]\n", opt.ed_max_loc);
+			fprintf(stderr, "  --ed-frac=FLOAT   compute for a fixed hash subsample of this fraction of reads (pairs) [%g]\n", opt.ed_frac);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -3345,6 +3761,20 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (opt.err_calib < 1 || opt.err_alpha <= 0.0 || opt.err_alpha >= 1.0) err = "--err-calib must be >= 1 and 0 < --err-alpha < 1";
 		else if ((opt.err_max_ev == -2 || opt.err_hist_fn) && (argc - o.ind < 2 || strcmp(argv[o.ind + 1], "-") == 0))
 			err = "--err-max-events=auto/--err-hist read the input twice: give a file, not stdin";
+		if (err) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
+			return 1;
+		}
+	}
+
+	if (opt.ed_stats_fn || opt.ed_hist_fn) {
+		const char *err = 0;
+		if (opt.algo != RB3_SA_REFMAP) err = "--ed-stats/--ed-hist apply to refmap only";
+		else if (opt.ed_cap < 0 || opt.ed_cap > RB3_ED_MAX_CAP) err = "--ed-max must be in [0, 60]";
+		else if (opt.ed_tiles < 1 || opt.ed_max_loc < 1 || opt.ed_max_occ < 1 || opt.ed_budget < 1)
+			err = "--ed-tiles, --ed-max-occ, --ed-budget and --ed-max-loc must be >= 1";
+		else if (!(opt.ed_frac > 0.0 && opt.ed_frac <= 1.0)) err = "--ed-frac must be in (0, 1]";
+		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--ed-stats/--ed-hist do not support --walk-mode=per-assembly";
 		if (err) {
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
@@ -3519,6 +3949,34 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		&& opt.max_occ <= opt.max_locate && opt.kmer_len <= 0 && rb3_verbose >= 2)
 		fprintf(stderr, "WARNING: --max-locate=%d has no effect: --max-occ=%ld already drops (MULTI) every read with more "
 						"occurrences, so all occurrences of the reads kept are located\n", opt.max_locate, (long)opt.max_occ);
+	p.ed_gtab = 0, p.ed_fp = 0, p.ed_npy = 0, p.ed_rows = 0, p.ed_hist = 0;
+	if (opt.algo == RB3_SA_REFMAP && (opt.ed_stats_fn || opt.ed_hist_fn)) { // --ed-stats/--ed-hist
+		size_t l = opt.ed_stats_fn? strlen(opt.ed_stats_fn) : 0;
+		p.ed_gtab = rb3_gtab_build(p.fmi.sid); // a separate table: p.gtab stays as the placement flags left it
+		ed_prof = getenv("RB3_ED_PROF") != 0;
+		if (opt.ed_stats_fn) {
+			p.ed_npy = (l >= 4 && strcmp(opt.ed_stats_fn + l - 4, ".npy") == 0);
+			p.ed_fp = fopen(opt.ed_stats_fn, p.ed_npy? "wb" : "w");
+			if (p.ed_fp == 0) {
+				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write --ed-stats '%s'\n", opt.ed_stats_fn);
+				return 1;
+			}
+			if (p.ed_npy) rb3_ed_npy_header(p.ed_fp, 0, p.ed_gtab->n_gamete + 2); // rewritten at the end
+			else {
+				int32_t a;
+				fprintf(p.ed_fp, "#ropebwt3 refmap --ed-stats: best edit distance (substitutions + indel bases + unaligned read bases)\n");
+				fprintf(p.ed_fp, "#to each assembly; NA = none within cap %d reachable from %d exact tiles; best = over the panel,\n", opt.ed_cap, opt.ed_tiles);
+				fprintf(p.ed_fp, "#n_best = assemblies at best, wrong = closest distinct wrong copy (> best+1); flags T truncated,\n");
+				fprintf(p.ed_fp, "#R repetitive tile skipped, N no usable tile, L some copies not located; tiles = complete exact\n");
+				fprintf(p.ed_fp, "#tiles: a value <= tiles is exact, a larger one an upper bound, NA none found <= cap (or below\n");
+				fprintf(p.ed_fp, "#tiles); mate . single-end, 1/2 mates, P pair (per-assembly sum of the mates)\n");
+				fprintf(p.ed_fp, "read\tmate\tbest\tn_best\twrong\tflags\ttiles");
+				for (a = 0; a < p.ed_gtab->n_gamete; ++a) fprintf(p.ed_fp, "\t%s", p.ed_gtab->name[a]);
+				fputc('\n', p.ed_fp);
+			}
+		}
+		if (opt.ed_hist_fn) p.ed_hist = rb3_edhist_init(p.ed_gtab->n_gamete, opt.ed_cap);
+	}
 	p.err_edit = (opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac > 0.0);
 	p.err_on = (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || p.err_edit);
 	p.err_cut = opt.err_max_ev >= 0? opt.err_max_ev : -1;
@@ -3577,6 +4035,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}
 	if (p.ps4g_per_read_fp) fclose(p.ps4g_per_read_fp);
+	if (p.ed_gtab) refmap_ed_finish(&p);
 	rb3_bed_destroy(p.label_bed);
 	rb3_gtab_destroy(p.gtab);
 	if (p.ref_seq) {
