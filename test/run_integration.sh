@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 RB=../ropebwt3
 DIR=../docs/examples
 TMP=tmp
+# valgrind: ignore LLVM libomp runtime state (clang builds); see valgrind-libomp.supp
+export VALGRIND_OPTS="${VALGRIND_OPTS:+$VALGRIND_OPTS }--suppressions=$(pwd)/valgrind-libomp.supp"
 IDX="$TMP/pangenome.fmd"
 
 n_pass=0
