@@ -1022,6 +1022,8 @@ if [ -n "$NPY_PY" ]; then
 	fi
 else
 	echo "SKIP: simulated-pangenome extract check needs a python3 with numpy" >&2
+fi
+
 # --- 16. refmap error-profile / span filters (--err-*, --max-ref-span, --pe-drop-disc) ---
 # docs/examples/err/ (make_err_fixture.py): 150 bp B73 reads hand-edited to a known number of
 # events, on the --paired fixture index. Every region used is identical in all four genomes.
@@ -1119,6 +1121,7 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$PIDX" "$ED/r1.fa" "$ED/r2.fa" > /dev/null 2>"$TMP/ed_vg.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind (edit mode) reported errors or leaks; see $TMP/ed_vg.log"; fi
 fi
+
 # --- 17. refmap --ed-stats / --ed-hist: best edit distance to each assembly ---
 # Same fixtures: the err reads come from a region every genome carries unchanged, so each
 # assembly's value is the read's known edit count; P1/1 is Mo17+Ki3-only sequence, P1/2 sits on
@@ -1167,6 +1170,29 @@ check_eq "--ed-stats on chain is an error" "$?$(grep -c 'apply to refmap only' "
 check_eq "--ed-max above 60 is an error" "$?$(grep -c 'ed-max must be' "$TMP/ed_e2.log")" "11"
 "$RB" $EDM --ed-hist="$TMP/x.hist" --ed-frac=0 "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/ed_e3.log"
 check_eq "--ed-frac=0 is an error" "$?" "1"
+
+# --- 18. refmap read filters (preset E/F) and the full recommended (GRITS) flag set ---
+RFM="refmap --ref-prefix=B73 --lift=$PLIFT -t2"
+PROMF="--max-occ=-1 -l 19 --lift-local-win=20000 --lift-chain-nb=3 --lift-chain-interp --placed-min-chr-agree=1 --exact-min-asm-agree=1 --exact-max-ref-hits=1 --placed-max-spread=1000000 --min-core-len=100 --err-noclip --err-max-events=1"
+"$RB" $RFM "$PIDX" "$PE/r1.fa" > "$TMP/rf_off.tsv" 2>/dev/null
+"$RB" $RFM --placed-min-chr-agree=0 --exact-min-asm-agree=0 --exact-max-ref-hits=0 --placed-max-spread=0 --min-core-len=0 \
+	"$PIDX" "$PE/r1.fa" > "$TMP/rf_zero.tsv" 2>/dev/null
+check_eq "read filters set to 0 = off: byte-identical to no flags" "$(cmp -s "$TMP/rf_off.tsv" "$TMP/rf_zero.tsv" && echo same)" "same"
+check_eq "--filter-stats appends 8 columns" "$("$RB" $RFM --filter-stats "$PIDX" "$PE/r1.fa" 2>/dev/null | awk -F'\t' '{print NF}' | sort -u)" \
+	"$(( $(awk -F'\t' '{print NF}' "$TMP/rf_off.tsv" | sort -u) + 8 ))"
+"$RB" $RFM --min-core-len=101 --filter-stats --ps4g="$TMP/rf_core.ps4g" "$PIDX" "$PE/r1.fa" > "$TMP/rf_core.tsv" 2>/dev/null
+check_eq "--min-core-len above the 100 bp reads: every EXACT read FILTERED with reason l" \
+	"$(awk -F'\t' '$2==100 && $3=="EXACT"' "$TMP/rf_core.tsv" | wc -l | tr -d ' ')/$(awk -F'\t' '$3=="FILTERED" && $NF=="l"' "$TMP/rf_core.tsv" | wc -l | tr -d ' ')" \
+	"0/$(awk -F'\t' '$2==100 && $3=="EXACT"' "$TMP/rf_off.tsv" | wc -l | tr -d ' ')"
+check_eq "FILTERED reads add nothing to --ps4g" "$(grep -v '^#' "$TMP/rf_core.ps4g" | awk 'NR>1{s+=$NF} END{print s+0}')" \
+	"$(awk -F'\t' '$3=="PLACED"' "$TMP/rf_core.tsv" | wc -l | tr -d ' ')"
+"$RB" $RFM $PROMF --filter-stats --err-stats --ps4g="$TMP/rf_prom.ps4g" --npy="$TMP/rf_prom.npy" --anchor-dist-npy \
+	"$PIDX" "$PE/r1.fa" > "$TMP/rf_prom.tsv" 2>"$TMP/rf_prom.log"
+check_eq "recommended GRITS flag set exits 0" "$?" "0"
+"$RB" $RFM --max-occ=-1 -l 19 "$PIDX" "$PE/r1.fa" > "$TMP/rf_base.tsv" 2>/dev/null
+check_eq "recommended flag set: the clean fixture loses no EXACT/PLACED read (vs the same --max-occ/-l, no filters)" \
+	"$(awk -F'\t' '$3=="EXACT"||$3=="PLACED"' "$TMP/rf_prom.tsv" | wc -l | tr -d ' ')" \
+	"$(awk -F'\t' '$3=="EXACT"||$3=="PLACED"' "$TMP/rf_base.tsv" | wc -l | tr -d ' ')"
 
 # --- memory safety, if valgrind is available ---
 if command -v valgrind >/dev/null 2>&1; then
@@ -1229,6 +1255,11 @@ if command -v valgrind >/dev/null 2>&1; then
 		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired --ed-stats="$TMP/vg_ed.npy" --ed-hist="$TMP/vg_ed.hist" --ed-tiles=6 \
 		--ed-budget=50 --ed-max-loc=1 -K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_ed.log"
 	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on refmap --ed-stats"; cat "$TMP/valgrind_ed.log" >&2; fi
+	valgrind --error-exitcode=99 --leak-check=full -q \
+		"$RB" refmap --ref-prefix=B73 --lift="$TMP/pe.lift" --paired $PROMF --filter-stats --err-stats --err-cigar \
+		--ed-stats="$TMP/vg_prom_ed.tsv" --ed-hist="$TMP/vg_prom_ed.hist" --ps4g "$TMP/vg_prom.ps4g" --npy "$TMP/vg_prom.npy" --anchor-dist-npy \
+		-K 2000 -t2 "$TMP/pe.fmd" "$DIR/pe/r1.fa" "$DIR/pe/r2.fa" > /dev/null 2>"$TMP/valgrind_prom.log"
+	if [ $? -eq 0 ]; then pass; else fail "valgrind reported errors or leaks on the recommended flag set + --ed-stats"; cat "$TMP/valgrind_prom.log" >&2; fi
 else
 	echo "SKIP: valgrind not installed; skipping the memory-safety pass" >&2
 fi

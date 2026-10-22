@@ -47,6 +47,7 @@ echo CCAGGACCCCTGTCCAGTGTTAGACAGGAGCATGCAG | ./ropebwt3 sw -eN200 -Lm10 human579
   - [Placing a query on a reference genome](#refmap)
   - [RNAseq: chaining and PAV placement](#chain)
   - [Extracting sequence by coordinate](#extract)
+  - [GRITS pipeline](#grits)
   - [Deprecated](#deprecated)
   - [Indexing](#build)
   - [Binary BWT formats](#format)
@@ -700,6 +701,77 @@ vs 7.3 s); the extra time is mostly the LF walks for the flanks and windows (39.
 12.2 M steps), concentrated in the ends that fall back to the wide/walk search. With
 the shared boundary computation and the joint two-flank step the same run takes 47.0 s
 (`-t4`: 12.5 s; 71.6 M LF steps).
+
+### <a name="grits"></a>GRITS pipeline (reads → founder-support matrix)
+
+The alignment step of the GRITS founder-imputation pipeline is one `refmap` run
+over a pangenome index of the founder assemblies, with B73 as the reference. It
+writes the PS4G gamete-support file and the `--npy` matrix (count block +
+ternary/anchor-distance blocks) that the windowing and decoding code reads.
+Sequence names must be `<ASSEMBLY>_<CONTIG>` (e.g. `B73_chr1`, `Oh43_chr1`):
+the assembly (gamete) is the prefix before the first `_`.
+
+```sh
+# 1. index: BWT + sampled suffix array + sequence lengths
+ropebwt3 build -t24 -do pan.fmd B73.fa Oh43.fa ...      # one FASTA per assembly
+ropebwt3 ssa -t24 -s8 -o pan.fmd.ssa pan.fmd
+cat B73.fa Oh43.fa ... | seqtk comp | cut -f1,2 | gzip > pan.fmd.len.gz
+# 2. lift: 50-mer anchors every 200 bp (denser than the -k 100 -s 2000 default;
+#    the PLACED fix below relies on it)
+ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t24 -o pan.k50_s200.lift pan.fmd B73.fa
+# 3. optional: entry points for `extract` (coordinate-based sequence lookup)
+ropebwt3 isa pan.fmd
+# 4. align (the recommended, "promoted" command)
+ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 -l 19 --lift=pan.k50_s200.lift -t 16 \
+  --ps4g=raw.ps4g --npy=raw.npy --anchor-dist-npy --anchor-dist-thresh=2000 \
+  --lift-local-win=20000 --lift-chain-nb=3 --lift-chain-interp \
+  --placed-min-chr-agree=1 --exact-min-asm-agree=1 --exact-max-ref-hits=1 \
+  --placed-max-spread=1000000 --min-core-len=100 \
+  --err-noclip --err-max-events=1 \
+  pan.fmd reads.fq > raw.tsv 2> raw.log
+```
+
+Flag groups in step 4 (every one of them is opt-in; leaving a group out restores
+the earlier behaviour byte-for-byte):
+
+* **Base placement + model input**: `--max-occ=-1 -l 19` (drop reads occurring more
+  than once per taxon; 19 bp minimum anchor), `--ps4g`/`--npy`, and
+  `--anchor-dist-npy --anchor-dist-thresh=2000` (ternary read-sharing and
+  anchor-distance blocks, see [refmap](#refmap)). Add `--label-bed=FILE` for
+  simulated reads with known founders.
+* **PLACED fix** (`--lift-local-win=20000 --lift-chain-nb=3 --lift-chain-interp`):
+  project a PLACED read through the nearest *collinear* flanking lift anchors
+  (anchors not collinear with one of their next 3 are dropped as strays) and
+  interpolate across indels between them, instead of the wide ±500 kb median.
+  On simulated maize reads this cut PLACED reads projected >20 kb from their true
+  position from ~43% to ~26%.
+* **Preset E read filters** (`--placed-min-chr-agree=1 --exact-min-asm-agree=1
+  --exact-max-ref-hits=1 --placed-max-spread=1000000 --min-core-len=100`): a read
+  is reported as `FILTERED` and adds nothing to `--ps4g`/`--npy` when its PLACED
+  projections disagree on the reference sequence or spread over >1 Mb, when an
+  EXACT read has more than one reference copy or its assembly copies do not
+  project back to that copy, or when its exact core is shorter than 100 bp.
+  They target likely-misplaced (e.g. wrong-chromosome) reads. `--filter-stats` appends the
+  per-read features as extra columns.
+* **No-clip ≤1-edit filter** (`--err-noclip --err-max-events=1`): extend the read
+  from its exact core against one carrier, with no free read ends (a contig-end
+  overhang costs its length, a k-bp indel costs k), and keep only reads within
+  1 edit. `--err-stats`/`--err-cigar`/`--err-hist` report events, an extended
+  CIGAR and the calibration histogram; `--min-match-frac` and
+  `--err-clip-reject` are alternative cut-offs.
+
+Paired reads: add `--paired` and give both files (`pan.fmd r1.fq r2.fq`); a pair
+then contributes one PS4G/npy event (see [Paired-end reads](#refmap)).
+`--ed-stats=FILE[.npy]`/`--ed-hist=FILE` additionally write each read's best edit
+distance to every assembly; they do not change placement output.
+
+Design notes and measured results:
+[docs/err-profile](docs/err-profile/PLAN.md) (error-profile and span filters),
+[docs/edit-match-frac](docs/edit-match-frac/PLAN.md) (edit mode / no-clip),
+[docs/ed-stats](docs/ed-stats/PLAN.md) (per-assembly edit distance),
+[docs/paired-end](docs/paired-end/PLAN.md) (`--paired` for refmap/chain/mem/sw),
+[Extracting sequence by coordinate](#extract) (`isa`/`extract`), and
+[docs/lift-second-ssa.md](docs/lift-second-ssa.md) (the lift).
 
 ### <a name="deprecated"></a>Deprecated
 
