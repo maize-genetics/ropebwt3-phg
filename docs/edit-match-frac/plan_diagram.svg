@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="720" viewBox="0 0 1000 720" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="1000" height="720" fill="#ffffff"/>
+  <defs><marker id="ar" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#546e7a"/></marker></defs>
+  <text x="40" y="40" font-size="22" font-weight="bold" fill="#263238">refmap edit mode: no free read ends, match_frac</text>
+  <text x="40" y="64" font-size="13" fill="#546e7a">on with --err-noclip / --err-clip-reject / --err-cigar / --min-match-frac; off = byte-identical to 20e8ae0</text>
+  <rect x="790" y="18" width="22" height="16" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/><text x="820" y="31" font-size="13" fill="#263238">reused</text>
+  <rect x="790" y="40" width="22" height="16" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/><text x="820" y="53" font-size="13" fill="#263238">new</text>
+  <rect x="790" y="62" width="22" height="16" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/><text x="820" y="75" font-size="13" fill="#263238">modified</text>
+
+  <rect x="40" y="96" width="560" height="50" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="126" font-size="15" fill="#263238">Exact core: whole read, else longest SMEM</text>
+  <text x="616" y="126" font-size="12" fill="#546e7a">refmap_core</text>
+
+  <rect x="40" y="166" width="560" height="112" rx="8" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/>
+  <text x="56" y="190" font-size="15" font-weight="bold" fill="#1b5e20">Extend to BOTH read ends against one carrier</text>
+  <text x="56" y="212" font-size="13" fill="#263238">match: '='   substitution: X (1)</text>
+  <text x="56" y="232" font-size="13" fill="#263238">k-bp read insertion I / deletion D (k, k &lt;= 8)</text>
+  <text x="56" y="252" font-size="13" fill="#263238">carrier ends: rest of read = S (1 per base)</text>
+  <text x="56" y="270" font-size="12" fill="#546e7a">legacy: overhang = 1 event, 1-bp indels only</text>
+  <text x="616" y="212" font-size="12" fill="#546e7a">refmap_err_edits,</text>
+  <text x="616" y="230" font-size="12" fill="#546e7a">err_extend_ed, err_del_dfs</text>
+
+  <rect x="40" y="298" width="560" height="62" rx="8" fill="#e3f6e5" stroke="#43a047" stroke-width="2"/>
+  <text x="56" y="322" font-size="15" fill="#263238">edits = X + I + D + S;  match_frac = '=' / length</text>
+  <text x="56" y="344" font-size="13" fill="#263238">extended CIGAR, e.g. 75=1X74=, 145=5S</text>
+
+  <rect x="40" y="380" width="560" height="74" rx="8" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/>
+  <text x="56" y="404" font-size="15" fill="#263238">Filters (read, or pair sum):</text>
+  <text x="56" y="424" font-size="13" fill="#263238">--err-max-events (edits, e)  --min-match-frac (m)</text>
+  <text x="56" y="444" font-size="13" fill="#263238">--err-clip-reject: any overhang (C)</text>
+  <text x="616" y="420" font-size="12" fill="#546e7a">refmap_filter_pre</text>
+
+  <rect x="40" y="474" width="560" height="50" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="504" font-size="15" fill="#263238">--paired: classify + rescue; span / disc filters</text>
+  <text x="616" y="504" font-size="12" fill="#546e7a">refmap_pair_batch, refmap_filter_pairs</text>
+
+  <rect x="40" y="544" width="560" height="62" rx="8" fill="#efe6fb" stroke="#7e57c2" stroke-width="2"/>
+  <text x="56" y="568" font-size="15" fill="#263238">stdout: --err-stats + match_frac, --err-cigar</text>
+  <text x="56" y="590" font-size="13" fill="#263238">--err-hist: edit + match_frac histograms</text>
+  <text x="616" y="572" font-size="12" fill="#546e7a">write_refmap1, refmap_err_calibrate</text>
+
+  <rect x="40" y="626" width="560" height="50" rx="8" fill="#eceff1" stroke="#90a4ae" stroke-width="2"/>
+  <text x="56" y="656" font-size="15" fill="#263238">PS4G / npy: FILTERED reads add nothing</text>
+
+  <g stroke="#546e7a" stroke-width="2" marker-end="url(#ar)">
+    <line x1="320" y1="146" x2="320" y2="164"/><line x1="320" y1="278" x2="320" y2="296"/>
+    <line x1="320" y1="360" x2="320" y2="378"/><line x1="320" y1="454" x2="320" y2="472"/>
+    <line x1="320" y1="524" x2="320" y2="542"/><line x1="320" y1="606" x2="320" y2="624"/>
+  </g>
+</svg>
