@@ -35,5 +35,10 @@ experiments/ref-sensitivity/e4/*.log
 /test/*.o
 /test/test_ps4g
 /test/test_hitcount
+/test/test_lift
+/test/test_extract
 /test/output/
 /test/tmp/
+test/test_pairing
+test/test_errprof
+test/test_edstats

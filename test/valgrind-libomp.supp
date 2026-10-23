@@ -1,0 +1,20 @@
+# LLVM's OpenMP runtime (libomp, used when building with clang -fopenmp) keeps its thread-pool and
+# per-thread state allocated until process exit, which valgrind reports as "possibly lost". These are
+# runtime internals, not ropebwt3 leaks (gcc's libgomp does not show them). Only allocations whose
+# stack passes through libomp.so are suppressed; leaks in ropebwt3 code are still reported.
+{
+   llvm_libomp_runtime_state
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   fun:malloc
+   ...
+   obj:*libomp.so*
+}
+{
+   llvm_libomp_runtime_state_calloc
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   fun:calloc
+   ...
+   obj:*libomp.so*
+}

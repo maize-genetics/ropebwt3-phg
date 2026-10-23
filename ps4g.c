@@ -109,6 +109,11 @@ static int rb3_i32_cmp(const void *a, const void *b)
 
 void rb3_ps4g_acc_add(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes)
 {
+	rb3_ps4g_acc_add_w(acc, ref_sid, pos, gametes, n_gametes, 1);
+}
+
+void rb3_ps4g_acc_add_w(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const int32_t *gametes, int32_t n_gametes, int32_t weight)
+{
 	int32_t tmp[256], n, m, i;
 	int64_t bin, ei, gi;
 	if (ref_sid < 0 || n_gametes <= 0) return;
@@ -125,6 +130,8 @@ void rb3_ps4g_acc_add(rb3_ps4g_acc_t *acc, int64_t ref_sid, int64_t pos, const i
 	acc->ev_bin  = RB3_REALLOC(int64_t, acc->ev_bin,  acc->m_ev);
 	acc->ev_goff = RB3_REALLOC(int32_t, acc->ev_goff, acc->m_ev);
 	acc->ev_glen = RB3_REALLOC(int32_t, acc->ev_glen, acc->m_ev);
+	acc->ev_w    = RB3_REALLOC(int32_t, acc->ev_w,    acc->m_ev);
+	acc->ev_w[ei] = weight > 0? weight : 1;
 	acc->ev_ref_sid[ei] = ref_sid;
 	acc->ev_bin[ei] = bin;
 	acc->ev_goff[ei] = (int32_t)acc->n_garena;
@@ -141,7 +148,7 @@ void rb3_ps4g_acc_destroy(rb3_ps4g_acc_t *acc)
 {
 	if (acc == 0) return;
 	free(acc->ev_ref_sid); free(acc->ev_bin);
-	free(acc->ev_goff); free(acc->ev_glen);
+	free(acc->ev_goff); free(acc->ev_glen); free(acc->ev_w);
 	free(acc->garena);
 	free(acc);
 }
@@ -264,7 +271,7 @@ static int bed_lookup(const rb3_bed_t *bed, int64_t ref_sid, int64_t pos, int32_
  * finalize: sort + write PS4G / npy *
  *******************/
 
-typedef struct { int64_t ref_sid, bin; int32_t goff, glen; } ev_t;
+typedef struct { int64_t ref_sid, bin; int32_t goff, glen, w; } ev_t;
 
 static const int32_t *g_sort_arena; // scratch for ev_cmp during the single-threaded finalize sort
 
@@ -306,6 +313,7 @@ static void write_npy_header(FILE *fp, int64_t rows, int64_t cols)
 
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
 							const rb3_bed_t *bed, int npy_binary,
+							const rb3_lift_ridx_t *ridx, int64_t anchor_thresh, int32_t ref_gamete,
 							const char *ps4g_fn, const char *npy_fn, const char *cli_command)
 {
 	ev_t *ev;
@@ -322,6 +330,7 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		ev[i].bin = acc->ev_bin[i];
 		ev[i].goff = acc->ev_goff[i];
 		ev[i].glen = acc->ev_glen[i];
+		ev[i].w = acc->ev_w[i];
 	}
 	g_sort_arena = acc->garena;
 	qsort(ev, acc->n_ev, sizeof(ev_t), ev_cmp);
@@ -331,12 +340,12 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		if (n_row > 0 && row[n_row-1].ref_sid == ev[i].ref_sid && row[n_row-1].bin == ev[i].bin &&
 			row[n_row-1].glen == ev[i].glen &&
 			memcmp(acc->garena + row[n_row-1].goff, acc->garena + ev[i].goff, ev[i].glen * sizeof(int32_t)) == 0) {
-			row[n_row-1].count++;
+			row[n_row-1].count += ev[i].w;
 		} else {
 			RB3_GROW(row_t, row, n_row, m_row);
 			row[n_row].ref_sid = ev[i].ref_sid, row[n_row].bin = ev[i].bin;
 			row[n_row].goff = ev[i].goff, row[n_row].glen = ev[i].glen;
-			row[n_row].count = 1;
+			row[n_row].count = ev[i].w;
 			++n_row;
 		}
 	}
@@ -379,7 +388,14 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 		// gameteSets sharing a bin. Aggregating different gameteSets into one row
 		// would discard exactly the co-occurrence information (which gametes were
 		// jointly supported by the same reads) that the imputation model needs.
-		int64_t cols = gtab->n_gamete + 2;
+		//
+		// With ridx: three n_gamete-wide blocks instead of one -- read-count/presence
+		// (unchanged), ternary read-sharing, distance-to-nearest-lift-anchor -- then
+		// the same trailing gA/gB label pair. See rb3_ps4g_npy_finalize's header
+		// comment (ps4g.h) for the exact per-column semantics.
+		int64_t n_g = gtab->n_gamete;
+		int64_t cols = ridx? 3 * n_g + 2 : n_g + 2;
+		int64_t label_off = ridx? 3 * n_g : n_g;
 		int32_t *mat = RB3_CALLOC(int32_t, n_row * cols);
 		FILE *fp;
 		char *aux_fn;
@@ -388,11 +404,33 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			int32_t k, val = npy_binary? 1 : (int32_t)row[i].count;
 			int32_t gA = -1, gB = -1;
 			int64_t pos = row[i].bin * acc->bin_size;
-			for (k = 0; k < row[i].glen; ++k)
-				mat[i * cols + acc->garena[row[i].goff + k]] = val;
+			const int32_t *gset = acc->garena + row[i].goff; // sorted ascending (rb3_ps4g_acc_add)
+			int32_t m = row[i].glen;
+			for (k = 0; k < m; ++k)
+				mat[i * cols + gset[k]] = val;
+			if (ridx) {
+				int32_t g;
+				for (g = 0; g < n_g; ++g) {
+					int in_set, lo = 0, hi = m;
+					int64_t dist; int8_t state;
+					while (lo < hi) { int32_t mid = (lo + hi) >> 1; if (gset[mid] < g) lo = mid + 1; else hi = mid; } // gset is sorted; binary search g
+					in_set = (lo < m && gset[lo] == g);
+					// The reference has no liftover anchors to itself, so distance is
+					// trivially 0 (never a "deletion") -- but state must still reflect
+					// whether THIS row's placement actually carries the reference gamete
+					// (in_set), not be hardcoded to match. A PLACED read lifted onto a
+					// reference coordinate via some OTHER assembly does not thereby
+					// match the reference's own sequence there; only a row that
+					// genuinely supports the reference gamete should read state=1.
+					dist = (g == ref_gamete) ? 0 : rb3_lift_nearest_ref(ridx, g, row[i].ref_sid, pos);
+					state = rb3_lift_ternary_state(in_set, dist, anchor_thresh);
+					mat[i * cols + n_g + g] = state;
+					mat[i * cols + 2 * n_g + g] = (int32_t)dist;
+				}
+			}
 			if (bed) bed_lookup(bed, row[i].ref_sid, pos, &gA, &gB); // diploid training labels, -1 if unlabeled
-			mat[i * cols + gtab->n_gamete] = gA;
-			mat[i * cols + gtab->n_gamete + 1] = gB;
+			mat[i * cols + label_off] = gA;
+			mat[i * cols + label_off + 1] = gB;
 		}
 
 		fp = fopen(npy_fn, "wb");
@@ -421,6 +459,18 @@ void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb
 			for (g = 0; g < gtab->n_gamete; ++g)
 				fprintf(fp, "%d\t%s\n", g, gtab->name[g]);
 			fclose(fp);
+		}
+		if (ridx) { // record the widened column layout for downstream readers -- only meaningful when ridx was used
+			sprintf(aux_fn, "%s.layout.tsv", npy_fn);
+			fp = fopen(aux_fn, "w");
+			if (fp) {
+				fprintf(fp, "block\tstart_col\tend_col\tmeaning\n");
+				fprintf(fp, "count\t0\t%ld\tread count (or presence if npy_binary), per founder\n", (long)n_g);
+				fprintf(fp, "ternary\t%ld\t%ld\tmatch(1)/diverged(0)/deletion(-1) per founder\n", (long)n_g, (long)(2 * n_g));
+				fprintf(fp, "distance\t%ld\t%ld\tbp to nearest lift anchor per founder (-1 = no anchor)\n", (long)(2 * n_g), (long)(3 * n_g));
+				fprintf(fp, "labels\t%ld\t%ld\tgA, gB diploid training labels (-1 = unlabeled)\n", (long)(3 * n_g), (long)(3 * n_g + 2));
+				fclose(fp);
+			}
 		}
 		free(aux_fn);
 		free(mat);

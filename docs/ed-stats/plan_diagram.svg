@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="640" font-family="Liberation Sans">
+<rect width="980" height="640" fill="#ffffff"/>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#5f5e5a"/></marker></defs>
+<text x="30" y="30" font-size="18" fill="#141413">refmap --ed-stats / --ed-hist (branch local/ed-stats)</text>
+<line x1="230" y1="105" x2="270" y2="105" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="470" y1="95" x2="510" y2="70" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="710" y1="70" x2="750" y2="70" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="470" y1="115" x2="510" y2="165" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="610" y1="200" x2="610" y2="230" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="610" y1="310" x2="610" y2="340" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="510" y1="375" x2="470" y2="485" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="370" y1="520" x2="130" y2="560" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="370" y1="520" x2="370" y2="560" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="510" y1="590" x2="470" y2="590" stroke="#5f5e5a" stroke-width="1.5" marker-end="url(#a)"/>
+<rect x="30" y="70" width="200" height="70" rx="8" fill="#f1f0ec" stroke="#8a8880" stroke-width="2"/>
+<text x="42" y="92" font-size="14" font-weight="bold" fill="#141413">read batch</text>
+<text x="42" y="110" font-size="11" fill="#3d3c38" font-family="Liberation Mono">worker_pipeline step 0</text>
+<rect x="270" y="70" width="200" height="70" rx="8" fill="#efe6f7" stroke="#7a4aa8" stroke-width="2"/>
+<text x="282" y="92" font-size="14" font-weight="bold" fill="#141413">worker_for_seq</text>
+<text x="282" y="110" font-size="11" fill="#3d3c38" font-family="Liberation Mono">+ refmap_ed per read</text>
+<rect x="510" y="40" width="200" height="60" rx="8" fill="#f1f0ec" stroke="#8a8880" stroke-width="2"/>
+<text x="522" y="62" font-size="14" font-weight="bold" fill="#141413">placement</text>
+<text x="522" y="80" font-size="11" fill="#3d3c38" font-family="Liberation Mono">refmap_query, pairing</text>
+<rect x="750" y="40" width="200" height="60" rx="8" fill="#f1f0ec" stroke="#8a8880" stroke-width="2"/>
+<text x="762" y="62" font-size="14" font-weight="bold" fill="#141413">stdout, PS4G, npy</text>
+<text x="762" y="80" font-size="11" fill="#3d3c38" font-family="Liberation Mono">unchanged (byte-identical)</text>
+<rect x="510" y="130" width="200" height="70" rx="8" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="522" y="152" font-size="14" font-weight="bold" fill="#141413">tiles</text>
+<text x="522" y="170" font-size="11" fill="#3d3c38" font-family="Liberation Mono">4 disjoint exact seeds</text>
+<text x="522" y="184" font-size="11" fill="#3d3c38" font-family="Liberation Mono">repeats: extend right</text>
+<rect x="510" y="230" width="200" height="80" rx="8" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="522" y="252" font-size="14" font-weight="bold" fill="#141413">best-first search</text>
+<text x="522" y="270" font-size="11" fill="#3d3c38" font-family="Liberation Mono">match/sub/ins/del, 0..8</text>
+<text x="522" y="284" font-size="11" fill="#3d3c38" font-family="Liberation Mono">prune: done rows, tiles,</text>
+<text x="522" y="298" font-size="11" fill="#3d3c38" font-family="Liberation Mono">U, --ed-budget</text>
+<rect x="510" y="340" width="200" height="70" rx="8" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="522" y="362" font-size="14" font-weight="bold" fill="#141413">locate end states</text>
+<text x="522" y="380" font-size="11" fill="#3d3c38" font-family="Liberation Mono">rb3_ssa_multi</text>
+<text x="522" y="394" font-size="11" fill="#3d3c38" font-family="Liberation Mono">min per assembly</text>
+<rect x="270" y="450" width="200" height="70" rx="8" fill="#efe6f7" stroke="#7a4aa8" stroke-width="2"/>
+<text x="282" y="472" font-size="14" font-weight="bold" fill="#141413">write_refmap</text>
+<text x="282" y="490" font-size="11" fill="#3d3c38" font-family="Liberation Mono">+ refmap_ed_write</text>
+<rect x="30" y="560" width="200" height="60" rx="8" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="42" y="582" font-size="14" font-weight="bold" fill="#141413">--ed-stats</text>
+<text x="42" y="600" font-size="11" fill="#3d3c38" font-family="Liberation Mono">TSV or uint8 .npy</text>
+<rect x="270" y="560" width="200" height="60" rx="8" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="282" y="582" font-size="14" font-weight="bold" fill="#141413">--ed-hist</text>
+<text x="282" y="600" font-size="11" fill="#3d3c38" font-family="Liberation Mono">best / asm / wrong / nbest</text>
+<rect x="510" y="560" width="200" height="60" rx="8" fill="#f1f0ec" stroke="#8a8880" stroke-width="2"/>
+<text x="522" y="582" font-size="14" font-weight="bold" fill="#141413">2-Poisson fit</text>
+<text x="522" y="600" font-size="11" fill="#3d3c38" font-family="Liberation Mono">errprof.c (rb3_err_fit)</text>
+<rect x="750" y="150" width="22" height="16" rx="3" fill="#f1f0ec" stroke="#8a8880" stroke-width="2"/>
+<text x="780" y="163" font-size="12" fill="#141413">reused, unchanged</text>
+<rect x="750" y="180" width="22" height="16" rx="3" fill="#e3f4ea" stroke="#1f8a4c" stroke-width="2"/>
+<text x="780" y="193" font-size="12" fill="#141413">new</text>
+<rect x="750" y="210" width="22" height="16" rx="3" fill="#efe6f7" stroke="#7a4aa8" stroke-width="2"/>
+<text x="780" y="223" font-size="12" fill="#141413">modified</text>
+<rect x="740" y="290" width="215" height="230" rx="8" fill="#fbfaf7" stroke="#c9c7bf"/>
+<text x="752" y="315" font-size="13" font-weight="bold" fill="#141413">Acceptance</text>
+<text x="752" y="341" font-size="11"  fill="#141413">flags off: byte-identical to</text>
+<text x="752" y="367" font-size="11"  fill="#141413">  ropebwt3_ep_a0fec31 (SE + PE)</text>
+<text x="752" y="393" font-size="11"  fill="#141413">ED on: refmap outputs unchanged</text>
+<text x="752" y="419" font-size="11"  fill="#141413">unit + integration + valgrind</text>
+<text x="752" y="445" font-size="11"  fill="#141413">agreement vs minimap2 (10k, 1.5M)</text>
+<text x="752" y="471" font-size="11"  fill="#141413">overhead on Ia453 0.1x</text>
+<text x="752" y="497" font-size="11"  fill="#141413">A/B/C figure side by side</text>
+</svg>

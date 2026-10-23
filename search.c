@@ -9,9 +9,19 @@
 #include "lift.h"
 #include "ps4g.h"
 #include "hitcount.h"
+#include "pairing.h"
+#include "errprof.h"
+#include "edstats.h"
 #include "khashl-km.h"
 
 KHASHL_MAP_INIT(KH_LOCAL, rb3_name2sid_t, rb3_name2sid, kh_cstr_t, int32_t, kh_hash_str, kh_eq_str)
+
+static int pos_cmp(const void *a, const void *b) // SMEM hits by (sequence/strand id, position)
+{
+	const rb3_pos_t *x = (const rb3_pos_t*)a, *y = (const rb3_pos_t*)b;
+	if (x->sid != y->sid) return x->sid < y->sid? -1 : 1;
+	return x->pos < y->pos? -1 : x->pos > y->pos? 1 : 0;
+}
 
 typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_REFMAP, RB3_SA_CHAIN } rb3_search_algo_t;
 
@@ -34,7 +44,7 @@ typedef enum { RB3_SA_MEM_TG, RB3_SA_MEM_ORI, RB3_SA_SW, RB3_SA_HAPDIV, RB3_SA_R
 // This should scale with the #samples in the index (a locus can be shared by up to
 // N assemblies); capped at 256 to keep counts byte-sized (Ed). For N>256 the extra
 // assemblies are truncated (accepted). See docs/sample-relative-thresholds.md (#3).
-#define RB3_RM_MAX_ASSEMBLY 256
+#define RB3_RM_MAX_ASSEMBLY 256 // refmap: default --max-locate (occurrences located per read)
 
 typedef struct {
 	uint32_t flag;
@@ -69,10 +79,69 @@ typedef struct {
 	int32_t pav_grid;      // chain --lift: snap the emitted pav: position to this grid (0 = off)
 	int32_t pav_agree;     // chain --lift: max spread among an assembly's projections to emit
 	int8_t diverged_rows;  // chain --lift: diverged rows: 0 = ordinary row, 1 = pav: row, 2 = drop
+	int8_t insertion_rows; // chain --lift: insertion rows: 0 = ordinary row (exact median, no snap),
+	                       // 1 = pav: row (grid-snapped, DEFAULT -- unchanged existing behavior), 2 = drop
 	int8_t npy_binary;  // refmap: --npy writes presence (1) instead of read counts (0 = off, counts)
 	int64_t target_hits; // refmap: stop reading once this many PLACED+EXACT records have been written (0 = off)
 	int8_t report_occ; // refmap: append the raw FM-index interval size (occurrence count) as an
 	                    // extra output column (0 = off, opt-in -- see --report-occ)
+	int8_t anchor_dist_npy; // refmap/chain --npy: also write a per-founder ternary read-sharing block
+	                    // (match/diverged/deletion) and a per-founder distance-to-nearest-lift-anchor
+	                    // block, widening --npy from (bin x gamete+2) to (bin x 3*gamete+2)
+	                    // (0 = off, opt-in -- see --anchor-dist-npy; requires --lift)
+	int64_t anchor_dist_thresh; // refmap/chain --anchor-dist-npy: distance (bp) at/under which a
+	                    // non-matching founder reads as diverged rather than deletion
+	int8_t support_best;   // chain: founder set = assemblies best explaining the read (1), or the
+	                       // chain-wide intersection of reference-hitting SMEMs (0, default)
+	int32_t support_tol;   // chain --support=best: keep assemblies within this many covered bases of the best
+	int64_t support_win;   // chain --support=best --lift: an assembly-only SMEM counts only if it
+	                       // projects within this many bp of the chain's reference span (0 = no check)
+	int8_t dup_count;      // chain: a read named "<name>;x=N" stands for N identical reads (PS4G/npy counts)
+	int8_t paired;         // --paired: reads are mate pairs (two files R1/R2, or one interleaved file); 0 = single-end
+	double pe_mean, pe_sd; // --pe-isize=MEAN,SD: fixed insert-size distribution (pe_mean <= 0: estimate per batch)
+	int64_t pe_slack;      // --pe-slack: bp added to the max insert size before two placed mates count as discordant
+	int32_t max_locate;    // refmap: occurrences of a read located per read (the rest are not sampled) [256]
+	int8_t pe_slack_set;   // --pe-slack given explicitly (else mem uses 0: SMEM positions are exact)
+	int64_t pe_near_win;   // --pe-near-win: a rescued mate keeps founders whose own projection is within this
+	                       // many bp of the anchor, same contig (0 = the concordance window) [100000]
+	int8_t pe_trust_exact; // --pe-trust-exact: an unrescuable EXACT + PLACED pair moves the PLACED mate onto the EXACT one
+	// refmap error-profile / span filters (all off by default; a rejected EXACT/PLACED read or pair is
+	// reported as FILTERED and adds nothing to --ps4g/--npy/--ps4g-per-read/--target-hits)
+	int32_t err_max_ev;    // --err-max-events: max mismatch events per read (per pair with --paired); -1 = off, -2 = auto
+	int64_t err_calib;     // --err-calib: reads (pairs with --paired) in the calibration pre-pass [1000000]
+	double err_alpha;      // --err-alpha: auto cutoff = smallest K with P(Poisson(mu_err) > K) <= alpha [0.001]
+	char *err_hist_fn;     // --err-hist: write the calibration histogram + fit here (NULL = off)
+	int8_t err_stats;      // --err-stats: append the events and reference-span columns to each row
+	int64_t max_ref_span;  // --max-ref-span: max reference span of a read (pair with --paired), bp; 0 = off
+	int8_t pe_drop_disc;   // --pe-drop-disc: discordant pairs are FILTERED instead of two single-end events
+	// edit mode (--err-noclip and everything that implies it): read ends are never free -- a contig-end
+	// overhang costs its length, a k-bp indel costs k, and the extension's carrier gives an extended
+	// CIGAR and match_frac = '=' bases / read length. Off (all 0): the legacy event count, byte-identical.
+	int8_t err_noclip;     // --err-noclip: count edits per base (overhang = its length) instead of events
+	int8_t err_clip_rej;   // --err-clip-reject: FILTER a read (both mates with --paired) whose carrier ends inside it
+	int8_t err_cigar;      // --err-cigar: append the extended CIGAR against the carrier to each row
+	double min_match_frac; // --min-match-frac: FILTER reads (pairs: sum '=' / sum length) below this; 0 = off
+	// refmap read filters (all 0 = off; opt-in). A read failing any enabled filter is reported
+	// as FILTERED and contributes nothing to --ps4g/--npy/--ps4g-per-read/--target-hits.
+	double placed_min_chr_agree; // PLACED: min fraction of projecting assemblies on the majority ref seq
+	int32_t placed_min_proj;     // PLACED: min number of assemblies that project through the lift
+	int64_t placed_max_spread;   // PLACED: max (max-min) of projected positions on the majority ref seq (bp)
+	int32_t exact_max_ref_hits;  // EXACT: max reference occurrences of the matched sequence
+	double exact_min_asm_agree;  // EXACT: min fraction of lift-projected assembly hits that land within
+	                             // exact_agree_dist of the reported reference hit (same ref seq)
+	int32_t exact_min_asm_proj;  // EXACT: apply exact_min_asm_agree only if >= this many assembly hits project
+	int64_t exact_agree_dist;    // EXACT: distance (bp) for an assembly projection to count as agreeing
+	int32_t min_core_len;        // EXACT/PLACED: min exact-match length (read length, or SMEM core on fallback)
+	int8_t filter_stats;         // append per-read filter features as extra TSV columns
+	// refmap --ed-stats / --ed-hist: per-read best edit distance to each assembly (off by default)
+	char *ed_stats_fn;     // --ed-stats: per-read (and per-pair) table; '.npy' suffix = uint8 matrix (NULL = off)
+	char *ed_hist_fn;      // --ed-hist: summary histograms + sequencing-error fit (NULL = off)
+	int32_t ed_cap;        // --ed-max: edit cap; larger = NA [8]
+	int32_t ed_tiles;      // --ed-tiles: disjoint exact seeds per read; exact up to ed_tiles-1 edits [4]
+	int32_t ed_max_loc;    // --ed-max-loc: rows located per aligned interval [64]
+	int64_t ed_max_occ;    // --ed-max-occ: skip a tile with more exact occurrences (repeats) [1000]
+	int64_t ed_budget;     // --ed-budget: expanded search states per tile [2000]
+	double ed_frac;        // --ed-frac: compute for this fraction of reads (pairs), a fixed hash subsample [1]
 	rb3_swopt_t swo;
 } rb3_mopt_t;
 
@@ -89,6 +158,7 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->pav_grid = 5000;   // chain --lift: pav is presence/absence; see chain_emit_pav (E3)
 	opt->pav_agree = 5000;  // chain --lift: independent of the grid; see chain_emit_pav
 	opt->diverged_rows = 0;     // colinear rows have a real reference coordinate -> ordinary row
+	opt->insertion_rows = 1;    // pav: row, grid-snapped -- matches pre-existing chain_emit_pav behavior
 	opt->hapdiv_k = 101;
 	opt->hapdiv_w = 50;
 	opt->batch_size = 100000000;
@@ -107,6 +177,17 @@ void rb3_mopt_init(rb3_mopt_t *opt)
 	opt->npy_binary = 0; // off by default (write read counts, not presence/absence)
 	opt->target_hits = 0; // off by default (read the whole input)
 	opt->report_occ = 0;  // off by default (extra output column, opt-in via --report-occ)
+	opt->anchor_dist_npy = 0;      // off by default (opt-in via --anchor-dist-npy)
+	opt->anchor_dist_thresh = 2000; // matches `ropebwt3 lift`'s default anchor stride (-s 2000)
+	opt->support_best = 0, opt->support_tol = 0, opt->support_win = 10000; // chain: default = intersection
+	opt->max_locate = RB3_RM_MAX_ASSEMBLY;
+	opt->pe_near_win = 100000; // lift projections are 2-20 kb noisy; the ~2.7 kb concordance window dropped true founders
+	opt->paired = 0, opt->pe_mean = 0.0, opt->pe_sd = 0.0; // single-end by default; insert size estimated per batch
+	opt->pe_slack = 2000;  // lift projections are typically within ~2kb (the --anchor-dist-thresh scale)
+	opt->err_max_ev = -1, opt->err_calib = 1000000, opt->err_alpha = 1e-3; // error-profile filter off by default
+	opt->exact_min_asm_proj = 1, opt->exact_agree_dist = 100000; // only used when --exact-min-asm-agree > 0
+	opt->ed_stats_fn = 0, opt->ed_hist_fn = 0; // edit-distance statistics off by default
+	opt->ed_cap = 8, opt->ed_tiles = 4, opt->ed_max_loc = 64, opt->ed_max_occ = 1000, opt->ed_budget = 2000, opt->ed_frac = 1.0;
 	rb3_swopt_init(&opt->swo);
 }
 
@@ -121,6 +202,7 @@ typedef struct {
 	int64_t n_pos;
 	rb3_sai_t mem;
 	rb3_pos_t *pos;
+	uint8_t *keep; // mem --paired: keep[j] != 0 iff pos[j] has a concordant mate hit (NULL if not computed)
 } m_sai_pos_t;
 
 typedef struct {
@@ -141,11 +223,26 @@ typedef struct {
 	int64_t n_ref;   // refmap: number of reference sequences
 	char **ref_seq;  // chain --ref-fasta: ref_seq[k] = uppercase ACGT sequence of reference seq k (NULL if not loaded)
 	rb3_lift_t *lift; // refmap: assembly->reference liftover (NULL = walk)
-	rb3_gtab_t *gtab;      // refmap --ps4g/--npy: sample (gamete) table, NULL unless requested
-	rb3_ps4g_acc_t *ps4g_acc; // refmap --ps4g/--npy: accumulated per-read support events
+	rb3_lift_ridx_t *lift_ridx; // refmap/chain --anchor-dist-npy: reference-position index over `lift`, NULL unless requested
+	rb3_gtab_t *gtab;      // refmap/chain --ps4g/--npy: sample (gamete) table, NULL unless requested
+	rb3_ps4g_acc_t *ps4g_acc; // refmap/chain --ps4g/--npy: accumulated per-read support events
 	FILE *ps4g_per_read_fp;   // refmap --ps4g-per-read: per-read PS4G file, NULL unless requested
 	rb3_bed_t *label_bed;  // refmap --label-bed: diploid training labels, NULL unless requested
 	rb3_hitcount_t hitcount; // refmap --target-hits: PLACED+EXACT records written so far vs. the target
+	rb3_seqio_t *fp2;        // --paired with two files: the R2 stream (NULL: interleaved, or single-end)
+	rb3_isize_t isize;       // --paired: insert-size distribution in use (fixed, or the latest good batch estimate)
+	int isize_fixed;         // --paired: isize came from --pe-isize; never re-estimated
+	int64_t pe_cnt[5];       // --paired: pairs per RB3_PE_* class
+	int pe_warned;           // --paired: the "too few pairs to estimate" warning was printed
+	int8_t err_on;           // refmap: count mismatch events per read (any --err-* filter/stats flag)
+	int32_t err_cut;         // refmap --err-max-events in force (fixed, or calibrated); -1 = off
+	int64_t err_nfilt[5];    // refmap: reads (mates) FILTERED by events / span / --pe-drop-disc / match_frac / overhang
+	int8_t err_edit;         // refmap edit mode (--err-noclip, --err-clip-reject, --err-cigar, --min-match-frac)
+	rb3_gtab_t *ed_gtab;     // refmap --ed-stats/--ed-hist: assembly (sample) of each sequence; NULL = off
+	FILE *ed_fp;             // --ed-stats output (NULL: --ed-hist only)
+	int8_t ed_npy;           // --ed-stats file is a uint8 .npy matrix
+	int64_t ed_rows;         // --ed-stats .npy: rows written
+	rb3_edhist_t *ed_hist;   // --ed-hist accumulator
 } pipeline_t;
 
 typedef struct {
@@ -159,6 +256,9 @@ typedef struct {
 #define RB3_RM_ONE_SIDE 2
 #define RB3_RM_EXACT    3
 #define RB3_RM_MULTI    4 // query occurs > max_occ times (repeat/retro): not placed
+#define RB3_RM_FILTERED 5 // EXACT/PLACED rejected by an opt-in read filter (--placed-*/--exact-*/--min-core-len,
+                          // --err-max-events/--max-ref-span/--pe-drop-disc)
+#define RB3_SPAN_INF INT64_MAX // reference span of a read whose copies/projections lie on different sequences
 
 typedef struct refmap_rst_s {
 	int8_t status;       // RB3_RM_*
@@ -174,6 +274,13 @@ typedef struct refmap_rst_s {
 	struct refmap_rst_s *sub; // per-assembly mode: one placement per assembly
 	int32_t n_vote, agree, second, mapq; // --kmer: informative tiles, agreeing k-mers, runner-up, calibrated MAPQ
 	int32_t *gametes, n_gametes; // PS4G/npy: sorted, deduped gamete (sample) indices supporting this call; allocated with RB3_MALLOC
+	int32_t core_len; // length of the exact interval used (s->len, or the SMEM core)
+	int8_t capped;    // the occurrence sample hit --max-locate: gametes may be incomplete
+	int32_t n_proj;   // --paired: alternative reference positions for mate rescue -- per-assembly lift
+	                  // projections (PLACED) or every reference copy (EXACT)
+	int64_t *proj_rsid, *proj_pos; // allocated with RB3_MALLOC; NULL when n_proj == 0
+	int32_t *proj_gid; // PLACED: gamete of each projection (NULL without --ps4g/--npy, and for EXACT)
+	int8_t *proj_strand; // EXACT: strand of each reference copy (NULL for PLACED)
 	int64_t occ; // --report-occ: raw FM-index interval size for the matched query (whole read, or the
 	             // matched SMEM core if there was no end-to-end match) -- 0 for UNPLACED and for
 	             // --kmer-mode results (no single whole-query interval exists there). Pangenome-wide:
@@ -182,6 +289,23 @@ typedef struct refmap_rst_s {
 	             // is correctly counted more than once -- this is real signal, not an artifact to
 	             // divide away; empirically, a single-copy locus present in only one assembly reports
 	             // occ=1, not 2 -- verified directly against known unique loci, see --report-occ help).
+	int16_t n_ev;  // --err-*: mismatch events against the best carrier of the exact core (-1 = not computed / no core)
+	int64_t span;  // reference span of the call: EXACT = first-to-last reference copy, PLACED = spread of
+	               // every assembly's lift projection; RB3_SPAN_INF across sequences, -1 = not set
+	// read-filter features (whole-read + --lift mode only; -1 = not computed; core_len above)
+	int32_t n_lproj, n_chr_agree; // PLACED: assemblies projecting (cf. n_proj: --paired) / on the majority ref seq
+	int64_t spread;      // PLACED: max-min projected position on the majority ref seq
+	int32_t n_ref_hits;  // EXACT: reference occurrences
+	int32_t a_proj, a_agree; // EXACT: assembly hits projecting / agreeing with the reported ref hit
+	char filt;     // FILTERED reason: 'c' chr-agree, 'n' min-proj, 's' spread, 'r' ref-hits, 'a' asm-agree,
+	               // 'l' core-len (read filters); 'e' events, 'S' span, 'D' --pe-drop-disc, 'm' --min-match-frac,
+	               // 'C' --err-clip-reject; 0 = kept
+	int32_t n_eq;  // edit mode: read bases that are '=' against the carrier (-1 = not computed / no core)
+	int32_t ovh;   // edit mode: read bases past the carrier's end (contig-end overhang, CIGAR 'S')
+	char *cigar;   // --err-cigar: extended CIGAR against the carrier (RB3_MALLOC; NULL = none)
+	uint8_t *ed;   // --ed-stats/--ed-hist: best edit distance to each assembly (RB3_ED_NA = none); RB3_MALLOC
+	uint8_t ed_best;  // best over the panel, also when its assembly was not located (RB3_ED_NA = none)
+	int32_t ed_flags; // RB3_ED_F_* | complete tiles << 8 (values are exact up to that many - 1 edits)
 } refmap_rst_t;
 
 typedef struct {
@@ -191,10 +315,14 @@ typedef struct {
 	rb3_swrst_t *rst, *rst_rev;
 	m_hapdiv_t *hapdiv;
 	refmap_rst_t *refmap; // refmap: one entry per query
+	rb3_pe_res_t *pe;     // --paired: one entry per mate pair (seq[2i], seq[2i+1])
+	int64_t pe_max_dist;  // --paired (mem/sw): concordance window used for this batch
+	uint8_t **sw_keep;    // --paired (sw): per read, keep flags over its (hit, position) list; NULL = keep all
 	m_tbuf_t *buf;
 } step_t;
 
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r);
+static int refmap_ed(void *km, const pipeline_t *p, int32_t len, const uint8_t *q, uint8_t *v, uint8_t *gbest);
 static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *flank, int32_t flen, int side,
 							   int64_t *out_sid, int *out_strand, int64_t *out_coord, int32_t *out_mlen);
 
@@ -263,6 +391,14 @@ static void worker_for_seq(void *data, long i, int tid)
 		}
 	} else if (p->opt->algo == RB3_SA_REFMAP) { // place the query on the reference genome
 		refmap_query(b->km, p, s, &t->refmap[i]);
+		if (p->ed_gtab) { // --ed-stats/--ed-hist: independent of the placement above
+			refmap_rst_t *r = &t->refmap[i];
+			uint64_t h = (uint64_t)(p->opt->paired? s->id >> 1 : s->id) * 0x9E3779B97F4A7C15ULL; // --ed-frac: mates stay together
+			r->ed = RB3_MALLOC(uint8_t, p->ed_gtab->n_gamete);
+			if (p->opt->ed_frac >= 1.0 || (double)(h >> 11) * (1.0 / 9007199254740992.0) < p->opt->ed_frac)
+				r->ed_flags = refmap_ed(b->km, p, s->len, s->seq, r->ed, &r->ed_best);
+			else memset(r->ed, RB3_ED_NA, p->ed_gtab->n_gamete), r->ed_flags = RB3_ED_F_SKIP, r->ed_best = RB3_ED_NA;
+		}
 	} else { // MEM algorithms
 		int32_t i;
 		b->mem.n = 0;
@@ -298,6 +434,9 @@ static void worker_for_seq(void *data, long i, int tid)
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *q = &s->mem[i];
 				q->n_pos = rb3_ssa_multi(b->km, &p->fmi, p->fmi.ssa, q->mem.x[0], q->mem.x[0] + q->mem.size, p->opt->max_pos, pos);
+				// rb3_ssa_multi's hit order depends on the SA sampling rate (ssa -s); chain keeps the
+				// first reference hit and breaks DP ties by order, so sort for an index-independent result
+				qsort(pos, q->n_pos, sizeof(rb3_pos_t), pos_cmp);
 				q->pos = RB3_MALLOC(rb3_pos_t, q->n_pos);
 				memcpy(q->pos, pos, sizeof(rb3_pos_t) * q->n_pos);
 			}
@@ -515,19 +654,33 @@ static int refmap_anchor_flank(void *km, const pipeline_t *p, const uint8_t *fla
 // the liftover (the E4 "second SSA"), instead of walking outward. The majority
 // reference sequence among the per-assembly projections wins; NULL projections
 // (no confident collinear support) are dropped, and if none survive -> UNPLACED.
+static int refmap_place_debug = 0; // RB3_PLACE_DEBUG=1: per-assembly projection trace (PLD lines) on stderr
+
 static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
-	int64_t rsids[RB3_RM_MAX_ASSEMBLY], rposs[RB3_RM_MAX_ASSEMBLY], best_rsid = -1, med, v[RB3_RM_MAX_ASSEMBLY];
-	int32_t n = 0, k, j, bestn, m;
-	for (k = 0; k < r->n_asm_list && n < RB3_RM_MAX_ASSEMBLY; ++k) {
+	int32_t L = r->n_asm_list > 0? r->n_asm_list : 1; // at most --max-locate
+	int64_t *rsids = Kmalloc(km, int64_t, L), *rposs = Kmalloc(km, int64_t, L), *v = Kmalloc(km, int64_t, L), best_rsid = -1, med;
+	int32_t n = 0, k, j, bestn, m, *gids = Kmalloc(km, int32_t, L);
+	for (k = 0; k < r->n_asm_list; ++k) {
 		int64_t clen, st, en, rsid, rpos;
 		pos_stranded(f->sid, &r->assemblies[k], s->len, &clen, &st, &en);
 		if (rb3_lift_project(p->lift, km, (int32_t)(r->assemblies[k].sid >> 1), st,
 							 p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos))
-			rsids[n] = rsid, rposs[n] = rpos, ++n;
+			gids[n] = p->gtab? p->gtab->sid2g[r->assemblies[k].sid >> 1] : -1, rsids[n] = rsid, rposs[n] = rpos, ++n;
+		else rsid = -1, rpos = -1;
+		if (refmap_place_debug)
+			fprintf(stderr, "PLD\t%s\t%d\t%ld\t%s\t%ld\t%d\t%s\t%ld\n", s->name, r->core_len, (long)r->occ,
+					f->sid->name[r->assemblies[k].sid >> 1], (long)st, rb3_lift_last_path,
+					rsid >= 0? f->sid->name[rsid] : ".", (long)rpos);
 	}
-	if (n == 0) { r->status = RB3_RM_UNPLACED; return; }
+	if (n == 0) { r->status = RB3_RM_UNPLACED; goto lift_end; }
+	if (p->opt->paired) { // keep every projection: a mate placed far from this one may find one near it
+		r->n_proj = n;
+		r->proj_rsid = RB3_MALLOC(int64_t, n), r->proj_pos = RB3_MALLOC(int64_t, n);
+		memcpy(r->proj_rsid, rsids, n * sizeof(int64_t)), memcpy(r->proj_pos, rposs, n * sizeof(int64_t));
+		if (p->gtab) r->proj_gid = RB3_MALLOC(int32_t, n), memcpy(r->proj_gid, gids, n * sizeof(int32_t));
+	}
 	for (k = 0, bestn = 0; k < n; ++k) {           // majority reference sequence
 		int32_t c = 0;
 		for (j = 0; j < n; ++j) if (rsids[j] == rsids[k]) ++c;
@@ -538,6 +691,49 @@ static void refmap_place_lift(void *km, const pipeline_t *p, const m_seq_t *s, r
 	med = v[m >> 1];
 	r->status = RB3_RM_PLACED, r->ref_sid = best_rsid, r->strand = 0;
 	r->cL = r->cR = med, r->ins_size = 0;
+	r->span = bestn < n? RB3_SPAN_INF : v[m - 1] - v[0]; // spread of every projection (cf. --placed-max-spread: majority seq only)
+	r->n_lproj = n, r->n_chr_agree = bestn, r->spread = v[m - 1] - v[0];
+lift_end:
+	kfree(km, rsids), kfree(km, rposs), kfree(km, v), kfree(km, gids);
+}
+
+// EXACT read-filter features: number of reference occurrences among the located hits, and how
+// many assembly hits project (via --lift) onto the reported reference hit (same ref seq, within
+// exact_agree_dist). A read from sequence absent at its true B73 locus that matches a B73 paralog
+// elsewhere typically has assembly copies at the TRUE locus that project away from the B73 hit.
+static void refmap_exact_feats(void *km, const pipeline_t *p, const m_seq_t *s, const rb3_pos_t *pos, int64_t np, refmap_rst_t *r)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int64_t i;
+	r->n_ref_hits = 0, r->a_proj = r->a_agree = 0;
+	for (i = 0; i < np; ++i) {
+		int64_t clen, st, en, rsid, rpos;
+		if (p->is_ref[pos[i].sid>>1]) { ++r->n_ref_hits; continue; }
+		if (p->lift == 0 || (p->opt->exact_min_asm_agree <= 0.0 && !p->opt->filter_stats)) continue;
+		pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+		if (rb3_lift_project(p->lift, km, (int32_t)(pos[i].sid >> 1), st, p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos)) {
+			++r->a_proj;
+			if (rsid == r->ref_sid && (rpos > r->cL? rpos - r->cL : r->cL - rpos) <= p->opt->exact_agree_dist) ++r->a_agree;
+		}
+	}
+}
+
+// Opt-in read filters: demote an EXACT/PLACED call to FILTERED (no npy/ps4g contribution).
+static void refmap_apply_filters(const rb3_mopt_t *o, refmap_rst_t *r)
+{
+	char why = 0;
+	if (r->status != RB3_RM_EXACT && r->status != RB3_RM_PLACED) return;
+	if (o->min_core_len > 0 && r->core_len >= 0 && r->core_len < o->min_core_len) why = 'l';
+	else if (r->status == RB3_RM_PLACED && r->n_lproj > 0) {
+		if (o->placed_min_proj > 0 && r->n_lproj < o->placed_min_proj) why = 'n';
+		else if (o->placed_min_chr_agree > 0.0 && (double)r->n_chr_agree < o->placed_min_chr_agree * r->n_lproj - 1e-9) why = 'c';
+		else if (o->placed_max_spread > 0 && r->spread > o->placed_max_spread) why = 's';
+	} else if (r->status == RB3_RM_EXACT) {
+		if (o->exact_max_ref_hits > 0 && r->n_ref_hits > o->exact_max_ref_hits) why = 'r';
+		else if (o->exact_min_asm_agree > 0.0 && r->a_proj >= o->exact_min_asm_proj && r->a_proj > 0
+				 && (double)r->a_agree < o->exact_min_asm_agree * r->a_proj - 1e-9) why = 'a';
+	}
+	if (why) r->status = RB3_RM_FILTERED, r->filt = why;
 }
 
 // One reference-coordinate vote from a k-mer. sx = the physical source sequence
@@ -662,6 +858,499 @@ static void refmap_query_kmer(void *km, const pipeline_t *p, const m_seq_t *s, r
 	kfree(km, votes);
 }
 
+/*
+ * --err-*: mismatch "events" of a read against the best-matching carrier of its exact core.
+ * Starting from the core interval refmap places the read with (the whole read, or its longest
+ * SMEM), extend it base by base to the right and then to the left in the bidirectional FMD
+ * index. While the read's next base extends the interval, the read still matches at least one
+ * indexed sequence end to end. When it does not, that is one event, resolved greedily as the
+ * edit whose continuation matches the most following read bases (RB3_ERR_LOOK lookahead):
+ *   substitution  -- carrier base b != read base (preferred on ties: the Illumina/wgsim error);
+ *   read insertion -- skip the read base;
+ *   read deletion  -- the carrier has an extra base b before the read base.
+ * The final interval is non-empty, so the count is the number of edits that explain the WHOLE read
+ * against ONE indexed sequence (a greedy upper bound on that minimum), never a mosaic of SMEMs
+ * from different assemblies. If no base extends (the carrier ends: contig end), the overhang
+ * is one event. Counting stops at RB3_ERR_CAP.
+ */
+#define RB3_ERR_LOOK 12
+#define RB3_ED_MIN_TILE 12 // --ed-tiles: fewer tiles on reads shorter than tiles * this
+
+static inline int64_t err_step(const rb3_fmi_t *f, const rb3_sai_t *ik, int c, int back, rb3_sai_t *out)
+{
+	rb3_sai_t ok[RB3_ASIZE];
+	if (c < 1 || c > 4) { out->size = 0; return 0; }
+	rb3_fmd_extend(f, ik, ok, back);
+	*out = ok[back? c : rb3_comp(c)];
+	return out->size;
+}
+
+// read bases matched exactly from q[i] on in direction d (+1 right, -1 left), at most lim
+static int32_t err_run(const rb3_fmi_t *f, rb3_sai_t ik, const uint8_t *q, int32_t len, int32_t i, int d, int32_t lim)
+{
+	int32_t n = 0;
+	rb3_sai_t ok;
+	for (; n < lim && i >= 0 && i < len; i += d, ++n) {
+		if (err_step(f, &ik, q[i], d < 0, &ok) == 0) break;
+		ik = ok;
+	}
+	return n;
+}
+
+static int32_t err_extend(const rb3_fmi_t *f, rb3_sai_t *ik, const uint8_t *q, int32_t len, int32_t i, int d, int32_t max_ev)
+{
+	int32_t ev = 0, back = d < 0;
+	while (i >= 0 && i < len && ev < max_ev) {
+		rb3_sai_t ok[RB3_ASIZE], best_ik, n2;
+		int32_t b, rem, lim, best = -1, sc;
+		rb3_fmd_extend(f, ik, ok, back);
+		if (q[i] >= 1 && q[i] <= 4 && ok[back? q[i] : rb3_comp(q[i])].size > 0) { // still matching
+			*ik = ok[back? q[i] : rb3_comp(q[i])], i += d;
+			continue;
+		}
+		++ev;
+		rem = d > 0? len - i - 1 : i; // read bases beyond q[i]
+		lim = rem < RB3_ERR_LOOK? rem : RB3_ERR_LOOK;
+		for (b = 1; b <= 4; ++b) { // substitution
+			const rb3_sai_t *x = &ok[back? b : rb3_comp(b)];
+			if (b == q[i] || x->size == 0) continue;
+			sc = err_run(f, *x, q, len, i + d, d, lim);
+			if (sc > best) best = sc, best_ik = *x;
+		}
+		if (best < 0) break; // the carrier ends here: the overhang is this one event
+		if (rem > 0) { // read insertion: q[i] is extra
+			sc = err_run(f, *ik, q, len, i + d, d, lim);
+			if (sc > best) best = sc, best_ik = *ik;
+		}
+		if (rem > 0 && q[i] >= 1 && q[i] <= 4) { // read deletion: the carrier has an extra base b, then q[i]
+			for (b = 1; b <= 4; ++b) {
+				const rb3_sai_t *x = &ok[back? b : rb3_comp(b)];
+				if (x->size == 0 || err_step(f, x, q[i], back, &n2) == 0) continue;
+				sc = err_run(f, n2, q, len, i + d, d, lim);
+				if (sc > best) best = sc, best_ik = n2;
+			}
+		}
+		*ik = best_ik, i += d;
+	}
+	return ev;
+}
+
+// Events of read q[0..len) given the core interval ik over q[st..en) (st == 0 && en == len: 0)
+static int32_t refmap_err_events(const rb3_fmi_t *f, int32_t len, const uint8_t *q, const rb3_sai_t *core, int32_t st, int32_t en)
+{
+	rb3_sai_t ik = *core;
+	int32_t ev;
+	if (st <= 0 && en >= len) return 0;
+	ev = err_extend(f, &ik, q, len, en, +1, RB3_ERR_CAP);
+	if (ev < RB3_ERR_CAP) ev += err_extend(f, &ik, q, len, st - 1, -1, RB3_ERR_CAP - ev);
+	return ev < RB3_ERR_CAP? ev : RB3_ERR_CAP;
+}
+
+/*
+ * Edit mode (--err-noclip, --err-clip-reject, --err-cigar, --min-match-frac): the same extension
+ * from the same exact core, but every read base outside the carrier's '=' bases is paid for and
+ * the path is recorded as an extended CIGAR relative to the read:
+ *   '=' read base matches the carrier          X  substitution (1 edit)
+ *   I   read base absent from the carrier (k-bp insertion = k edits)
+ *   D   carrier base absent from the read (k-bp deletion = k edits; no read base)
+ *   S   read base past the end of the carrier (contig-end overhang = 1 edit per base)
+ * edits = X + I + D + S bases; match_frac = '=' bases / read length (D is in neither). There is no
+ * free clipping: the extension always runs to both read ends. At each non-extending base the edit
+ * is chosen greedily among a substitution, a 1..RB3_ERR_MAXINDEL bp read insertion and a
+ * 1..RB3_ERR_MAXINDEL bp read deletion (every carrier path of that length, RB3_ERR_DEL_BUDGET
+ * interval extensions per event), scored as (read bases matched in the next RB3_ERR_LOOK) - (cost - 1);
+ * ties go to the substitution, then the shorter indel. Only when no base at all extends (every
+ * carrier in the interval ends: contig end / assembly gap) is the rest of the read an overhang.
+ */
+#define RB3_ERR_MAXINDEL   8
+#define RB3_ERR_DEL_BUDGET 256
+enum { RB3_EOP_EQ = 0, RB3_EOP_X, RB3_EOP_I, RB3_EOP_D, RB3_EOP_S };
+
+typedef struct { int32_t n, m; uint32_t *a; } err_ops_t; // run-length ops: len<<3 | op, in extension order
+
+static void err_ops_push(err_ops_t *o, int op, int32_t l)
+{
+	if (l <= 0) return;
+	if (o->n > 0 && (int)(o->a[o->n-1] & 7) == op) { o->a[o->n-1] += (uint32_t)l << 3; return; }
+	if (o->n == o->m) o->m = o->m? o->m << 1 : 16, o->a = (uint32_t*)realloc(o->a, o->m * sizeof(uint32_t));
+	o->a[o->n++] = (uint32_t)l << 3 | op;
+}
+
+typedef struct { // best edit so far at one event
+	int32_t sc, op, k;
+	rb3_sai_t ik;
+} err_pick_t;
+
+static inline void err_pick(err_pick_t *b, int32_t sc, int op, int32_t k, const rb3_sai_t *ik)
+{
+	if (sc > b->sc) b->sc = sc, b->op = op, b->k = k, b->ik = *ik;
+}
+
+// read deletion of k = depth bases: x = the carrier after `depth` extra bases; then q[i] must follow
+static void err_del_dfs(const rb3_fmi_t *f, const rb3_sai_t *x, int32_t depth, const uint8_t *q, int32_t len, int32_t i, int d,
+						int32_t lim, int32_t *budget, err_pick_t *b)
+{
+	rb3_sai_t ok[RB3_ASIZE];
+	int back = d < 0, c;
+	if (*budget <= 0) return;
+	--*budget;
+	rb3_fmd_extend(f, x, ok, back);
+	if (q[i] >= 1 && q[i] <= 4) {
+		const rb3_sai_t *y = &ok[back? q[i] : rb3_comp(q[i])];
+		if (y->size > 0) err_pick(b, err_run(f, *y, q, len, i + d, d, lim) - (depth - 1), RB3_EOP_D, depth, y);
+	}
+	if (depth < RB3_ERR_MAXINDEL)
+		for (c = 1; c <= 4; ++c) {
+			const rb3_sai_t *y = &ok[back? c : rb3_comp(c)];
+			if (y->size > 0) err_del_dfs(f, y, depth + 1, q, len, i, d, lim, budget, b);
+		}
+}
+
+// extend from q[i] in direction d to the read end; returns the edits; ops in extension order
+static int32_t err_extend_ed(const rb3_fmi_t *f, rb3_sai_t *ik, const uint8_t *q, int32_t len, int32_t i, int d,
+							 err_ops_t *ops, int32_t *ovh)
+{
+	int32_t ed = 0, back = d < 0;
+	while (i >= 0 && i < len) {
+		rb3_sai_t ok[RB3_ASIZE];
+		int32_t c, rem, lim, k, budget = RB3_ERR_DEL_BUDGET;
+		err_pick_t b;
+		rb3_fmd_extend(f, ik, ok, back);
+		if (q[i] >= 1 && q[i] <= 4 && ok[back? q[i] : rb3_comp(q[i])].size > 0) { // still matching
+			*ik = ok[back? q[i] : rb3_comp(q[i])], i += d;
+			err_ops_push(ops, RB3_EOP_EQ, 1);
+			continue;
+		}
+		rem = d > 0? len - i - 1 : i; // read bases beyond q[i]
+		lim = rem < RB3_ERR_LOOK? rem : RB3_ERR_LOOK;
+		b.sc = INT32_MIN, b.op = -1, b.k = 0;
+		for (c = 1; c <= 4; ++c) { // substitution
+			const rb3_sai_t *x = &ok[back? c : rb3_comp(c)];
+			if (c == q[i] || x->size == 0) continue;
+			err_pick(&b, err_run(f, *x, q, len, i + d, d, lim), RB3_EOP_X, 1, x);
+		}
+		if (b.op < 0) { // no base extends: every carrier ends here; the rest of the read is overhang
+			int32_t l = rem + 1;
+			err_ops_push(ops, RB3_EOP_S, l), ed += l, *ovh += l;
+			break;
+		}
+		for (k = 1; k <= RB3_ERR_MAXINDEL && k <= rem; ++k) { // read insertion: q[i..i+k) are extra
+			int32_t lk = rem - k + 1 < RB3_ERR_LOOK? rem - k + 1 : RB3_ERR_LOOK;
+			err_pick(&b, err_run(f, *ik, q, len, i + k * d, d, lk) - (k - 1), RB3_EOP_I, k, ik);
+		}
+		if (rem > 0) // read deletion: the carrier has k extra bases, then q[i]
+			for (c = 1; c <= 4; ++c) {
+				const rb3_sai_t *x = &ok[back? c : rb3_comp(c)];
+				if (x->size > 0) err_del_dfs(f, x, 1, q, len, i, d, lim, &budget, &b);
+			}
+		*ik = b.ik, ed += b.k;
+		if (b.op == RB3_EOP_X) err_ops_push(ops, RB3_EOP_X, 1), i += d;
+		else if (b.op == RB3_EOP_I) err_ops_push(ops, RB3_EOP_I, b.k), i += b.k * d;
+		else err_ops_push(ops, RB3_EOP_D, b.k), err_ops_push(ops, RB3_EOP_EQ, 1), i += d; // ik already holds q[i]
+	}
+	return ed;
+}
+
+typedef struct { int32_t ed, n_eq, ovh; } err_ed_t;
+
+// Edit-mode count of read q[0..len) from the core interval over q[st..en); *cigar (if non-NULL) =
+// the extended CIGAR (RB3_MALLOC'd)
+static void refmap_err_edits(const rb3_fmi_t *f, int32_t len, const uint8_t *q, const rb3_sai_t *core, int32_t st, int32_t en,
+							 err_ed_t *e, char **cigar)
+{
+	rb3_sai_t ik = *core;
+	err_ops_t R = {0,0,0}, L = {0,0,0}, A = {0,0,0};
+	int32_t j;
+	e->ed = e->ovh = 0;
+	e->ed += err_extend_ed(f, &ik, q, len, en, +1, &R, &e->ovh);
+	e->ed += err_extend_ed(f, &ik, q, len, st - 1, -1, &L, &e->ovh);
+	for (j = L.n - 1; j >= 0; --j) err_ops_push(&A, L.a[j] & 7, L.a[j] >> 3); // left part, read order
+	err_ops_push(&A, RB3_EOP_EQ, en - st);
+	for (j = 0; j < R.n; ++j) err_ops_push(&A, R.a[j] & 7, R.a[j] >> 3);
+	e->n_eq = 0;
+	for (j = 0; j < A.n; ++j) if ((A.a[j] & 7) == RB3_EOP_EQ) e->n_eq += A.a[j] >> 3;
+	if (cigar) {
+		kstring_t str = {0,0,0};
+		for (j = 0; j < A.n; ++j) rb3_sprintf_lite(&str, "%d%c", A.a[j] >> 3, "=XIDS"[A.a[j] & 7]);
+		*cigar = str.s;
+	}
+	free(R.a), free(L.a), free(A.a);
+}
+
+// The exact core refmap places a read with: the whole read, else its longest SMEM (first one on
+// ties). Returns 0 if nothing of the read occurs in any genome; *st/*en = the core's read span.
+static int refmap_core(void *km, const pipeline_t *p, const m_seq_t *s, rb3_sai_t *Iq, int32_t *st, int32_t *en)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	if (!refmap_query_interval(f, s->len, s->seq, Iq) || Iq->size == 0) {
+		// no end-to-end match (e.g. a sequencing error): fall back to the longest exact core (SMEM)
+		rb3_sai_v mem = {0,0,0};
+		size_t bi;
+		int32_t bestlen = 0;
+		rb3_fmd_smem_TG(km, f, s->len, s->seq, &mem, 1, p->opt->min_len);
+		for (bi = 0; bi < mem.n; ++bi) {
+			int32_t a = mem.a[bi].info>>32, b = (int32_t)mem.a[bi].info;
+			if (b - a > bestlen) bestlen = b - a, *Iq = mem.a[bi], *st = a, *en = b;
+		}
+		kfree(km, mem.a);
+		if (bestlen == 0 || Iq->size == 0) return 0; // nothing of the query occurs in any genome
+	} else *st = 0, *en = s->len;
+	return 1;
+}
+
+/*
+ * refmap --ed-stats / --ed-hist: best edit distance of a read to EACH assembly.
+ *
+ * Definition: the minimum number of edits -- substitutions, inserted or deleted bases (a k-bp
+ * indel costs k), and read bases left unaligned at a contig end -- that turn the whole read into
+ * a substring of the assembly (either strand). Unaligned bases cost the same as insertions, so
+ * this is the semi-global edit distance (read end to end, free ends on the assembly).
+ *
+ * Seeds: the read is cut into --ed-tiles disjoint tiles at the nominal boundaries; a tile that
+ * occurs more than --ed-max-occ times is extended to the right until it does not (repeats: fewer,
+ * longer tiles), and skipped if it still does at the read end. If the whole read occurs more than
+ * --ed-max-occ times, its first --ed-max-loc copies are located at cost 0 and nothing is searched.
+ *
+ * Search, per tile: best-first (Dijkstra over integer costs, a bucket queue) extension in the
+ * bidirectional FM-index from the tile's exact interval, first to the left (to the right for the
+ * first tile), then to the other side. A state is (FMD interval, read position, cost); moves are
+ * match (0), substitution, read insertion and read deletion (1 each). The interval holds the
+ * indexed copies whose text the path has spelled, so copies that agree share one state and the
+ * search branches only where copies differ or an edit is made. A popped state that has aligned the
+ * whole read is the cheapest alignment of the copies it holds; they are located (rb3_ssa_multi, at
+ * most --ed-max-loc) and give their assemblies that cost. Pruning:
+ *  - finished copies: during the first phase the intervals are sub-ranges of the tile's interval on
+ *    that side, during the second sub-ranges of the first-phase end interval on the other side, so
+ *    "every copy of this state already has its cost on this side" is a range check (union-find);
+ *  - complete tiles: a path that crosses an earlier complete tile without an edit inside it is an
+ *    alignment that tile's own search already covered (tiles go left to right and the first phase
+ *    goes left, so this cuts most paths of later tiles before their second phase);
+ *  - U: the search stops at a cost no assembly can improve on (the largest current value).
+ *
+ * Exactness: a copy within e edits of the read leaves at least one of e+1 disjoint tiles
+ * untouched, so up to (complete tiles - 1) edits nothing is missed (pigeonhole); beyond that a
+ * copy is found only if some tile occurs in it exactly. The tile loop stops once every value is
+ * <= the number of complete tiles so far, and an end state cheaper than that number is not
+ * located (its copies were found from an earlier tile). A tile is complete unless skipped as
+ * repetitive or truncated by --ed-budget expanded states (then only values below the cost it
+ * reached are proven). Values above --ed-max are NA. The best over the panel (ed_best) is the
+ * cheapest whole-read alignment seen, kept even when its copies were not all located.
+ */
+static int ed_prof = 0;   // environment RB3_ED_PROF set: work totals on stderr at the end (development aid)
+static int64_t ed_cnt[5]; // reads, tiles searched, expanded states, locate calls, located rows
+typedef struct { rb3_sai_t ik; int32_t i, fr, le; int16_t c; int8_t dir, stg; } ed_st_t; // dir: 0 right, 1 left; stg: phase 0/1; le: last edit position
+typedef struct { int64_t base; int32_t n; int32_t *nxt; } ed_frame_t;
+typedef struct { int64_t x0, x1, size; int32_t i; } ed_key_t; // x[0] alone does not tell text lengths apart
+static inline khint_t ed_key_hash(ed_key_t k) { return kh_hash_uint64((uint64_t)k.x0 * 0x9E3779B97F4A7C15ULL ^ (uint64_t)k.x1 ^ (uint64_t)k.size << 40 ^ (uint64_t)k.i << 20); }
+#define ed_key_eq(a, b) ((a).x0 == (b).x0 && (a).x1 == (b).x1 && (a).size == (b).size && (a).i == (b).i)
+KHASHL_SET_INIT(KH_LOCAL, ed_vis_t, ed_vis, ed_key_t, ed_key_hash, ed_key_eq)
+
+typedef struct {
+	void *km;
+	int32_t cap;
+	int32_t *n_q, *m_q; // bucket queue, one stack per cost 0..cap
+	ed_st_t **q;
+	ed_frame_t *fr;
+	int32_t n_fr, m_fr;
+	ed_vis_t *vis;
+	rb3_pos_t *pos;
+	int flags;        // RB3_ED_F_LOC
+	int32_t gbest;    // cheapest whole-read alignment seen
+	int32_t *lcross, *rcross; // [len+1]: lcross[st_u] = en_u and rcross[en_u] = st_u for every complete tile u, else -1
+} ed_ctx_t;
+
+static inline int32_t ed_uf_find(int32_t *nxt, int32_t x)
+{
+	int32_t r = x, y;
+	while (nxt[r] != r) r = nxt[r];
+	while (nxt[x] != r) y = nxt[x], nxt[x] = r, x = y; // path compression
+	return r;
+}
+
+static inline int ed_dominated(const ed_frame_t *f, int64_t x, int64_t size) // every row of [x,x+size) has its cost
+{
+	return ed_uf_find(f->nxt, (int32_t)(x - f->base)) >= x - f->base + size;
+}
+
+static inline void ed_finalize(ed_frame_t *f, int64_t x, int64_t size)
+{
+	int32_t r, hi = (int32_t)(x - f->base + size);
+	for (r = ed_uf_find(f->nxt, (int32_t)(x - f->base)); r < hi; r = ed_uf_find(f->nxt, r))
+		f->nxt[r] = r + 1;
+}
+
+static int32_t ed_new_frame(ed_ctx_t *e, int64_t base, int64_t n)
+{
+	ed_frame_t *f;
+	int32_t k;
+	Kgrow(e->km, ed_frame_t, e->fr, e->n_fr, e->m_fr);
+	f = &e->fr[e->n_fr];
+	f->base = base, f->n = (int32_t)n;
+	f->nxt = Kmalloc(e->km, int32_t, n + 1);
+	for (k = 0; k <= n; ++k) f->nxt[k] = k;
+	return e->n_fr++;
+}
+
+static inline void ed_push(ed_ctx_t *e, const rb3_sai_t *ik, int32_t i, int32_t c, int32_t le, int dir, int stg, int32_t fr)
+{
+	ed_st_t *s;
+	if (c > e->cap) return;
+	Kgrow(e->km, ed_st_t, e->q[c], e->n_q[c], e->m_q[c]);
+	s = &e->q[c][e->n_q[c]++];
+	s->ik = *ik, s->i = i, s->c = c, s->le = le, s->dir = dir, s->stg = stg, s->fr = fr;
+}
+
+static inline int32_t ed_max_val(const uint8_t *v, int32_t n, int32_t cap) // NA counts as cap+1
+{
+	int32_t a, m = 0;
+	for (a = 0; a < n; ++a) {
+		int32_t x = v[a] == RB3_ED_NA? cap + 1 : v[a];
+		m = x > m? x : m;
+	}
+	return m;
+}
+
+// One tile [st,en) with exact interval seed. Updates v[]; returns 1 if the search was truncated.
+static int ed_tile(ed_ctx_t *e, const pipeline_t *p, const uint8_t *q, int32_t len, const rb3_sai_t *seed,
+				   int32_t st, int32_t en, int32_t t_ok, uint8_t *v)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_mopt_t *o = p->opt;
+	int32_t n_g = p->ed_gtab->n_gamete, c, U, k, d0 = st > 0;
+	int64_t n_exp = 0;
+	int trunc = 0;
+	for (k = 0; k < e->n_fr; ++k) kfree(e->km, e->fr[k].nxt);
+	e->n_fr = 0;
+	ed_vis_clear(e->vis);
+	for (c = 0; c <= e->cap; ++c) e->n_q[c] = 0;
+	// The first phase goes left when there is anything to the left: complete tiles lie there (tiles are
+	// processed left to right), so alignments matching one of them exactly are dropped before the second phase.
+	ed_new_frame(e, seed->x[d0], seed->size); // frame 0: rows of the tile's x[0] (right first) or x[1] (left first)
+	ed_push(e, seed, d0? st - 1 : en, 0, d0? INT32_MAX : -1, d0, 0, 0);
+	U = ed_max_val(v, n_g, e->cap);
+	for (c = 0; c <= e->cap && c < U; ++c) {
+		while (e->n_q[c] > 0 && c < U) {
+			ed_st_t s = e->q[c][--e->n_q[c]];
+			rb3_sai_t ok[RB3_ASIZE];
+			ed_frame_t *fr = &e->fr[s.fr];
+			ed_key_t key;
+			int absent, b, back = s.dir, nd;
+			if (ed_dominated(fr, s.ik.x[back], s.ik.size)) continue;
+			if (s.dir? e->lcross[s.i + 1] >= 0 && s.le >= e->lcross[s.i + 1] : e->rcross[s.i] >= 0 && s.le < e->rcross[s.i])
+				continue; // matched a complete tile exactly: that tile's own search covered these alignments
+			key.x0 = s.ik.x[0], key.x1 = s.ik.x[1], key.size = s.ik.size, key.i = (s.i + 2) * 4 + s.stg * 2 + s.dir;
+			ed_vis_put(e->vis, key, &absent);
+			if (!absent) continue;
+			if (s.dir? s.i < 0 : s.i == len) { // this side is aligned: these copies' cost on it is c
+				ed_finalize(fr, s.ik.x[back], s.ik.size);
+				if (s.stg == 0 && (s.dir? en < len : st > 0)) { // the other side, in a frame over this interval's rows
+					int32_t nf = ed_new_frame(e, s.ik.x[!s.dir], s.ik.size);
+					ed_push(e, &s.ik, s.dir? en : st - 1, c, s.dir? -1 : INT32_MAX, !s.dir, 1, nf);
+					continue;
+				}
+				// the whole read is aligned: locate these copies
+				if (c < e->gbest) e->gbest = c;
+				if (c >= t_ok) { // (every copy within t_ok-1 edits was found from an earlier tile)
+					int64_t np, j;
+					np = rb3_ssa_multi(e->km, f, f->ssa, s.ik.x[0], s.ik.x[0] + s.ik.size, o->ed_max_loc, e->pos);
+					if (ed_prof) __sync_fetch_and_add(&ed_cnt[3], 1), __sync_fetch_and_add(&ed_cnt[4], np);
+					if (np < s.ik.size) e->flags |= RB3_ED_F_LOC;
+					for (j = 0; j < np; ++j) {
+						int32_t g = p->ed_gtab->sid2g[e->pos[j].sid >> 1];
+						if (g >= 0 && (v[g] == RB3_ED_NA || c < v[g])) v[g] = c;
+					}
+					U = ed_max_val(v, n_g, e->cap);
+				}
+				continue;
+			}
+			if (++n_exp > o->ed_budget) { trunc = 1; goto end_tile; }
+			rb3_fmd_extend(f, &s.ik, ok, back);
+			nd = s.dir? s.i - 1 : s.i + 1;
+			for (b = 1; b <= 4; ++b) {
+				const rb3_sai_t *ch = &ok[back? b : rb3_comp(b)];
+				if (ch->size == 0) continue;
+				if (b == q[s.i]) ed_push(e, ch, nd, c, s.le, s.dir, s.stg, s.fr); // match
+				else ed_push(e, ch, nd, c + 1, s.i, s.dir, s.stg, s.fr);       // substitution
+				ed_push(e, ch, s.i, c + 1, s.i, s.dir, s.stg, s.fr); // read deletion: the copy has an extra base b
+			}
+			ed_push(e, &s.ik, nd, c + 1, s.i, s.dir, s.stg, s.fr); // read insertion (or an unaligned base)
+		}
+	}
+end_tile:
+	if (ed_prof) __sync_fetch_and_add(&ed_cnt[1], 1), __sync_fetch_and_add(&ed_cnt[2], n_exp);
+	return trunc;
+}
+
+// Best edit distance of read q to every assembly (v[0..n_gamete), RB3_ED_NA = none); returns RB3_ED_F_* flags.
+static int refmap_ed(void *km, const pipeline_t *p, int32_t len, const uint8_t *q, uint8_t *v, uint8_t *gbest)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_mopt_t *o = p->opt;
+	int32_t n_g = p->ed_gtab->n_gamete, n_t = o->ed_tiles, pst, t_ok = 0, n_done = 0, c, k;
+	int flags = 0;
+	ed_ctx_t e;
+	if (ed_prof) __sync_fetch_and_add(&ed_cnt[0], 1);
+	memset(v, RB3_ED_NA, n_g);
+	*gbest = RB3_ED_NA;
+	if (n_t > len / RB3_ED_MIN_TILE) n_t = len / RB3_ED_MIN_TILE;
+	if (n_t <= 0) return RB3_ED_F_NOSEED;
+	memset(&e, 0, sizeof(e));
+	e.km = km, e.cap = o->ed_cap, e.gbest = RB3_ED_NA;
+	e.n_q = Kcalloc(km, int32_t, e.cap + 1), e.m_q = Kcalloc(km, int32_t, e.cap + 1);
+	e.q = Kcalloc(km, ed_st_t*, e.cap + 1);
+	e.vis = ed_vis_init2(km);
+	e.pos = Kmalloc(km, rb3_pos_t, o->ed_max_loc);
+	e.lcross = Kmalloc(km, int32_t, len + 1), e.rcross = Kmalloc(km, int32_t, len + 1);
+	for (k = 0; k <= len; ++k) e.lcross[k] = e.rcross[k] = -1;
+	for (pst = 0; len - pst >= RB3_ED_MIN_TILE; ) {
+		// tile [pst,en): up to the next of the n_t nominal boundaries, extended to the right while it occurs more
+		// than --ed-max-occ times (repeats); tiles stay disjoint
+		int32_t en0, en, i, a, bad = 0;
+		rb3_sai_t ik, ok[RB3_ASIZE];
+		for (k = 1; k <= n_t; ++k)
+			if ((en0 = (int32_t)((int64_t)len * k / n_t)) >= pst + RB3_ED_MIN_TILE) break;
+		if (k > n_t) en0 = len;
+		if (n_done > 0) { // stop once every value is proven: a cheaper copy would avoid one of the t_ok complete tiles
+			for (a = 0; a < n_g; ++a)
+				if (v[a] == RB3_ED_NA || v[a] > t_ok) break;
+			if (a == n_g) break;
+		}
+		ik.size = 0;
+		for (i = pst; i < len; ++i) { // the tile's exact interval, by forward extension
+			if (q[i] < 1 || q[i] > 4) { bad = 1; break; }
+			if (i == pst) rb3_fmd_set_intv(f, q[i], &ik);
+			else rb3_fmd_extend(f, &ik, ok, 0), ik = ok[rb3_comp(q[i])];
+			if (ik.size == 0 || (i + 1 >= en0 && ik.size <= o->ed_max_occ)) break;
+		}
+		en = i < len? i + 1 : len;
+		++n_done;
+		if (bad) { pst = en > en0? en : en0; continue; } // an N: not a usable seed
+		if (ik.size == 0 && en <= en0) { // no copy carries [pst,en0) exactly: complete with no work
+			e.lcross[pst] = en0, e.rcross[en0] = pst, ++t_ok, pst = en0;
+			continue;
+		}
+		if (pst == 0 && en == len && ik.size > o->ed_max_occ) { // the whole read occurs too often to search: cost 0, located in part
+			int64_t np = rb3_ssa_multi(km, f, f->ssa, ik.x[0], ik.x[0] + ik.size, o->ed_max_loc, e.pos), j;
+			for (j = 0; j < np; ++j)
+				if ((a = p->ed_gtab->sid2g[e.pos[j].sid >> 1]) >= 0) v[a] = 0;
+			e.gbest = 0, flags |= RB3_ED_F_REP | (np < ik.size? RB3_ED_F_LOC : 0);
+			break;
+		}
+		if (ik.size == 0 || ik.size > o->ed_max_occ) { flags |= RB3_ED_F_REP, pst = en > en0? en : en0; continue; }
+		if (ed_tile(&e, p, q, len, &ik, pst, en, t_ok, v)) flags |= RB3_ED_F_TRUNC;
+		else e.lcross[pst] = en, e.rcross[en] = pst, ++t_ok;
+		pst = en;
+	}
+	if (n_done == 0) flags |= RB3_ED_F_NOSEED;
+	flags |= e.flags | (t_ok < 255? t_ok : 255) << 8;
+	*gbest = e.gbest;
+	for (c = 0; c < e.n_fr; ++c) kfree(km, e.fr[c].nxt);
+	for (c = 0; c <= e.cap; ++c) kfree(km, e.q[c]);
+	kfree(km, e.fr); kfree(km, e.q); kfree(km, e.n_q); kfree(km, e.m_q); kfree(km, e.pos); kfree(km, e.lcross); kfree(km, e.rcross);
+	ed_vis_destroy(e.vis);
+	return flags;
+}
+
 static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap_rst_t *r)
 {
 	const rb3_fmi_t *f = &p->fmi;
@@ -669,24 +1358,23 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	if (p->opt->kmer_len > 0) { refmap_query_kmer(km, p, s, r); return; }
 	rb3_pos_t *pos;
 	int64_t np, i;
-	int asm_seen[RB3_RM_MAX_ASSEMBLY], n_asm = 0;
+	int32_t L = p->opt->max_locate, *asm_seen, n_asm = 0;
 
 	memset(r, 0, sizeof(*r));
 	r->status = RB3_RM_UNPLACED, r->strand = 0, r->qlen = s->len;
 	r->ref_sid = -1, r->cL = r->cR = -1;
+	r->core_len = s->len, r->n_lproj = r->n_chr_agree = r->n_ref_hits = r->a_proj = r->a_agree = -1, r->spread = -1;
 
-	if (!refmap_query_interval(f, s->len, s->seq, &Iq) || Iq.size == 0) {
-		// no end-to-end match (e.g. a sequencing error): fall back to the longest exact core (SMEM)
-		rb3_sai_v mem = {0,0,0};
-		size_t bi;
-		int32_t bestlen = 0;
-		rb3_fmd_smem_TG(km, f, s->len, s->seq, &mem, 1, p->opt->min_len);
-		for (bi = 0; bi < mem.n; ++bi) {
-			int32_t st = mem.a[bi].info>>32, en = (int32_t)mem.a[bi].info;
-			if (en - st > bestlen) bestlen = en - st, Iq = mem.a[bi];
-		}
-		kfree(km, mem.a);
-		if (bestlen == 0 || Iq.size == 0) return; // nothing of the query occurs in any genome
+	r->n_ev = -1, r->span = -1, r->n_eq = -1;
+	{
+		int32_t st = 0, en = 0;
+		if (!refmap_core(km, p, s, &Iq, &st, &en)) return; // nothing of the query occurs in any genome
+		r->core_len = en - st;
+		if (p->err_edit) { // edit mode: per-base edits, '=' count, overhang, CIGAR
+			err_ed_t e;
+			refmap_err_edits(f, s->len, s->seq, &Iq, st, en, &e, p->opt->err_cigar? &r->cigar : 0);
+			r->n_ev = e.ed < RB3_ERR_CAP? e.ed : RB3_ERR_CAP, r->n_eq = e.n_eq, r->ovh = e.ovh;
+		} else if (p->err_on) r->n_ev = refmap_err_events(f, s->len, s->seq, &Iq, st, en);
 	}
 	r->occ = Iq.size; // --report-occ: raw interval size, before any --max-occ/assembly-cap truncation
 	                  // below, so MULTI/EXACT/PLACED rows all carry the true occurrence count
@@ -699,8 +1387,9 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 	}
 
 	// locate a sample of occurrences; separate reference hits (exact) from assemblies
-	pos = Kmalloc(km, rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
-	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, RB3_RM_MAX_ASSEMBLY, pos);
+	pos = Kmalloc(km, rb3_pos_t, L);
+	np = rb3_ssa_multi(km, f, f->ssa, Iq.x[0], Iq.x[0] + Iq.size, L, pos);
+	r->capped = (np >= L);
 	{
 		int ref_found = 0;
 		for (i = 0; i < np; ++i) {
@@ -712,20 +1401,43 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 				ref_found = 1; // keep scanning: PS4G/npy need every sample sharing this exact sequence
 			}
 		}
+		if (ref_found) { // span: first-to-last reference copy located (RB3_SPAN_INF across sequences)
+			int64_t lo = INT64_MAX, hi = -1, rs = -1;
+			for (i = 0; i < np && r->span != RB3_SPAN_INF; ++i) {
+				int64_t clen, st, en;
+				if (!p->is_ref[pos[i].sid>>1]) continue;
+				if (rs >= 0 && rs != pos[i].sid>>1) { r->span = RB3_SPAN_INF; break; }
+				pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+				rs = pos[i].sid>>1, lo = st < lo? st : lo, hi = en > hi? en : hi;
+			}
+			if (r->span != RB3_SPAN_INF) r->span = hi - lo;
+		}
+		if (ref_found && p->opt->paired) { // every reference copy: a mate can pick the right one
+			int32_t m = 0;
+			r->proj_rsid = RB3_MALLOC(int64_t, np), r->proj_pos = RB3_MALLOC(int64_t, np), r->proj_strand = RB3_MALLOC(int8_t, np);
+			for (i = 0; i < np; ++i) {
+				int64_t clen, st, en;
+				if (!p->is_ref[pos[i].sid>>1]) continue;
+				pos_stranded(f->sid, &pos[i], s->len, &clen, &st, &en);
+				r->proj_rsid[m] = pos[i].sid>>1, r->proj_pos[m] = st, r->proj_strand[m++] = pos[i].sid&1;
+			}
+			r->n_proj = m;
+		}
 		if (ref_found) {
 			if (p->gtab) { // equivalent hits: every occurrence of an EXACT read names a candidate parent
-				int32_t tmp[RB3_RM_MAX_ASSEMBLY], m;
-				for (i = 0, m = 0; i < np; ++i) tmp[m++] = p->gtab->sid2g[pos[i].sid>>1];
-				r->gametes = RB3_MALLOC(int32_t, m);
-				memcpy(r->gametes, tmp, m * sizeof(int32_t)); // rb3_ps4g_acc_add sorts+dedupes on ingestion
-				r->n_gametes = m;
+				r->gametes = RB3_MALLOC(int32_t, np > 0? np : 1); // rb3_ps4g_acc_add sorts+dedupes on ingestion
+				for (i = 0; i < np; ++i) r->gametes[i] = p->gtab->sid2g[pos[i].sid>>1];
+				r->n_gametes = (int32_t)np;
 			}
+			refmap_exact_feats(km, p, s, pos, np, r);
+			refmap_apply_filters(p->opt, r);
 			kfree(km, pos);
 			return;
 		}
 	}
-	r->assemblies = RB3_CALLOC(rb3_pos_t, RB3_RM_MAX_ASSEMBLY);
-	for (i = 0; i < np && n_asm < RB3_RM_MAX_ASSEMBLY; ++i) { // keep distinct assembly sequences for reporting
+	r->assemblies = RB3_CALLOC(rb3_pos_t, L);
+	asm_seen = Kmalloc(km, int32_t, L);
+	for (i = 0; i < np && n_asm < L; ++i) { // keep distinct assembly sequences for reporting
 		int32_t j, dup = 0;
 		for (j = 0; j < n_asm; ++j)
 			if (asm_seen[j] == (int)(pos[i].sid>>1)) { dup = 1; break; }
@@ -734,6 +1446,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 		r->assemblies[n_asm++] = pos[i];
 	}
 	r->n_asm_list = n_asm, r->n_assembly = n_asm;
+	kfree(km, asm_seen);
 	kfree(km, pos);
 	if (p->gtab && n_asm > 0) { // PS4G/npy: assembly samples backing a (possible) PLACED call below
 		int32_t k;
@@ -744,6 +1457,7 @@ static void refmap_query(void *km, const pipeline_t *p, const m_seq_t *s, refmap
 
 	if (p->lift) { // E4: project assembly hits to the reference instead of walking
 		refmap_place_lift(km, p, s, r);
+		refmap_apply_filters(p->opt, r);
 		return;
 	}
 
@@ -841,9 +1555,10 @@ static void write_all_hits(kstring_t *out, const m_seq_t *s, const rb3_swrst_t *
 	rb3_sprintf_lite(out, "//\n");
 }
 
-static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ)
+static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, const refmap_rst_t *r, int kmer, int report_occ, int err_stats,
+						  int err_edit, int err_cigar, int filter_stats)
 {
-	static const char *status_str[5] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI" };
+	static const char *status_str[6] = { "UNPLACED", "PLACED", "ONE_SIDE", "EXACT", "MULTI", "FILTERED" };
 	int32_t k;
 	out->l = 0;
 	write_name(out, s);
@@ -868,6 +1583,23 @@ static void write_refmap1(kstring_t *out, const rb3_fmi_t *f, const m_seq_t *s, 
 		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%d", r->n_vote, r->agree, r->second, r->mapq);
 	if (report_occ) // --report-occ: raw FM-index interval size (pangenome-wide occurrence count; see refmap_rst_t.occ)
 		rb3_sprintf_lite(out, "\t%ld", (long)r->occ);
+	if (err_stats) { // --err-stats: events, reference span (inf = across sequences, . = unset), filter reason
+		rb3_sprintf_lite(out, "\t%d", r->n_ev);
+		if (r->span == RB3_SPAN_INF) rb3_sprintf_lite(out, "\tinf");
+		else if (r->span < 0) rb3_sprintf_lite(out, "\t.");
+		else rb3_sprintf_lite(out, "\t%ld", (long)r->span);
+		rb3_sprintf_lite(out, "\t%c", r->filt? r->filt : '.');
+		if (err_edit) { // edit mode: match_frac ('=' bases / read length; . = no core)
+			char buf[32];
+			if (r->n_eq >= 0) snprintf(buf, sizeof(buf), "%.4f", r->qlen > 0? (double)r->n_eq / r->qlen : 0.0);
+			else strcpy(buf, ".");
+			rb3_sprintf_lite(out, "\t%s", buf);
+		}
+	}
+	if (err_cigar) rb3_sprintf_lite(out, "\t%s", r->cigar? r->cigar : "*"); // --err-cigar: extended CIGAR vs the carrier
+	if (filter_stats) // --filter-stats: core_len n_lproj n_chr_agree spread n_ref_hits a_proj a_agree filt
+		rb3_sprintf_lite(out, "\t%d\t%d\t%d\t%ld\t%d\t%d\t%d\t%c", r->core_len, r->n_lproj, r->n_chr_agree, (long)r->spread,
+						 r->n_ref_hits, r->a_proj, r->a_agree, r->filt? r->filt : '.');
 	rb3_sprintf_lite(out, "\n");
 }
 
@@ -906,6 +1638,130 @@ static void refmap_count_hit(const pipeline_t *p, int8_t status)
 	rb3_hitcount_add(&((pipeline_t*)p)->hitcount, status == RB3_RM_PLACED || status == RB3_RM_EXACT);
 }
 
+// --paired: the single PS4G/npy event of a pair, at the anchor mate a's position, carrying the
+// founders both mates share (rb3_pe_event_gametes). --ps4g-per-read gets one line, named after
+// the fragment (the mate name without "/1" or "/2").
+static void refmap_pair_event(const pipeline_t *p, const m_seq_t *s, const refmap_rst_t *a, const refmap_rst_t *b)
+{
+	int32_t *g, n, k;
+	if (a->status == RB3_RM_FILTERED) return; // --err-max-events/--max-ref-span/--pe-drop-disc rejected the pair
+	if (a->n_gametes <= 0 && b->n_gametes <= 0) return;
+	g = RB3_MALLOC(int32_t, a->n_gametes + b->n_gametes);
+	n = rb3_pe_event_gametes(a->gametes, a->n_gametes, a->capped, b->gametes, b->n_gametes, b->capped, g);
+	if (n > 0 && p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, a->ref_sid, a->cL, g, n);
+	if (n > 0 && p->ps4g_per_read_fp) {
+		const char *nm = p->fmi.sid->name[a->ref_sid], *us = strchr(nm, '_');
+		fprintf(p->ps4g_per_read_fp, "%.*s\t%s\t%ld\t", s->name? rb3_pe_name_len(s->name) : 1, s->name? s->name : "?",
+				us? us + 1 : nm, (long)a->cL);
+		for (k = 0; k < n; ++k) fprintf(p->ps4g_per_read_fp, "%s%d", k? "," : "", g[k]);
+		fputc('\n', p->ps4g_per_read_fp);
+	}
+	free(g);
+}
+
+// --ed-stats / --ed-hist: one row per read (mate "1"/"2" with --paired, "." single-end), plus one
+// pair row (mate "P", fragment name, per-assembly sums) after mate 2. The .npy form has one row
+// per read (input order; no pair rows): the per-assembly values, then the flags.
+static void refmap_ed_row(pipeline_t *p, kstring_t *out, const char *name, int name_len, const char *mate, const uint8_t *v, int gbest, int flags)
+{
+	int32_t a, n = p->ed_gtab->n_gamete, nb, w, best;
+	char *nm;
+	if (p->ed_fp == 0) return;
+	if (p->ed_npy) { // every read gets a row (input order); pairs do not
+		if (mate[0] == 'P') return;
+		fwrite(v, 1, n, p->ed_fp);
+		fputc(gbest, p->ed_fp);
+		fputc((flags & 0x1f) | ((flags >> 8) < 7? flags >> 8 : 7) << 5, p->ed_fp); // flag bits, complete tiles (max 7) << 5
+		++p->ed_rows;
+		return;
+	}
+	if (flags & RB3_ED_F_SKIP) return; // not in the --ed-frac subsample
+	best = rb3_ed_summary(v, n, gbest, &nb, &w);
+	out->l = 0;
+	nm = RB3_MALLOC(char, name_len + 1); // rb3_sprintf_lite has no %.*s
+	memcpy(nm, name, name_len), nm[name_len] = 0;
+	rb3_sprintf_lite(out, "%s\t%s\t", nm, mate);
+	free(nm);
+	if (best == RB3_ED_NA) rb3_sprintf_lite(out, "NA\t0\t"); else rb3_sprintf_lite(out, "%d\t%d\t", best, nb);
+	if (w == RB3_ED_NA) rb3_sprintf_lite(out, "NA\t"); else rb3_sprintf_lite(out, "%d\t", w);
+	if ((flags & 0xff) == 0) rb3_sprintf_lite(out, ".");
+	if (flags & RB3_ED_F_TRUNC) rb3_sprintf_lite(out, "T");
+	if (flags & RB3_ED_F_REP) rb3_sprintf_lite(out, "R");
+	if (flags & RB3_ED_F_NOSEED) rb3_sprintf_lite(out, "N");
+	if (flags & RB3_ED_F_LOC) rb3_sprintf_lite(out, "L");
+	rb3_sprintf_lite(out, "\t%d", flags >> 8);
+	for (a = 0; a < n; ++a)
+		if (v[a] == RB3_ED_NA) rb3_sprintf_lite(out, "\tNA"); else rb3_sprintf_lite(out, "\t%d", v[a]);
+	rb3_sprintf_lite(out, "\n");
+	fputs(out->s, p->ed_fp);
+}
+
+static void refmap_ed_write(pipeline_t *p, const step_t *t, int32_t j)
+{
+	const m_seq_t *s = &t->seq[j];
+	const refmap_rst_t *r = &t->refmap[j];
+	kstring_t out = {0,0,0};
+	const char *nm = s->name? s->name : "?";
+	if (r->ed == 0) return;
+	refmap_ed_row(p, &out, nm, (int)strlen(nm), p->opt->paired? (j&1? "2" : "1") : ".", r->ed, r->ed_best, r->ed_flags);
+	if (p->ed_hist && !(r->ed_flags & RB3_ED_F_SKIP)) rb3_edhist_add(p->ed_hist, RB3_ED_UNIT_READ, r->ed, r->ed_best, r->ed_flags);
+	if (p->opt->paired && (j&1)) { // the pair: per-assembly sum of the mates
+		const refmap_rst_t *a = &t->refmap[j-1];
+		uint8_t *v = RB3_MALLOC(uint8_t, p->ed_gtab->n_gamete);
+		int32_t ta = a->ed_flags >> 8, tb = r->ed_flags >> 8, fl = ((a->ed_flags | r->ed_flags) & 0xff) | (ta < tb? ta : tb) << 8;
+		rb3_ed_pair(a->ed, r->ed, p->ed_gtab->n_gamete, v);
+		refmap_ed_row(p, &out, nm, s->name? rb3_pe_name_len(s->name) : 1, "P", v, RB3_ED_NA, fl); // pair best: one assembly for both mates
+		if (p->ed_hist && !(fl & RB3_ED_F_SKIP)) rb3_edhist_add(p->ed_hist, RB3_ED_UNIT_PAIR, v, RB3_ED_NA, fl);
+		free(v);
+	}
+	free(out.s);
+}
+
+// --ed-stats/--ed-hist: finish the .npy (header with the row count, column sidecar), write the
+// histograms, log the summary, free everything.
+static void refmap_ed_finish(pipeline_t *p)
+{
+	const rb3_mopt_t *o = p->opt;
+	int32_t a, n = p->ed_gtab->n_gamete;
+	if (p->ed_fp && p->ed_npy) {
+		char *fn = RB3_MALLOC(char, strlen(o->ed_stats_fn) + 16);
+		FILE *fp;
+		fflush(p->ed_fp);
+		if (fseek(p->ed_fp, 0, SEEK_SET) == 0) rb3_ed_npy_header(p->ed_fp, p->ed_rows, n + 2);
+		else if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ed-stats .npy is not seekable; the header is wrong\n");
+		sprintf(fn, "%s.cols.tsv", o->ed_stats_fn);
+		if ((fp = fopen(fn, "w")) != 0) {
+			for (a = 0; a < n; ++a) fprintf(fp, "%d\t%s\n", a, p->ed_gtab->name[a]);
+			fprintf(fp, "%d\tbest\n%d\tflags\n", n, n + 1);
+			fclose(fp);
+		}
+		free(fn);
+	}
+	if (p->ed_fp) fclose(p->ed_fp);
+	if (ed_prof > 0) fprintf(stderr, "EDPROF reads %ld tiles %ld expanded %ld locate_calls %ld located_rows %ld\n", (long)ed_cnt[0], (long)ed_cnt[1], (long)ed_cnt[2], (long)ed_cnt[3], (long)ed_cnt[4]);
+	if (p->ed_hist) {
+		FILE *fp = fopen(o->ed_hist_fn, "w");
+		if (fp == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write --ed-hist '%s'\n", o->ed_hist_fn);
+		} else {
+			rb3_edhist_write(fp, p->ed_hist, (const char *const*)p->ed_gtab->name, o->err_alpha);
+			fclose(fp);
+		}
+		if (rb3_verbose >= 3 && p->ed_hist->n[0] > 0) {
+			const rb3_edhist_t *h = p->ed_hist;
+			int64_t cum = 0;
+			int32_t k;
+			fprintf(stderr, "[M::%s] %ld reads, best edits <=k for k=0..3:", __func__, (long)h->n[0]);
+			for (k = 0; k <= 3 && k <= h->cap[0]; ++k)
+				cum += h->best[0][k], fprintf(stderr, " %.2f%%", 100.0 * cum / h->n[0]);
+			fprintf(stderr, "; NA %.2f%%; %ld truncated, %ld with a repetitive tile\n", 100.0 * h->best[0][h->cap[0] + 1] / h->n[0],
+					(long)h->n_trunc[0], (long)h->n_rep[0]);
+		}
+		rb3_edhist_destroy(p->ed_hist);
+	}
+	rb3_gtab_destroy(p->ed_gtab);
+}
+
 static void write_refmap(step_t *t)
 {
 	const pipeline_t *p = t->p;
@@ -918,7 +1774,7 @@ static void write_refmap(step_t *t)
 		int kmer = p->opt->kmer_len > 0;
 		if (r->n_sub > 0) { // per-assembly mode: one line per assembly (sub->assemblies borrows r->assemblies)
 			for (k = 0; k < r->n_sub; ++k) {
-				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ);
+				write_refmap1(&out, f, s, &r->sub[k], kmer, p->opt->report_occ, p->opt->err_stats, p->err_edit, p->opt->err_cigar, p->opt->filter_stats);
 				fputs(out.s, stdout);
 				refmap_rst_accumulate(p->ps4g_acc, &r->sub[k]);
 				write_ps4g_read(p->ps4g_per_read_fp, f, s, &r->sub[k]);
@@ -927,18 +1783,334 @@ static void write_refmap(step_t *t)
 			}
 			free(r->sub);
 		} else {
-			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ);
+			write_refmap1(&out, f, s, r, kmer, p->opt->report_occ, p->opt->err_stats, p->err_edit, p->opt->err_cigar, p->opt->filter_stats);
+			if (t->pe) { // --paired: one extra column, the pair class (MOVED = this mate was rescued)
+				const rb3_pe_res_t *e = &t->pe[j >> 1];
+				out.l--; // drop the newline
+				rb3_sprintf_lite(&out, "\t%s\n", e->cls == RB3_PE_RESC && e->rescued == (j & 1)? "MOVED" : rb3_pe_class_str[(int)e->cls]);
+			}
 			fputs(out.s, stdout);
-			refmap_rst_accumulate(p->ps4g_acc, r);
-			write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
+			if (t->pe == 0 || t->pe[j >> 1].cls == RB3_PE_DISC) { // single-end, or a discordant mate: its own event
+				refmap_rst_accumulate(p->ps4g_acc, r);
+				write_ps4g_read(p->ps4g_per_read_fp, f, s, r);
+			} else if (t->pe[j >> 1].anchor == (j & 1)) // one event per pair, at the anchor mate
+				refmap_pair_event(p, s, r, &t->refmap[j ^ 1]);
 			refmap_count_hit(p, r->status);
 		}
+		if (p->ed_gtab) refmap_ed_write((pipeline_t*)p, t, j);
+	}
+	for (j = 0; j < t->n_seq; ++j) { // after all rows: a pair event reads its mate's gametes
+		refmap_rst_t *r = &t->refmap[j];
+		free(r->ed);
 		free(r->assemblies);
 		free(r->gametes);
-		free(s->seq);
-		free(s->name);
+		free(r->proj_rsid);
+		free(r->proj_pos);
+		free(r->proj_gid);
+		free(r->proj_strand);
+		free(r->cigar);
+		free(t->seq[j].seq);
+		free(t->seq[j].name);
 	}
 	free(out.s);
+}
+
+/********************************************************************
+ * refmap --err-max-events / --max-ref-span / --pe-drop-disc
+ ********************************************************************/
+static inline int refmap_is_placed(const refmap_rst_t *r) { return r->status == RB3_RM_EXACT || r->status == RB3_RM_PLACED; }
+
+static inline void refmap_filter1(pipeline_t *p, refmap_rst_t *r, char why, int which)
+{
+	if (!refmap_is_placed(r)) return;
+	r->status = RB3_RM_FILTERED, r->filt = why, ++p->err_nfilt[which];
+}
+
+static inline int64_t refmap_se_span(const refmap_rst_t *r) // walk path / kmer: the bracket
+{
+	return r->span >= 0? r->span : r->cR >= r->cL && r->cL >= 0? r->cR - r->cL : 0;
+}
+
+static inline int32_t refmap_pair_ev(const refmap_rst_t *a, const refmap_rst_t *b) // no core counts as the cap
+{
+	int32_t e = (a->n_ev < 0? RB3_ERR_CAP : a->n_ev) + (b->n_ev < 0? RB3_ERR_CAP : b->n_ev);
+	return e < RB3_ERR_CAP? e : RB3_ERR_CAP;
+}
+
+// edit mode: '=' bases (0 without a core) and their match_frac test; per pair = sum '=' / sum length
+static inline int refmap_mf_fail(int64_t n_eq, int64_t len, double min_mf)
+{
+	return min_mf > 0.0 && (len <= 0 || (double)n_eq < min_mf * (double)len - 1e-9);
+}
+
+// Step 1, before pairing: single-end event + match_frac + overhang + span filters, or the pair-sum
+// event / match_frac filters and the pair overhang filter (both mates).
+static void refmap_filter_pre(pipeline_t *p, step_t *t)
+{
+	int32_t j;
+	double mmf = p->opt->min_match_frac;
+	if (!p->opt->paired) {
+		for (j = 0; j < t->n_seq; ++j) {
+			refmap_rst_t *r = &t->refmap[j];
+			if (!refmap_is_placed(r)) continue;
+			if (p->err_cut >= 0 && (r->n_ev < 0 || r->n_ev > p->err_cut)) refmap_filter1(p, r, 'e', 0);
+			else if (refmap_mf_fail(r->n_eq > 0? r->n_eq : 0, r->qlen, mmf)) refmap_filter1(p, r, 'm', 3);
+			else if (p->opt->err_clip_rej && r->ovh > 0) refmap_filter1(p, r, 'C', 4);
+			else if (p->opt->max_ref_span > 0 && refmap_se_span(r) > p->opt->max_ref_span) refmap_filter1(p, r, 'S', 1);
+		}
+	} else if (p->err_cut >= 0 || mmf > 0.0 || p->opt->err_clip_rej) {
+		for (j = 0; j + 1 < t->n_seq; j += 2) {
+			refmap_rst_t *a = &t->refmap[j], *b = &t->refmap[j+1];
+			if (p->err_cut >= 0 && refmap_pair_ev(a, b) > p->err_cut)
+				refmap_filter1(p, a, 'e', 0), refmap_filter1(p, b, 'e', 0);
+			else if (refmap_mf_fail((int64_t)(a->n_eq > 0? a->n_eq : 0) + (b->n_eq > 0? b->n_eq : 0), (int64_t)a->qlen + b->qlen, mmf))
+				refmap_filter1(p, a, 'm', 3), refmap_filter1(p, b, 'm', 3);
+			else if (p->opt->err_clip_rej && (a->ovh > 0 || b->ovh > 0))
+				refmap_filter1(p, a, 'C', 4), refmap_filter1(p, b, 'C', 4);
+		}
+	}
+}
+
+// Reference span of a resolved pair: first-to-last coordinate of both mates (CONC/RESC/DISC on one
+// sequence), RB3_SPAN_INF for a DISC pair across sequences, the placed mate's own span for SOLO.
+static int64_t refmap_pair_span(const rb3_pe_res_t *e, const refmap_rst_t *a, const refmap_rst_t *b)
+{
+	int64_t lo, hi;
+	if (e->cls == RB3_PE_NONE) return -1;
+	if (e->cls == RB3_PE_SOLO) return refmap_se_span(e->anchor? b : a);
+	if (a->ref_sid != b->ref_sid) return RB3_SPAN_INF;
+	lo = a->cL < b->cL? a->cL : b->cL, hi = a->cR > b->cR? a->cR : b->cR;
+	return hi - lo;
+}
+
+// Step 1, after pairing: --pe-drop-disc and the pair span cap (both mates FILTERED).
+static void refmap_filter_pairs(pipeline_t *p, step_t *t)
+{
+	int32_t i;
+	for (i = 0; i < t->n_seq / 2; ++i) {
+		const rb3_pe_res_t *e = &t->pe[i];
+		refmap_rst_t *a = &t->refmap[2*i], *b = &t->refmap[2*i+1];
+		if (p->opt->pe_drop_disc && e->cls == RB3_PE_DISC)
+			refmap_filter1(p, a, 'D', 2), refmap_filter1(p, b, 'D', 2);
+		else if (p->opt->max_ref_span > 0 && refmap_pair_span(e, a, b) > p->opt->max_ref_span)
+			refmap_filter1(p, a, 'S', 1), refmap_filter1(p, b, 'S', 1);
+	}
+}
+
+// Calibration pre-pass (--err-max-events=auto, --err-hist): events of the first opt->err_calib reads
+// (pairs) of the input, exactly as the main pass counts them; fit the error model; set p->err_cut.
+typedef struct {
+	const pipeline_t *p;
+	m_seq_t *seq;
+	int16_t *ev;
+	int32_t *eq; // edit mode: '=' bases (-1 = no core)
+	void **km;
+} err_cal_t;
+
+static void err_cal_worker(void *data, long i, int tid)
+{
+	err_cal_t *c = (err_cal_t*)data;
+	m_seq_t *s = &c->seq[i];
+	rb3_sai_t Iq;
+	int32_t st = 0, en = 0;
+	rb3_char2nt6(s->len, s->seq);
+	if (c->p->opt->trim_polya > 0) m_trim_polya(s, c->p->opt->trim_polya);
+	if (!refmap_core(c->km[tid], c->p, s, &Iq, &st, &en)) c->ev[i] = -1, c->eq[i] = -1;
+	else if (c->p->err_edit) {
+		err_ed_t e;
+		refmap_err_edits(&c->p->fmi, s->len, s->seq, &Iq, st, en, &e, 0);
+		c->ev[i] = e.ed < RB3_ERR_CAP? e.ed : RB3_ERR_CAP, c->eq[i] = e.n_eq;
+	} else c->ev[i] = refmap_err_events(&c->p->fmi, s->len, s->seq, &Iq, st, en), c->eq[i] = -1;
+}
+
+// edit mode --err-hist: match_frac histogram, bin = floor(100 * match_frac) in 0..100
+#define RB3_MF_NBIN 101
+static inline int32_t err_mf_bin(int64_t eq, int64_t len)
+{
+	int32_t b = len > 0? (int32_t)((double)eq * 100.0 / (double)len + 1e-9) : 0;
+	return b < 0? 0 : b > 100? 100 : b;
+}
+
+static void err_write_mf_hist(FILE *fp, const char *unit, const int64_t *h)
+{
+	int64_t n = 0, ge = 0;
+	int32_t k;
+	for (k = 0; k < RB3_MF_NBIN; ++k) n += h[k];
+	fprintf(fp, "#unit=%s\tn=%ld\tbin = floor(100 * match_frac); cum_ge = fraction with match_frac >= bin/100\n", unit, (long)n);
+	for (k = RB3_MF_NBIN - 1; k >= 0; --k) {
+		ge += h[k];
+		fprintf(fp, "%s\t%d\t%ld\t%.6f\t%.6f\n", unit, k, (long)h[k], n? (double)h[k] / n : 0.0, n? (double)ge / n : 0.0);
+	}
+}
+
+static int refmap_err_calibrate(pipeline_t *p, const char *fn1, const char *fn2, int is_line)
+{
+	const rb3_mopt_t *o = p->opt;
+	int32_t nm = o->paired? 2 : 1, chunk = 200000, k, cut, i;
+	int64_t n_frag = 0, hist_r[RB3_ERR_CAP+1], hist_p[RB3_ERR_CAP+1], mf_r[RB3_MF_NBIN], mf_p[RB3_MF_NBIN];
+	int32_t *qlen;
+	rb3_seqio_t *fp, *fp2 = 0;
+	err_cal_t c;
+	rb3_errfit_t fit_r, fit_p;
+	memset(hist_r, 0, sizeof(hist_r)), memset(hist_p, 0, sizeof(hist_p)), memset(mf_r, 0, sizeof(mf_r)), memset(mf_p, 0, sizeof(mf_p));
+	if ((fp = rb3_seq_open(fn1, is_line)) == 0 || (fn2 && (fp2 = rb3_seq_open(fn2, is_line)) == 0)) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --err-*: failed to open '%s' for calibration\n", fp? fn2 : fn1);
+		if (fp) rb3_seq_close(fp);
+		return -1;
+	}
+	c.p = p, c.seq = RB3_CALLOC(m_seq_t, chunk), c.ev = RB3_CALLOC(int16_t, chunk), c.km = RB3_CALLOC(void*, o->n_threads);
+	c.eq = RB3_CALLOC(int32_t, chunk), qlen = RB3_CALLOC(int32_t, chunk);
+	for (i = 0; i < o->n_threads; ++i) c.km[i] = km_init();
+	while (n_frag < o->err_calib) {
+		int32_t n = 0;
+		while (n + nm <= chunk && n_frag < o->err_calib) {
+			int64_t len;
+			const char *name;
+			char *ss;
+			for (k = 0; k < nm; ++k) {
+				if ((ss = rb3_seq_read1(k == 1 && fp2? fp2 : fp, &len, &name)) == 0) break;
+				c.seq[n + k].seq = (uint8_t*)rb3_strdup(ss), c.seq[n + k].len = len;
+			}
+			if (k < nm) { for (i = 0; i < k; ++i) free(c.seq[n + i].seq); break; }
+			n += nm, ++n_frag;
+		}
+		if (n == 0) break;
+		kt_for(o->n_threads, err_cal_worker, &c, n);
+		for (i = 0; i < n; ++i) {
+			if (c.ev[i] >= 0) ++hist_r[c.ev[i] < RB3_ERR_CAP? c.ev[i] : RB3_ERR_CAP];
+			if (p->err_edit && c.eq[i] >= 0) ++mf_r[err_mf_bin(c.eq[i], c.seq[i].len)];
+			qlen[i] = c.seq[i].len;
+			free(c.seq[i].seq);
+		}
+		if (nm == 2)
+			for (i = 0; i + 1 < n; i += 2) {
+				refmap_rst_t a, b;
+				a.n_ev = c.ev[i], b.n_ev = c.ev[i+1];
+				++hist_p[refmap_pair_ev(&a, &b)];
+				if (p->err_edit) // a coreless mate adds its length and no '=' bases
+					++mf_p[err_mf_bin((int64_t)(c.eq[i] > 0? c.eq[i] : 0) + (c.eq[i+1] > 0? c.eq[i+1] : 0), (int64_t)qlen[i] + qlen[i+1])];
+			}
+		if (n < chunk - nm + 1 && n_frag < o->err_calib) break; // input exhausted
+	}
+	for (i = 0; i < o->n_threads; ++i) km_destroy(c.km[i]);
+	free(c.km), free(c.seq), free(c.ev), free(c.eq), free(qlen);
+	rb3_seq_close(fp);
+	if (fp2) rb3_seq_close(fp2);
+	rb3_err_fit(hist_r, RB3_ERR_CAP, &fit_r);
+	if (nm == 2) rb3_err_fit(hist_p, RB3_ERR_CAP, &fit_p);
+	{
+		const rb3_errfit_t *fu = nm == 2? &fit_p : &fit_r;
+		cut = fu->ok? rb3_err_cutoff(fu->mu0, o->err_alpha, RB3_ERR_CAP) : RB3_ERR_CAP - 1;
+		if (o->err_max_ev == -2) p->err_cut = cut;
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] %ld %s: error component pi0=%.4f mu0=%.4f, tail mu1=%.3f; P(Poisson(mu0) > K) <= %g at K=%d%s\n",
+					__func__, (long)n_frag, nm == 2? "pairs" : "reads", fu->pi0, fu->mu0, fu->mu1, o->err_alpha, cut,
+					o->err_max_ev == -2? " (in force)" : "");
+	}
+	if (o->err_hist_fn) {
+		FILE *hf = fopen(o->err_hist_fn, "w");
+		if (hf == 0) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to open --err-hist file '%s'\n", o->err_hist_fn);
+			return -1;
+		}
+		fprintf(hf, "#ropebwt3 refmap error profile: events = edits explaining the read against one carrier of its exact core%s\n",
+				p->err_edit? " (edit mode: per base, overhang = its length)" : "");
+		fprintf(hf, "#calibration %s=%ld\n", nm == 2? "pairs" : "reads", (long)n_frag);
+		fprintf(hf, "unit\tk\tcount\tfrac\tcum_frac\terr_expected\tpost_err\n");
+		rb3_err_write_hist(hf, "read", hist_r, RB3_ERR_CAP, &fit_r, o->err_alpha, rb3_err_cutoff(fit_r.mu0, o->err_alpha, RB3_ERR_CAP));
+		if (nm == 2) rb3_err_write_hist(hf, "pair", hist_p, RB3_ERR_CAP, &fit_p, o->err_alpha, rb3_err_cutoff(fit_p.mu0, o->err_alpha, RB3_ERR_CAP));
+		if (p->err_edit) { // edit mode: events above are edits; then the match_frac histograms
+			fprintf(hf, "#match_frac = '=' bases / read length against the extension's carrier (pair: sum / sum)\n");
+			fprintf(hf, "unit\tbin\tcount\tfrac\tcum_ge\n");
+			err_write_mf_hist(hf, "read_mf", mf_r);
+			if (nm == 2) err_write_mf_hist(hf, "pair_mf", mf_p);
+		}
+		fclose(hf);
+	}
+	return 0;
+}
+
+/********************************************************************
+ * --paired: mate pairing over one batch (refmap)
+ ********************************************************************/
+#define RB3_PE_MIN_PAIRS       25   // fewest EXACT-EXACT pairs for a batch's own insert-size estimate
+#define RB3_PE_DEFAULT_MAX_INS 1000 // max insert used until some batch yields an estimate
+#define RB3_PE_EST_WIN 10000 // mem/chain: largest span accepted into the insert-size sample
+
+// Update p->isize from one batch's fragment spans (span[] is sorted in place); warn once while
+// no batch has had enough pairs. Runs in pipeline step 1 (serialized across batches).
+static void pe_update_isize(pipeline_t *p, int64_t *span, int32_t n_span)
+{
+	rb3_isize_t is;
+	if (rb3_pe_isize_estimate(span, n_span, RB3_PE_MIN_PAIRS, &is)) {
+		p->isize = is;
+		if (rb3_verbose >= 3)
+			fprintf(stderr, "[M::%s] insert size from %d pairs: mean %.1f, sd %.1f, max %ld\n", __func__,
+					is.n, is.mean, is.sd, (long)is.max_ins);
+	} else if (!p->isize.ok && !p->pe_warned && rb3_verbose >= 2) {
+		fprintf(stderr, "WARNING: only %d confidently placed pairs in a batch (need %d) to estimate the insert size; "
+						"using max insert %d until one does (or pass --pe-isize)\n", n_span, RB3_PE_MIN_PAIRS, RB3_PE_DEFAULT_MAX_INS);
+		p->pe_warned = 1;
+	}
+}
+
+static inline int8_t refmap_pe_rank(const refmap_rst_t *r)
+{
+	if (r->ref_sid < 0) return 0;
+	return r->status == RB3_RM_EXACT? 2 : r->status == RB3_RM_PLACED? 1 : 0;
+}
+
+// Estimate the insert size from the batch's confidently placed pairs (both mates EXACT on one
+// contig, opposite strands; span = fragment end - fragment start), then classify every pair
+// and move rescued mates next to their anchor. Runs in pipeline step 1, which kt_pipeline
+// serializes across batches, so updating p->isize / p->pe_cnt here is race-free.
+static void refmap_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	int64_t max_dist;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	if (!p->isize_fixed) {
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		for (i = 0; i < n_pair; ++i) {
+			const refmap_rst_t *a = &t->refmap[2*i], *b = &t->refmap[2*i+1];
+			if (a->status != RB3_RM_EXACT || b->status != RB3_RM_EXACT) continue;
+			if (a->ref_sid != b->ref_sid || a->strand == b->strand) continue;
+			span[n_span++] = (a->cR > b->cR? a->cR : b->cR) - (a->cL < b->cL? a->cL : b->cL);
+		}
+		pe_update_isize(p, span, n_span);
+		free(span);
+	}
+	max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	for (i = 0; i < n_pair; ++i) {
+		refmap_rst_t *r[2];
+		rb3_pe_mate_t m[2];
+		int k;
+		r[0] = &t->refmap[2*i], r[1] = &t->refmap[2*i+1];
+		for (k = 0; k < 2; ++k) {
+			m[k].rank = refmap_pe_rank(r[k]);
+			m[k].rsid = r[k]->ref_sid, m[k].pos = r[k]->cL;
+			m[k].n_proj = r[k]->n_proj, m[k].proj_rsid = r[k]->proj_rsid, m[k].proj_pos = r[k]->proj_pos;
+			m[k].proj_gid = r[k]->proj_gid;
+		}
+		rb3_pe_resolve(m, max_dist, p->opt->pe_trust_exact, &t->pe[i]);
+		if (t->pe[i].cls == RB3_PE_RESC) { // move the mate; keep only founders whose own copy projected there
+			const rb3_pe_res_t *e = &t->pe[i];
+			refmap_rst_t *q = r[(int)e->rescued];
+			const rb3_pe_mate_t *a = &m[(int)e->anchor];
+			if (q->proj_gid && q->gametes) {
+				int64_t nw = p->opt->pe_near_win > 0? p->opt->pe_near_win : max_dist;
+				int32_t ng = rb3_pe_near_gametes(&m[(int)e->rescued], a->rsid, a->pos, nw, q->gametes);
+				if (ng > 0) q->n_gametes = ng; // q->gametes holds n_asm >= n_proj entries
+			}
+			if (q->status == RB3_RM_EXACT) { // moved to another reference copy: keep its length, take its strand
+				int32_t c;
+				for (c = 0; c < q->n_proj; ++c)
+					if (q->proj_rsid[c] == e->resc_rsid && q->proj_pos[c] == e->resc_pos) { q->strand = q->proj_strand[c]; break; }
+				q->cR = e->resc_pos + (q->cR - q->cL), q->cL = e->resc_pos, q->ref_sid = e->resc_rsid;
+			} else q->ref_sid = e->resc_rsid, q->cL = q->cR = e->resc_pos;
+		}
+		++p->pe_cnt[(int)t->pe[i].cls];
+	}
 }
 
 /********************************************************************
@@ -1087,6 +2259,65 @@ static inline int64_t pav_fwd_pos(const rb3_fmi_t *f, const rb3_pos_t *t, int32_
 // rows (741 full-length, 31 3'-tag) at **0.0%** source recall -- every one named the wrong
 // assembly. 3'-tag libraries generate these by design (polyA priming), so gate on
 // composition, not length. See pav_e1_findings_2026-07-26.md.
+// chain --dup-count: a collapsed duplicate read is named "<name>;x=N" (N identical reads); it adds N
+// to the PS4G/npy counts. Without the option, or without a valid suffix, every read counts once.
+static int32_t chain_read_weight(const pipeline_t *p, const m_seq_t *s)
+{
+	const char *q;
+	long n;
+	if (!p->opt->dup_count || s->name == 0 || (q = strstr(s->name, ";x=")) == 0) return 1;
+	n = strtol(q + 3, 0, 10);
+	return n > 0 && n < INT32_MAX? (int32_t)n : 1;
+}
+
+// One chain output row. Single-end prints it at once; --paired collects a read's rows in a sink so
+// both mates can be compared before anything is printed or counted.
+typedef struct {
+	int32_t rsid;     // reference contig
+	int64_t pos, hi;  // row position (segment start / projected position) and segment end
+	int32_t *acc, na; // founder (gamete) set, sorted
+	int8_t pav;       // 1: "pav:"-prefixed, grid-snapped insertion row
+	int8_t extra;     // 5th column of a pav: row (insertion/diverged flag), -1 if none
+	int8_t lift;      // 1: from the lift-projection (PAV) path
+} chain_row_t;
+
+typedef struct {
+	chain_row_t *a;
+	int32_t n, m;
+	int8_t strand;    // reference chain's strand
+	int32_t bases;    // query bases in the reference chain
+} chain_sink_t;
+
+static void chain_print_row(const pipeline_t *p, const char *name, int name_len, const chain_row_t *r, int32_t w, const char *cls)
+{
+	const char *nm = p->fmi.sid->name[r->rsid], *us = strchr(nm, '_');
+	int32_t i;
+	if (p->ps4g_acc && r->na > 0) rb3_ps4g_acc_add_w(p->ps4g_acc, r->rsid, r->pos, r->acc, r->na, w);
+	printf("%.*s\t%s%s\t%ld\t", name_len, name, r->pav? "pav:" : "", us? us + 1 : nm, (long)r->pos);
+	for (i = 0; i < r->na; ++i) printf("%s%d", i? "," : "", r->acc[i]);
+	if (r->extra >= 0) printf("\t%d", r->extra);
+	if (cls) printf("\t%s", cls);
+	putchar('\n');
+}
+
+// Emit (sk == NULL) or collect one row of read s.
+static void chain_put_row(const pipeline_t *p, chain_sink_t *sk, const m_seq_t *s, int32_t rsid, int64_t pos, int64_t hi,
+						  const int32_t *acc, int32_t na, int pav, int extra, int lift)
+{
+	chain_row_t r;
+	r.rsid = rsid, r.pos = pos, r.hi = hi, r.na = na, r.pav = pav, r.extra = extra, r.lift = lift;
+	if (sk == 0) {
+		const char *nm = s->name? s->name : "?";
+		r.acc = (int32_t*)acc;
+		chain_print_row(p, nm, (int)strlen(nm), &r, chain_read_weight(p, s), 0);
+		return;
+	}
+	r.acc = RB3_MALLOC(int32_t, na > 0? na : 1);
+	memcpy(r.acc, acc, na * sizeof(int32_t));
+	RB3_GROW(chain_row_t, sk->a, sk->n, sk->m);
+	sk->a[sk->n++] = r;
+}
+
 static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 {
 	int32_t cnt[7], i, c, best = 0, n = qe - qs;
@@ -1110,7 +2341,7 @@ static int pav_low_complexity(const m_seq_t *s, int32_t qs, int32_t qe)
 // wrong singletons -- see RopeBWTGrits-eval/experiments/pav_e1_findings_2026-07-26.md.
 // This mirrors what chain_emit does in reference space (colinear DP, then intersect over
 // the winning chain only).
-static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
+static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km, chain_sink_t *sk)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1234,8 +2465,6 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 		// being the STRICTEST setting: with no grid the tolerance fell back to --gap-intron
 		// (30bp), so insertions carried by several assemblies were silently suppressed.
 		if (nmaj > 0 && bestn == np && disp <= p->opt->pav_agree) {
-			const char *nm = f->sid->name[best_rsid], *us = strchr(nm, '_');
-			const char *contig = us? us + 1 : nm;
 			int is_insertion = n_insertion * 2 >= nmaj;   // majority of projections were true breakpoints
 			// A DIVERGED row is not a PAV: the sequence is in the reference, just too divergent
 			// to share a SMEM, and the projection is a real colinear coordinate rather than a
@@ -1248,9 +2477,22 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			if (!is_insertion) {
 				if (p->opt->diverged_rows == 2) goto pav_done;          // drop
 				if (p->opt->diverged_rows == 0) {                        // ordinary row, exact position
-					printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)med);
-					for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
-					putchar('\n');
+					chain_put_row(p, sk, s, best_rsid, med, med, acc, na, 0, -1, 1);
+					goto pav_done;
+				}
+			} else {
+				// --insertion-rows: same routing as --diverged-rows, but for TRUE insertions. The
+				// "ordinary" choice places the read inline on its real reference contig at the exact
+				// (unsnapped) median -- this is MORE precise than the grid-snapped pav: row below,
+				// which floors rather than centers (bp = med/grid*grid). It exists because the
+				// downstream windower groups PS4G/npy rows by contig (ropebwt_npy_to_matrix.py), so a
+				// `pav:chr1` row is a separate pseudo-chromosome disconnected from `chr1` -- "ordinary"
+				// keeps insertion evidence positionally inline with everything else on the real contig.
+				// DEFAULT stays `pav` (grid-snapped, prefixed): this branch changes nothing unless
+				// explicitly requested.
+				if (p->opt->insertion_rows == 2) goto pav_done;          // drop
+				if (p->opt->insertion_rows == 0) {                       // ordinary row, exact median, no snap
+					chain_put_row(p, sk, s, best_rsid, med, med, acc, na, 0, -1, 1);
 					goto pav_done;
 				}
 			}
@@ -1261,14 +2503,17 @@ static void chain_emit_pav(const pipeline_t *p, const m_seq_t *s, void *km)
 			// showed source recall is 100% in every spread bucket, i.e. the assembly sets are
 			// right and only the aggregation key moved. 5 kb -> 72% of insertions in one bin.
 			int64_t bp = p->opt->pav_grid > 0? med / p->opt->pav_grid * p->opt->pav_grid : med;
-			printf("%s\tpav:%s\t%ld\t", s->name? s->name : "?", contig, (long)bp);
-			for (i = 0; i < na; ++i) printf("%s%d", i? "," : "", acc[i]);
+			// PS4G/npy accumulate under the REAL ref_sid + snapped bp -- the accumulator has no
+			// concept of the `pav:` contig prefix (it is stdout-only, added at
+			// rb3_ps4g_npy_finalize/ps4g.c time from sid->name), so this shares bins with ordinary
+			// rows on the same contig at the same coarse position. Known gap, not resolved here --
+			// see the design note on --insertion-rows above; --insertion-rows=ordinary avoids it.
 			// 5th column = row class. 1 = INSERTION: absent from the reference, placed at
 			// the nearest reference breakpoint, approximate (presence/absence only).
 			// 0 = DIVERGED: present in the reference but too divergent to share a SMEM,
 			// so the coordinate is colinear and exact. Only insertions reach here --
 			// diverged rows are routed by --diverged-rows (default: ordinary row).
-			printf("\t%d\n", is_insertion? 1 : 0);
+			chain_put_row(p, sk, s, best_rsid, bp, bp, acc, na, 1, is_insertion? 1 : 0, 1);
 		}
 	}
 pav_done:
@@ -1276,7 +2521,65 @@ pav_done:
 	free(acc); free(clu); free(cand); free(cs);
 }
 
-static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
+// chain --support=best: replace the chain-wide intersection by the assemblies that best explain
+// the read. Placement is unchanged (the reference-hitting colinear chain); support is counted over
+// the chain's SMEMs PLUS the read's assembly-only SMEMs (no reference occurrence -- the ones the
+// intersection rule discards: a donor-allele read with a SNP vs the reference is matched longer by
+// the assembly carrying that allele). An assembly-only SMEM occurrence counts for its gamete only
+// if, with --lift and --support-win > 0, it projects onto the chain's reference contig within
+// support_win bp of the chain's reference span (a paralog elsewhere does not count). Per gamete:
+// the number of read bases covered by the counted SMEMs that occur in it; the set is every gamete
+// within support_tol bases of the best. Non-chain SMEMs that do hit the reference are ignored, as
+// in the default rule. Writes the sorted set to acc (capacity n_gamete) and returns its size.
+static int32_t chain_support_best(const pipeline_t *p, const m_seq_t *s, void *km, const chain_sm_t *cs,
+								  const int32_t *chain, int32_t nc, int64_t rlo, int64_t rhi, int32_t *acc)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	const rb3_gtab_t *gt = p->gtab;
+	int32_t ng = gt->n_gamete, len = s->len, i, k, g, best = 0, na = 0;
+	int32_t rsid0 = cs[chain[0]].rsid;
+	uint8_t *mask;
+	int32_t *cov;
+	if (len <= 0) return 0;
+	mask = RB3_CALLOC(uint8_t, (int64_t)ng * len);
+	cov = RB3_CALLOC(int32_t, ng);
+	for (i = 0; i < nc; ++i) { // the placement chain's SMEMs: every gamete they occur in
+		const chain_sm_t *c = &cs[chain[i]];
+		for (k = 0; k < c->n_gam; ++k)
+			memset(mask + (int64_t)c->gam[k] * len + c->qs, 1, c->qe - c->qs);
+	}
+	for (i = 0; i < s->n_mem; ++i) { // assembly-only SMEMs near the chain locus
+		const m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info, nref = 0;
+		if (r->n_pos == 0 || (int64_t)r->mem.size > p->opt->chain_max_occ) continue;
+		for (k = 0; k < r->n_pos; ++k) if (p->is_ref[r->pos[k].sid>>1]) ++nref;
+		if (nref > 0) continue;
+		for (k = 0; k < r->n_pos; ++k) {
+			const rb3_pos_t *t = &r->pos[k];
+			g = gt->sid2g[t->sid>>1];
+			if (g < 0 || g >= ng) continue;
+			if (p->lift && p->opt->support_win > 0) {
+				int64_t rsid, rpos;
+				if (!rb3_lift_project(p->lift, km, (int32_t)(t->sid>>1), pav_fwd_pos(f, t, en - st),
+									  p->opt->lift_win, p->opt->lift_mad, 4, &rsid, &rpos)) continue;
+				if (rsid != rsid0 || rpos < rlo - p->opt->support_win || rpos > rhi + p->opt->support_win) continue;
+			}
+			memset(mask + (int64_t)g * len + st, 1, en - st);
+		}
+	}
+	for (g = 0; g < ng; ++g) {
+		const uint8_t *m = mask + (int64_t)g * len;
+		for (k = 0; k < len; ++k) cov[g] += m[k];
+		if (cov[g] > best) best = cov[g];
+	}
+	if (best > 0)
+		for (g = 0; g < ng; ++g)
+			if (cov[g] > 0 && cov[g] >= best - p->opt->support_tol) acc[na++] = g;
+	free(mask); free(cov);
+	return na;
+}
+
+static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km, chain_sink_t *sk)
 {
 	const rb3_fmi_t *f = &p->fmi;
 	const rb3_gtab_t *gt = p->gtab;
@@ -1314,7 +2617,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	}
 	if (n == 0) { // no ref anchor -> try the PAV breakpoint path (which reads s->mem[].pos)
 		free(cs);
-		if (p->lift) chain_emit_pav(p, s, km);
+		if (p->lift) chain_emit_pav(p, s, km, sk);
 		for (i = 0; i < s->n_mem; ++i) free(s->mem[i].pos);
 		return;
 	}
@@ -1330,6 +2633,7 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t rj = cs[j].rpos, dr = strand? rj - ri : ri - rj;
 			int64_t dq = cs[i].qs - cs[j].qe, unexp;
 			int32_t anch; int64_t sc;
+			if (cs[j].rsid != cs[i].rsid) continue;       // different contigs: positions are not comparable
 			if (dr < 0 || cs[j].qs > cs[i].qs) continue;  // out of order -> not colinear
 			if (dq < 0) dq = 0;
 			unexp = dr - dq; if (unexp < 0) unexp = 0;    // intron length / paralog jump
@@ -1362,26 +2666,31 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 			int64_t *ivlo = RB3_MALLOC(int64_t, nc), *ivhi = RB3_MALLOC(int64_t, nc);
 			memcpy(acc, cs[chain[0]].gam, na * sizeof(int32_t));
 			for (i = 1; i < nc; ++i) na = chain_isect(acc, na, cs[chain[i]].gam, cs[chain[i]].n_gam);
+			for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
+			if (p->opt->support_best) { // founder set = best-explaining assemblies (see chain_support_best)
+				int64_t rlo = ivlo[0], rhi = ivhi[0];
+				for (i = 1; i < nc; ++i) { if (ivlo[i] < rlo) rlo = ivlo[i]; if (ivhi[i] > rhi) rhi = ivhi[i]; }
+				free(acc);
+				acc = RB3_MALLOC(int32_t, gt->n_gamete);
+				na = chain_support_best(p, s, km, cs, chain, nc, rlo, rhi, acc);
+			}
 			if (na > 0) { // segment forward intervals by intron-sized gaps, emit one row per segment
-				const char *nm = f->sid->name[cs[chain[0]].rsid], *us = strchr(nm, '_');
-				const char *contig = us? us + 1 : nm;
 				int64_t lo, hi;
-				for (i = 0; i < nc; ++i) ivlo[i] = cs[chain[i]].rpos, ivhi[i] = cs[chain[i]].rpos + (cs[chain[i]].qe - cs[chain[i]].qs);
+				if (sk) { // --paired: the chain's strand and size, for comparing mates
+					sk->strand = strand;
+					for (i = 0, sk->bases = 0; i < nc; ++i) sk->bases += cs[chain[i]].qe - cs[chain[i]].qs;
+				}
 				for (i = 0; i < nc - 1; ++i) // insertion sort ascending by start (nc is tiny)
 					for (j = i + 1; j < nc; ++j)
 						if (ivlo[j] < ivlo[i]) { int64_t t0 = ivlo[i], t1 = ivhi[i]; ivlo[i] = ivlo[j], ivhi[i] = ivhi[j], ivlo[j] = t0, ivhi[j] = t1; }
 				lo = ivlo[0], hi = ivhi[0];
 				for (i = 1; i < nc; ++i) {
 					if (ivlo[i] - hi > p->opt->gap_intron) { // intron gap -> flush this exon segment
-						printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
-						for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
-						putchar('\n');
+						chain_put_row(p, sk, s, cs[chain[0]].rsid, lo, hi, acc, na, 0, -1, 0);
 						lo = ivlo[i], hi = ivhi[i];
 					} else if (ivhi[i] > hi) hi = ivhi[i];
 				}
-				printf("%s\t%s\t%ld\t", s->name? s->name : "?", contig, (long)lo);
-				for (j = 0; j < na; ++j) printf("%s%d", j? "," : "", acc[j]);
-				putchar('\n');
+				chain_put_row(p, sk, s, cs[chain[0]].rsid, lo, hi, acc, na, 0, -1, 0);
 			}
 			free(ivlo); free(ivhi);
 			free(acc);
@@ -1392,18 +2701,94 @@ static void chain_emit(const pipeline_t *p, const m_seq_t *s, void *km)
 	free(chain); free(cs);
 }
 
+/********************************************************************
+ * --paired: chain
+ ********************************************************************/
+#define RB3_PE_LIFT_SLACK 2000 // extra gap allowed per lift-projected (PAV) mate: projections are ~kb-accurate
+
+static void chain_sink_span(const chain_sink_t *sk, rb3_pe_chain_t *c)
+{
+	int32_t i;
+	memset(c, 0, sizeof(*c));
+	if (sk->n == 0) { c->kind = RB3_PE_CHAIN_NONE, c->rsid = -1; return; }
+	c->kind = sk->a[0].lift? RB3_PE_CHAIN_LIFT : RB3_PE_CHAIN_REF;
+	c->rsid = sk->a[0].rsid, c->lo = sk->a[0].pos, c->hi = sk->a[0].hi, c->strand = sk->strand, c->bases = sk->bases;
+	for (i = 1; i < sk->n; ++i) {
+		if (sk->a[i].pos < c->lo) c->lo = sk->a[i].pos;
+		if (sk->a[i].hi > c->hi) c->hi = sk->a[i].hi;
+	}
+}
+
+static void chain_write_paired(pipeline_t *p, step_t *t, void *km)
+{
+	int32_t i, j, n_pair = t->n_seq / 2, n_span = 0;
+	chain_sink_t *sk = RB3_CALLOC(chain_sink_t, t->n_seq > 0? t->n_seq : 1);
+	int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1), max_gap;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	for (j = 0; j < t->n_seq; ++j) chain_emit(p, &t->seq[j], km, &sk[j]); // collect, print nothing yet
+	if (!p->isize_fixed) { // insert size: both mates single-segment reference chains, same contig, opposite strands
+		for (i = 0; i < n_pair; ++i) {
+			const chain_sink_t *a = &sk[2*i], *b = &sk[2*i+1];
+			if (a->n != 1 || b->n != 1 || a->a[0].lift || b->a[0].lift) continue;
+			if (a->a[0].rsid != b->a[0].rsid || a->strand == b->strand) continue;
+			span[n_span] = (a->a[0].hi > b->a[0].hi? a->a[0].hi : b->a[0].hi) - (a->a[0].pos < b->a[0].pos? a->a[0].pos : b->a[0].pos);
+			if (span[n_span] < RB3_PE_EST_WIN) ++n_span;
+		}
+		pe_update_isize(p, span, n_span);
+	}
+	max_gap = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->max_intron + p->opt->pe_slack;
+	for (i = 0; i < n_pair; ++i) {
+		const m_seq_t *s0 = &t->seq[2*i];
+		chain_sink_t *k[2];
+		rb3_pe_chain_t c[2];
+		rb3_pe_res_t *e = &t->pe[i];
+		const char *cls;
+		k[0] = &sk[2*i], k[1] = &sk[2*i+1];
+		chain_sink_span(k[0], &c[0]), chain_sink_span(k[1], &c[1]);
+		rb3_pe_chain_resolve(c, max_gap, RB3_PE_LIFT_SLACK, e);
+		++p->pe_cnt[(int)e->cls];
+		cls = rb3_pe_class_str[(int)e->cls];
+		if (e->cls == RB3_PE_DISC) { // each mate on its own, as single-end
+			for (j = 0; j < 2; ++j) {
+				const m_seq_t *s = &t->seq[2*i+j];
+				const char *nm = s->name? s->name : "?";
+				int32_t r;
+				for (r = 0; r < k[j]->n; ++r) chain_print_row(p, nm, (int)strlen(nm), &k[j]->a[r], chain_read_weight(p, s), cls);
+			}
+		} else if (e->cls == RB3_PE_CONC || e->cls == RB3_PE_SOLO) { // one event: the anchor's first row
+			const chain_sink_t *a = k[(int)e->anchor], *b = k[e->anchor ^ 1];
+			const char *nm = s0->name? s0->name : "?";
+			chain_row_t r = a->a[0];
+			int32_t *g = RB3_MALLOC(int32_t, a->a[0].na + (b->n > 0? b->a[0].na : 0) + 1);
+			r.na = rb3_pe_event_gametes(a->a[0].acc, a->a[0].na, 0, b->n > 0? b->a[0].acc : 0, b->n > 0? b->a[0].na : 0, 0, g);
+			r.acc = g;
+			chain_print_row(p, nm, rb3_pe_name_len(nm), &r, chain_read_weight(p, s0), cls);
+			free(g);
+		}
+	}
+	for (j = 0; j < t->n_seq; ++j) {
+		int32_t r;
+		for (r = 0; r < sk[j].n; ++r) free(sk[j].a[r].acc);
+		free(sk[j].a);
+	}
+	free(sk); free(span);
+}
+
 static void write_per_seq(step_t *t)
 {
 	const pipeline_t *p = t->p;
 	int32_t i, j;
 	kstring_t out = {0,0,0};
 	void *km = p->opt->algo == RB3_SA_CHAIN? km_init() : 0; // arena reused by the PAV lift projections
+	if (p->opt->algo == RB3_SA_CHAIN && p->opt->paired) // both mates first, then one event per pair
+		chain_write_paired((pipeline_t*)p, t, km);
 	for (j = 0; j < t->n_seq; ++j) {
 		m_seq_t *s = &t->seq[j];
-		free(s->seq);
+		if (p->opt->algo != RB3_SA_CHAIN) free(s->seq); // chain's PAV path still reads s->seq (pav_low_complexity)
 		out.l = 0;
 		if (p->opt->algo == RB3_SA_CHAIN) { // unite SMEMs -> per-read PS4G (per exon segment)
-			chain_emit(p, s, km);
+			if (!p->opt->paired) chain_emit(p, s, km, 0);
+			free(s->seq);
 		} else if (p->opt->algo == RB3_SA_SW && (p->opt->flag & RB3_MF_WRITE_ALL)) { // write all hits in a compact format
 			write_all_hits(&out, s, &t->rst[j], '+', p->opt->max_all_out);
 			rb3_swrst_free(&t->rst[j]);
@@ -1414,17 +2799,32 @@ static void write_per_seq(step_t *t)
 			fputs(out.s, stdout);
 		} else if (p->opt->algo == RB3_SA_SW) { // write PAF
 			rb3_swrst_t *r = &t->rst[j];
+			const char *pcls = t->pe? rb3_pe_class_str[(int)t->pe[j >> 1].cls] : 0;
+			uint8_t *keep = t->sw_keep? t->sw_keep[j] : 0; // --paired CONC: concordant positions only
 			if (r->n > 0) { // mapped
+				int32_t x = 0;
 				for (i = 0; i < r->n; ++i) {
+					rb3_swhit_t *h = &r->a[i];
+					if (keep) { // move the concordant positions to the front; drop the hit if it has none
+						int32_t k, m = 0;
+						for (k = 0; k < h->n_pos; ++k, ++x)
+							if (keep[x]) h->pos[m++] = h->pos[k];
+						if (m == 0) continue;
+						h->n_pos = m;
+					}
 					out.l = 0;
-					write_paf(&out, &p->fmi, &r->a[i], s);
+					write_paf(&out, &p->fmi, h, s);
+					if (pcls) out.l--, rb3_sprintf_lite(&out, "\tpe:Z:%s\n", pcls);
 					fputs(out.s, stdout);
 				}
 			} else if (p->opt->flag & RB3_MF_WRITE_UNMAP) { // unmapped
 				write_name(&out, s);
-				rb3_sprintf_lite(&out, "\t%d\t*\t*\t*\t*\t*\t*\t*\t0\t0\t0\n", s->len);
+				rb3_sprintf_lite(&out, "\t%d\t*\t*\t*\t*\t*\t*\t*\t0\t0\t0", s->len);
+				if (pcls) rb3_sprintf_lite(&out, "\tpe:Z:%s", pcls);
+				rb3_sprintf_lite(&out, "\n");
 				fputs(out.s, stdout);
 			}
+			if (keep) free(keep);
 			rb3_swrst_free(r);
 		} else if (p->opt->min_gap_len > 0) { // output regions not covered by long MEMs
 			for (i = 0; i < s->n_gap; ++i) {
@@ -1453,6 +2853,8 @@ static void write_per_seq(step_t *t)
 			}
 		} else { // output long MEMs
 			const rb3_fmi_t *f = &p->fmi;
+			const rb3_pe_res_t *e = t->pe? &t->pe[j >> 1] : 0; // --paired: this read's pair
+			int filt = e && e->cls == RB3_PE_CONC;            // concordant pair: print only concordant positions
 			for (i = 0; i < s->n_mem; ++i) {
 				m_sai_pos_t *r = &s->mem[i];
 				rb3_sai_t *q = &r->mem;
@@ -1461,16 +2863,20 @@ static void write_per_seq(step_t *t)
 				write_name(&out, s);
 				rb3_sprintf_lite(&out, "\t%d\t%d\t%ld", st, en, (long)q->size);
 				if (r->n_pos > 0) {
-					int32_t j;
-					rb3_sprintf_lite(&out, "\t%ld", r->n_pos);
+					int32_t j, nk = r->n_pos;
+					if (filt) for (j = 0, nk = 0; j < r->n_pos; ++j) nk += r->keep && r->keep[j];
+					rb3_sprintf_lite(&out, "\t%ld", (long)nk);
 					for (j = 0; j < r->n_pos; ++j) {
 						rb3_pos_t *t = &r->pos[j];
 						int64_t rlen = f->sid->len[t->sid>>1], pos;
+						if (filt && !(r->keep && r->keep[j])) continue;
 						pos = t->sid&1? rlen - (t->pos + (en - st)) : t->pos;
 						rb3_sprintf_lite(&out, "\t%s:%c:%ld", f->sid->name[t->sid>>1], "+-"[t->sid&1], pos);
 					}
 					free(r->pos);
 				}
+				free(r->keep);
+				if (e) rb3_sprintf_lite(&out, "\t%s", rb3_pe_class_str[(int)e->cls]);
 				rb3_sprintf_lite(&out, "\n");
 				fputs(out.s, stdout);
 			}
@@ -1481,6 +2887,7 @@ static void write_per_seq(step_t *t)
 	free(out.s);
 	free(t->rst);
 	free(t->rst_rev);
+	free(t->sw_keep);
 }
 
 static void write_hapdiv(step_t *t)
@@ -1511,6 +2918,204 @@ static void write_hapdiv(step_t *t)
 	free(t->hapdiv);
 }
 
+/********************************************************************
+ * --paired: mate pairing over one batch (mem)
+ ********************************************************************/
+
+// A read's located SMEM hits, as implied read starts on each contig's forward strand, flattened
+// in (SMEM, position) order; full_only: only SMEMs covering the whole read. Returns the count.
+static int32_t mem_read_hits(const pipeline_t *p, const m_seq_t *s, int full_only, rb3_pe_hit_t *h)
+{
+	const rb3_fmi_t *f = &p->fmi;
+	int32_t i, j, n = 0;
+	for (i = 0; i < s->n_mem; ++i) {
+		const m_sai_pos_t *r = &s->mem[i];
+		int32_t st = r->mem.info>>32, en = (int32_t)r->mem.info;
+		if (full_only && (st != 0 || en != s->len)) continue;
+		for (j = 0; j < r->n_pos; ++j) {
+			const rb3_pos_t *t = &r->pos[j];
+			int64_t rlen = f->sid->len[t->sid>>1];
+			int strand = t->sid & 1;
+			int64_t pos = strand? rlen - (t->pos + (en - st)) : t->pos; // forward start of the SMEM
+			h[n].sid = t->sid >> 1, h[n].strand = strand;
+			h[n++].start = strand? pos - (s->len - en) : pos - st;
+		}
+	}
+	return n;
+}
+
+// 1 if every occurrence of the read's longest SMEM was located (-p did not truncate it). A mate
+// whose hits are only a sample cannot veto its partner's hits: the missing occurrence may be the
+// partner's true locus.
+static int mem_fully_located(const m_seq_t *s)
+{
+	int32_t i, best = -1, bl = -1;
+	for (i = 0; i < s->n_mem; ++i) {
+		int32_t l = (int32_t)s->mem[i].mem.info - (int32_t)(s->mem[i].mem.info>>32);
+		if (l > bl) bl = l, best = i;
+	}
+	return best >= 0 && s->mem[best].n_pos >= s->mem[best].mem.size;
+}
+
+static int32_t mem_n_pos(const m_seq_t *s)
+{
+	int32_t i, n = 0;
+	for (i = 0; i < s->n_mem; ++i) n += s->mem[i].n_pos;
+	return n;
+}
+
+static void mem_pair_worker(void *data, long i, int tid)
+{
+	step_t *t = (step_t*)data;
+	m_seq_t *s[2];
+	rb3_pe_hit_t *h[2];
+	uint8_t *k[2];
+	int32_t n[2], c, nc;
+	rb3_pe_res_t *e = &t->pe[i];
+	s[0] = &t->seq[2*i], s[1] = &t->seq[2*i+1];
+	for (c = 0; c < 2; ++c) {
+		int32_t m = mem_n_pos(s[c]);
+		h[c] = RB3_MALLOC(rb3_pe_hit_t, m > 0? m : 1);
+		k[c] = RB3_CALLOC(uint8_t, m > 0? m : 1);
+		n[c] = mem_read_hits(t->p, s[c], 0, h[c]);
+	}
+	nc = rb3_pe_concordant_hits(h[0], n[0], h[1], n[1], t->pe_max_dist, s[0]->len, s[1]->len, k[0], k[1], 0);
+	for (c = 0; c < 2 && nc > 0; ++c)
+		if (!mem_fully_located(s[c^1])) // the mate's hits are a -p sample: keep all of this read's positions
+			memset(k[c], 1, n[c] > 0? n[c] : 1);
+	e->anchor = e->rescued = -1;
+	e->cls = nc > 0? RB3_PE_CONC : n[0] > 0 && n[1] > 0? RB3_PE_DISC : n[0] > 0 || n[1] > 0? RB3_PE_SOLO : RB3_PE_NONE;
+	e->resc_support = nc; // mem: number of contigs carrying the fragment
+	if (nc > 0) // scatter the flags back to each SMEM's positions (same flattened order as mem_read_hits)
+		for (c = 0; c < 2; ++c) {
+			int32_t a, b, x = 0;
+			for (a = 0; a < s[c]->n_mem; ++a) {
+				m_sai_pos_t *r = &s[c]->mem[a];
+				if (r->n_pos <= 0) continue;
+				r->keep = RB3_MALLOC(uint8_t, r->n_pos);
+				for (b = 0; b < r->n_pos; ++b) r->keep[b] = k[c][x++];
+			}
+		}
+	for (c = 0; c < 2; ++c) free(h[c]), free(k[c]);
+}
+
+/********************************************************************
+ * --paired: mate pairing over one batch (sw)
+ ********************************************************************/
+// A read's located sw hits as implied read starts on each contig's forward strand, flattened in
+// (hit, position) order; full_only: only end-to-end (whole-read) hits. Returns the count.
+static int32_t sw_read_hits(const pipeline_t *p, const m_seq_t *s, const rb3_swrst_t *r, int full_only, rb3_pe_hit_t *h)
+{
+	int32_t i, k, n = 0;
+	for (i = 0; i < r->n; ++i) {
+		const rb3_swhit_t *x = &r->a[i];
+		int32_t qs = x->n_qoff > 0? x->qoff[0] : 0, qe = qs + x->qlen;
+		if (full_only && (qs != 0 || qe != s->len)) continue;
+		for (k = 0; k < x->n_pos; ++k) {
+			int64_t clen, st, en;
+			int strand = x->pos[k].sid & 1;
+			pos_stranded(p->fmi.sid, &x->pos[k], x->rlen, &clen, &st, &en);
+			h[n].sid = x->pos[k].sid >> 1, h[n].strand = strand;
+			h[n++].start = strand? st - (s->len - qe) : st - qs;
+		}
+	}
+	return n;
+}
+
+static int32_t sw_n_pos(const rb3_swrst_t *r)
+{
+	int32_t i, n = 0;
+	for (i = 0; i < r->n; ++i) n += r->a[i].n_pos;
+	return n;
+}
+
+// 1 if every occurrence of the read's best-scoring hit was located (-p did not truncate it)
+static int sw_fully_located(const rb3_swrst_t *r)
+{
+	int32_t i, b = -1;
+	for (i = 0; i < r->n; ++i) if (b < 0 || r->a[i].score > r->a[b].score) b = i;
+	return b >= 0 && r->a[b].n_pos >= r->a[b].hi - r->a[b].lo;
+}
+
+static void sw_pair_worker(void *data, long i, int tid)
+{
+	step_t *t = (step_t*)data;
+	rb3_pe_hit_t *h[2];
+	uint8_t *k[2];
+	int32_t n[2], c, nc;
+	rb3_pe_res_t *e = &t->pe[i];
+	for (c = 0; c < 2; ++c) {
+		int32_t m = sw_n_pos(&t->rst[2*i+c]);
+		h[c] = RB3_MALLOC(rb3_pe_hit_t, m > 0? m : 1);
+		k[c] = RB3_CALLOC(uint8_t, m > 0? m : 1);
+		n[c] = sw_read_hits(t->p, &t->seq[2*i+c], &t->rst[2*i+c], 0, h[c]);
+	}
+	nc = rb3_pe_concordant_hits(h[0], n[0], h[1], n[1], t->pe_max_dist, t->seq[2*i].len, t->seq[2*i+1].len, k[0], k[1], 0);
+	e->anchor = e->rescued = -1;
+	e->cls = nc > 0? RB3_PE_CONC : n[0] > 0 && n[1] > 0? RB3_PE_DISC : n[0] > 0 || n[1] > 0? RB3_PE_SOLO : RB3_PE_NONE;
+	e->resc_support = nc;
+	for (c = 0; c < 2 && nc > 0; ++c)
+		if (!sw_fully_located(&t->rst[2*i+(c^1)])) // the mate's positions are a -p sample: keep all of this read's
+			memset(k[c], 1, n[c] > 0? n[c] : 1);
+	for (c = 0; c < 2; ++c) {
+		if (nc > 0) t->sw_keep[2*i+c] = k[c];
+		else free(k[c]);
+		free(h[c]);
+	}
+}
+
+static void sw_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	t->sw_keep = RB3_CALLOC(uint8_t*, t->n_seq > 0? t->n_seq : 1);
+	if (!p->isize_fixed) { // sample: pairs whose mates both have end-to-end hits on a shared contig
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		for (i = 0; i < n_pair; ++i) {
+			int32_t ma = sw_n_pos(&t->rst[2*i]), mb = sw_n_pos(&t->rst[2*i+1]), na, nb;
+			rb3_pe_hit_t *ha, *hb;
+			int64_t sp;
+			if (ma == 0 || mb == 0) continue;
+			ha = RB3_MALLOC(rb3_pe_hit_t, ma), hb = RB3_MALLOC(rb3_pe_hit_t, mb);
+			na = sw_read_hits(p, &t->seq[2*i], &t->rst[2*i], 1, ha), nb = sw_read_hits(p, &t->seq[2*i+1], &t->rst[2*i+1], 1, hb);
+			if (rb3_pe_concordant_hits(ha, na, hb, nb, RB3_PE_EST_WIN, t->seq[2*i].len, t->seq[2*i+1].len, 0, 0, &sp) > 0 && sp > 0)
+				span[n_span++] = sp;
+			free(ha), free(hb);
+		}
+		pe_update_isize(p, span, n_span);
+		free(span);
+	}
+	t->pe_max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	kt_for(p->opt->n_threads, sw_pair_worker, t, n_pair);
+	for (i = 0; i < n_pair; ++i) ++p->pe_cnt[(int)t->pe[i].cls];
+}
+
+static void mem_pair_batch(pipeline_t *p, step_t *t)
+{
+	int32_t i, n_pair = t->n_seq / 2, n_span = 0;
+	t->pe = RB3_CALLOC(rb3_pe_res_t, n_pair > 0? n_pair : 1);
+	if (!p->isize_fixed) { // sample: pairs whose mates both have whole-read SMEM hits on a shared contig
+		int64_t *span = RB3_MALLOC(int64_t, n_pair > 0? n_pair : 1);
+		for (i = 0; i < n_pair; ++i) {
+			const m_seq_t *a = &t->seq[2*i], *b = &t->seq[2*i+1];
+			int32_t ma = mem_n_pos(a), mb = mem_n_pos(b), na, nb;
+			rb3_pe_hit_t *ha, *hb;
+			int64_t sp;
+			if (ma == 0 || mb == 0) continue;
+			ha = RB3_MALLOC(rb3_pe_hit_t, ma), hb = RB3_MALLOC(rb3_pe_hit_t, mb);
+			na = mem_read_hits(p, a, 1, ha), nb = mem_read_hits(p, b, 1, hb);
+			if (rb3_pe_concordant_hits(ha, na, hb, nb, RB3_PE_EST_WIN, a->len, b->len, 0, 0, &sp) > 0 && sp > 0)
+				span[n_span++] = sp;
+			free(ha), free(hb);
+		}
+		pe_update_isize(p, span, n_span);
+		free(span);
+	}
+	t->pe_max_dist = (p->isize.ok? p->isize.max_ins : RB3_PE_DEFAULT_MAX_INS) + p->opt->pe_slack;
+	kt_for(p->opt->n_threads, mem_pair_worker, t, n_pair);
+	for (i = 0; i < n_pair; ++i) ++p->pe_cnt[(int)t->pe[i].cls];
+}
+
 static void *worker_pipeline(void *shared, int step, void *in)
 {
 	pipeline_t *p = (pipeline_t*)shared;
@@ -1522,16 +3127,37 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		int64_t len, tot = 0;
 		int32_t n_seq = 0, m_seq = 0;
 		m_seq_t *seq = 0;
-		while (!rb3_hitcount_reached(&p->hitcount) && (ss = rb3_seq_read1(p->fp, &len, &name)) != 0) { // read sequences
-			m_seq_t *s;
-			RB3_GROW0(m_seq_t, seq, n_seq, m_seq);
-			s = &seq[n_seq++];
-			s->name = name? rb3_strdup(name) : 0;
-			s->seq = (uint8_t*)rb3_strdup(ss);
-			s->len = len;
-			s->id = p->id++;
-			s->mem = 0, s->n_mem = 0;
-			tot += len;
+		while (!rb3_hitcount_reached(&p->hitcount)) { // read sequences; --paired: whole mate pairs only
+			int32_t k, nm = p->opt->paired? 2 : 1;
+			for (k = 0; k < nm; ++k) {
+				m_seq_t *s;
+				if ((ss = rb3_seq_read1(k == 1 && p->fp2? p->fp2 : p->fp, &len, &name)) == 0) break;
+				RB3_GROW0(m_seq_t, seq, n_seq, m_seq);
+				s = &seq[n_seq++];
+				s->name = name? rb3_strdup(name) : 0;
+				s->seq = (uint8_t*)rb3_strdup(ss);
+				s->len = len;
+				s->id = p->id++;
+				s->mem = 0, s->n_mem = 0;
+				tot += len;
+			}
+			if (k == 0) { // end of input
+				if (p->fp2 && rb3_seq_read1(p->fp2, &len, &name) != 0) {
+					fprintf(stderr, "ERROR: --paired: the second file has more reads than the first\n");
+					exit(1);
+				}
+				break;
+			}
+			if (k < nm) {
+				fprintf(stderr, "ERROR: --paired: %s\n", p->fp2? "the first file has more reads than the second"
+						: "odd number of reads in the interleaved file");
+				exit(1);
+			}
+			if (nm == 2 && !rb3_pe_names_match(seq[n_seq-2].name, seq[n_seq-1].name)) {
+				fprintf(stderr, "ERROR: --paired: reads '%s' and '%s' are not mates (names must match up to /1 /2)\n",
+						seq[n_seq-2].name? seq[n_seq-2].name : "?", seq[n_seq-1].name? seq[n_seq-1].name : "?");
+				exit(1);
+			}
 			if (tot >= p->opt->batch_size)
 				break;
 		}
@@ -1567,6 +3193,15 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			kt_for(p->opt->n_threads, worker_for_hapdiv, in, t->n_hapdiv);
 		else
 			kt_for(p->opt->n_threads, worker_for_seq, in, t->n_seq);
+		if (p->opt->algo == RB3_SA_REFMAP && (p->err_cut >= 0 || p->opt->max_ref_span > 0 || p->opt->min_match_frac > 0.0 || p->opt->err_clip_rej))
+			refmap_filter_pre(p, t);
+		if (p->opt->paired && p->opt->algo == RB3_SA_REFMAP) {
+			refmap_pair_batch(p, t);
+			if (p->opt->pe_drop_disc || p->opt->max_ref_span > 0) refmap_filter_pairs(p, t);
+		} else if (p->opt->paired && (p->opt->algo == RB3_SA_MEM_TG || p->opt->algo == RB3_SA_MEM_ORI))
+			mem_pair_batch(p, t);
+		else if (p->opt->paired && p->opt->algo == RB3_SA_SW)
+			sw_pair_batch(p, t);
 		return in;
 	} else if (step == 2) {
 		for (i = 0; i < p->opt->n_threads; ++i) {
@@ -1577,9 +3212,9 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		if (p->opt->algo == RB3_SA_HAPDIV)
 			write_hapdiv(t);
 		else if (p->opt->algo == RB3_SA_REFMAP)
-			write_refmap(t), free(t->refmap);
+			write_refmap(t), free(t->refmap), free(t->pe);
 		else
-			write_per_seq(t);
+			write_per_seq(t), free(t->pe);
 		free(t->seq);
 		if (rb3_verbose >= 3)
 			fprintf(stderr, "[M::%s::%.3f*%.2f] processed %d sequences\n", __func__, rb3_realtime(), rb3_percent_cpu(), t->n_seq);
@@ -1604,6 +3239,10 @@ static ko_longopt_t long_options[] = {
 	{ "lift",            ko_required_argument, 313 },
 	{ "lift-win",        ko_required_argument, 314 },
 	{ "lift-mad",        ko_required_argument, 315 },
+	{ "lift-local-win",  ko_required_argument, 360 },
+	{ "lift-local-tol",  ko_required_argument, 361 },
+	{ "lift-chain-nb",   ko_required_argument, 362 },
+	{ "lift-chain-interp", ko_no_argument,     363 },
 	{ "kmer",            ko_required_argument, 316 },
 	{ "kmer-step",       ko_required_argument, 317 },
 	{ "min-agree",       ko_required_argument, 318 },
@@ -1615,7 +3254,7 @@ static ko_longopt_t long_options[] = {
 	{ "bin-size",        ko_required_argument, 323 },
 	{ "npy-binary",      ko_no_argument,       324 },
 	{ "target-hits",     ko_required_argument, 325 },
-	{ "report-occ",      ko_no_argument,       326 },
+	{ "report-occ",      ko_no_argument,       341 },
 	{ "max-intron",      ko_required_argument, 330 },
 	{ "gap-intron",      ko_required_argument, 331 },
 	{ "chain-max-occ",   ko_required_argument, 332 },
@@ -1627,6 +3266,47 @@ static ko_longopt_t long_options[] = {
 	{ "pav-grid",        ko_required_argument, 338 },
 	{ "pav-agree",       ko_required_argument, 340 },
 	{ "diverged-rows",       ko_required_argument, 339 },
+	{ "insertion-rows",      ko_required_argument, 342 },
+	{ "anchor-dist-npy",     ko_no_argument,       343 },
+	{ "anchor-dist-thresh",  ko_required_argument, 344 },
+	{ "support",             ko_required_argument, 345 },
+	{ "support-tol",         ko_required_argument, 346 },
+	{ "support-win",         ko_required_argument, 347 },
+	{ "dup-count",           ko_no_argument,       348 },
+	{ "paired",              ko_no_argument,       370 },
+	{ "pe-isize",            ko_required_argument, 371 },
+	{ "pe-slack",            ko_required_argument, 372 },
+	{ "pe-trust-exact",      ko_no_argument,       373 },
+	{ "max-locate",          ko_required_argument, 374 },
+	{ "pe-near-win",         ko_required_argument, 375 },
+	{ "err-max-events",      ko_required_argument, 380 },
+	{ "err-calib",           ko_required_argument, 381 },
+	{ "err-alpha",           ko_required_argument, 382 },
+	{ "err-hist",            ko_required_argument, 383 },
+	{ "err-stats",           ko_no_argument,       384 },
+	{ "max-ref-span",        ko_required_argument, 385 },
+	{ "pe-drop-disc",        ko_no_argument,       386 },
+	{ "err-noclip",          ko_no_argument,       387 },
+	{ "err-clip-reject",     ko_no_argument,       388 },
+	{ "err-cigar",           ko_no_argument,       389 },
+	{ "min-match-frac",      ko_required_argument, 379 },
+	{ "placed-min-chr-agree", ko_required_argument, 390 },
+	{ "placed-min-proj",     ko_required_argument, 391 },
+	{ "placed-max-spread",   ko_required_argument, 392 },
+	{ "exact-max-ref-hits",  ko_required_argument, 393 },
+	{ "exact-min-asm-agree", ko_required_argument, 394 },
+	{ "exact-min-asm-proj",  ko_required_argument, 395 },
+	{ "exact-agree-dist",    ko_required_argument, 396 },
+	{ "min-core-len",        ko_required_argument, 397 },
+	{ "filter-stats",        ko_no_argument,       398 },
+	{ "ed-stats",            ko_required_argument, 400 },
+	{ "ed-hist",             ko_required_argument, 401 },
+	{ "ed-max",              ko_required_argument, 402 },
+	{ "ed-tiles",            ko_required_argument, 403 },
+	{ "ed-max-occ",          ko_required_argument, 404 },
+	{ "ed-budget",           ko_required_argument, 405 },
+	{ "ed-max-loc",          ko_required_argument, 406 },
+	{ "ed-frac",             ko_required_argument, 407 },
 	{ "no-kalloc",       ko_no_argument,       501 },
 	{ "dbg-dawg",        ko_no_argument,       502 },
 	{ "dbg-sw",          ko_no_argument,       503 },
@@ -1635,14 +3315,30 @@ static ko_longopt_t long_options[] = {
 	{ 0, 0, 0 }
 };
 
+// --anchor-dist-npy/--anchor-dist-thresh usage, shared verbatim by refmap and chain: both
+// commands feed the same PS4G/npy accumulator and rb3_ps4g_npy_finalize builds the block.
+static void usage_anchor_dist(const rb3_mopt_t *opt)
+{
+	fprintf(stderr, "  --anchor-dist-npy with --npy, also write a per-founder ternary read-sharing block\n");
+	fprintf(stderr, "                    (match=1/diverged=0/deletion=-1) and a per-founder distance-to-\n");
+	fprintf(stderr, "                    nearest-lift-anchor block (bp, -1 = no anchor), widening --npy from\n");
+	fprintf(stderr, "                    (bin x gamete+2) to (bin x 3*gamete+2); requires --lift; a\n");
+	fprintf(stderr, "                    '<npy>.layout.tsv' sidecar records the column layout\n");
+	fprintf(stderr, "  --anchor-dist-thresh=NUM  with --anchor-dist-npy, distance (bp) at/under which a\n");
+	fprintf(stderr, "                    non-matching founder reads as diverged rather than deletion [%ld]\n", (long)opt->anchor_dist_thresh);
+}
+
 int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 {
-	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0;
+	int32_t c, j, is_line = 0, ret, load_flag = 0, no_ssa = 0, ref_gamete = -1; // --anchor-dist-npy: gamete index of the reference genome, -1 if unknown
 	rb3_mopt_t opt;
 	pipeline_t p;
 	ketopt_t o = KETOPT_INIT;
+	int64_t lift_local_win_opt = 0, lift_local_tol_opt = 1000; // --lift-local-win/--lift-local-tol
+	int32_t lift_chain_nb_opt = 0, lift_chain_interp_opt = 0; // --lift-chain-nb, --lift-chain-interp
 
 	rb3_mopt_init(&opt);
+	if (getenv("RB3_PLACE_DEBUG")) refmap_place_debug = atoi(getenv("RB3_PLACE_DEBUG"));
 	p.opt = &opt, p.id = 0;
 	while ((c = ketopt(&o, argc, argv, 1, "Ll:c:t:K:MdN:A:B:O:E:C:m:k:uj:ey:a:w:p:bg:", long_options)) >= 0) {
 		if (c == 'L') is_line = 1;
@@ -1689,6 +3385,10 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 313) opt.lift_fn = o.arg;           // E4: liftover file (project, not walk)
 		else if (c == 314) opt.lift_win = rb3_parse_num(o.arg);
 		else if (c == 315) opt.lift_mad = rb3_parse_num(o.arg);
+		else if (c == 360) lift_local_win_opt = rb3_parse_num(o.arg);
+		else if (c == 361) lift_local_tol_opt = rb3_parse_num(o.arg);
+		else if (c == 362) lift_chain_nb_opt = atoi(o.arg);
+		else if (c == 363) lift_chain_interp_opt = 1;
 		else if (c == 316) opt.kmer_len = atoi(o.arg);    // k-mer-agreement placement (0 = off)
 		else if (c == 317) opt.kmer_step = atoi(o.arg);
 		else if (c == 318) opt.min_agree = atoi(o.arg);
@@ -1700,7 +3400,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (c == 323) opt.bin_size = rb3_parse_num(o.arg); // PS4G/npy position bin size in bp
 		else if (c == 324) opt.npy_binary = 1; // npy: write presence (1) instead of read counts
 		else if (c == 325) opt.target_hits = rb3_parse_num(o.arg); // stop once this many PLACED+EXACT records are written
-		else if (c == 326) opt.report_occ = 1; // append raw FM-index interval size (occurrence count) as an extra column
+		else if (c == 341) opt.report_occ = 1; // append raw FM-index interval size (occurrence count) as an extra column
 		else if (c == 330) opt.max_intron = rb3_parse_num(o.arg);    // chain: max unexplained ref jump per link
 		else if (c == 331) opt.gap_intron = atoi(o.arg);             // chain: ref gap that starts a new exon segment
 		else if (c == 332) opt.chain_max_occ = atoi(o.arg);          // chain: interval-size cap for an informative SMEM
@@ -1717,6 +3417,61 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			else if (strcmp(o.arg, "drop") == 0) opt.diverged_rows = 2;
 			else { fprintf(stderr, "ERROR: --diverged-rows must be ordinary|pav|drop\n"); return 1; }
 		}
+		else if (c == 342) {                                         // chain --lift: insertion-row policy
+			if (strcmp(o.arg, "ordinary") == 0) opt.insertion_rows = 0;
+			else if (strcmp(o.arg, "pav") == 0) opt.insertion_rows = 1;
+			else if (strcmp(o.arg, "drop") == 0) opt.insertion_rows = 2;
+			else { fprintf(stderr, "ERROR: --insertion-rows must be ordinary|pav|drop\n"); return 1; }
+		}
+		else if (c == 343) opt.anchor_dist_npy = 1;                  // npy: also write ternary sharing + lift-anchor distance blocks
+		else if (c == 344) opt.anchor_dist_thresh = rb3_parse_num(o.arg); // diverged/deletion distance threshold (bp)
+		else if (c == 345) {                                         // chain: founder-set rule
+			if (strcmp(o.arg, "chain") == 0) opt.support_best = 0;
+			else if (strcmp(o.arg, "best") == 0) opt.support_best = 1;
+			else { fprintf(stderr, "ERROR: --support must be chain or best\n"); return 1; }
+		}
+		else if (c == 346) opt.support_tol = atoi(o.arg);            // chain --support=best: coverage tolerance (bases)
+		else if (c == 347) opt.support_win = rb3_parse_num(o.arg);   // chain --support=best: lift proximity window
+		else if (c == 348) opt.dup_count = 1;                        // chain: "<name>;x=N" reads count N times
+		else if (c == 370) opt.paired = 1;                           // mate pairs: R1 R2, or one interleaved file
+		else if (c == 371) {                                         // --paired: fixed insert size MEAN,SD
+			if (sscanf(o.arg, "%lf,%lf", &opt.pe_mean, &opt.pe_sd) != 2 || opt.pe_mean <= 0 || opt.pe_sd < 0) {
+				fprintf(stderr, "ERROR: --pe-isize must be MEAN,SD (MEAN > 0, SD >= 0)\n");
+				return 1;
+			}
+		}
+		else if (c == 372) opt.pe_slack = rb3_parse_num(o.arg), opt.pe_slack_set = 1; // --paired: discordance slack (bp)
+		else if (c == 375) opt.pe_near_win = rb3_parse_num(o.arg);   // --paired: rescued-mate founder window
+		else if (c == 380) opt.err_max_ev = strcmp(o.arg, "auto") == 0? -2 : atoi(o.arg); // refmap: events cutoff
+		else if (c == 381) opt.err_calib = rb3_parse_num(o.arg);     // refmap: calibration reads (pairs)
+		else if (c == 382) opt.err_alpha = atof(o.arg);              // refmap: auto-cutoff tail probability
+		else if (c == 383) opt.err_hist_fn = o.arg;                  // refmap: calibration histogram sidecar
+		else if (c == 384) opt.err_stats = 1;                        // refmap: events/span/reason columns
+		else if (c == 385) opt.max_ref_span = rb3_parse_num(o.arg);  // refmap: reference span cap (bp)
+		else if (c == 386) opt.pe_drop_disc = 1;                     // refmap --paired: drop DISC pairs
+		else if (c == 387) opt.err_noclip = 1;                       // refmap: edit mode (no free read ends)
+		else if (c == 388) opt.err_clip_rej = 1;                     // refmap: FILTER reads with a contig-end overhang
+		else if (c == 389) opt.err_cigar = 1;                        // refmap: extended CIGAR column
+		else if (c == 379) opt.min_match_frac = atof(o.arg);         // refmap: min '=' bases / read length
+		else if (c == 400) opt.ed_stats_fn = o.arg;                  // refmap: per-read edit distance per assembly
+		else if (c == 401) opt.ed_hist_fn = o.arg;                   // refmap: edit-distance histograms
+		else if (c == 402) opt.ed_cap = atoi(o.arg);                 // refmap: edit cap
+		else if (c == 403) opt.ed_tiles = atoi(o.arg);               // refmap: exact tiles per read
+		else if (c == 404) opt.ed_max_occ = rb3_parse_num(o.arg);    // refmap: repetitive-tile cutoff
+		else if (c == 405) opt.ed_budget = rb3_parse_num(o.arg);     // refmap: search states per tile
+		else if (c == 406) opt.ed_max_loc = atoi(o.arg);             // refmap: rows located per aligned interval
+		else if (c == 407) opt.ed_frac = atof(o.arg);                // refmap: subsample fraction
+		else if (c == 374) opt.max_locate = atoi(o.arg);             // refmap: occurrences located per read
+		else if (c == 373) opt.pe_trust_exact = 1;                   // --paired: move unrescuable PLACED mates onto EXACT ones
+		else if (c == 390) opt.placed_min_chr_agree = atof(o.arg);
+		else if (c == 391) opt.placed_min_proj = atoi(o.arg);
+		else if (c == 392) opt.placed_max_spread = rb3_parse_num(o.arg);
+		else if (c == 393) opt.exact_max_ref_hits = atoi(o.arg);
+		else if (c == 394) opt.exact_min_asm_agree = atof(o.arg);
+		else if (c == 395) opt.exact_min_asm_proj = atoi(o.arg);
+		else if (c == 396) opt.exact_agree_dist = rb3_parse_num(o.arg);
+		else if (c == 397) opt.min_core_len = atoi(o.arg);
+		else if (c == 398) opt.filter_stats = 1;
 		else if (c == 501) opt.flag |= RB3_MF_NO_KALLOC;
 		else if (c == 502) rb3_dbg_flag |= RB3_DBG_DAWG;
 		else if (c == 503) rb3_dbg_flag |= RB3_DBG_SW;
@@ -1757,6 +3512,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --old-mem   use the original MEM algorithm (for testing)\n");
 			fprintf(stderr, "  --gap=NUM   output regions >=NUM that are not covered by MEMs [%d]\n", opt.min_gap_len);
 			fprintf(stderr, "  --cov       output breadth of coverage\n");
+			fprintf(stderr, "  --paired    reads are mate pairs (<R1> <R2>, or one interleaved file); needs -p. A pair\n");
+			fprintf(stderr, "              with hits on the same contig, opposite strands, implied starts within the\n");
+			fprintf(stderr, "              insert is CONC and prints only those positions; a trailing column gives\n");
+			fprintf(stderr, "              the pair class (CONC/DISC/SOLO/NONE). --pe-isize=MEAN,SD, --pe-slack=NUM [0]\n");
+			fprintf(stderr, "              With --paired use a LARGE -p (start at -p 1024): a small cap locates only a\n");
+			fprintf(stderr, "              sample of a repetitive SMEM's hits and misses the true locus (maize: -p 128\n");
+			fprintf(stderr, "              91.4%% vs -p 1024 96.2%% true-founder recall; pairing keeps the sets small)\n");
 		}
 		if (strcmp(argv[0], "refmap") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1765,10 +3527,21 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --max-walk=NUM    DEPRECATED (--walk only) max bases to walk per flank [%d]\n", opt.max_walk);
 			fprintf(stderr, "  --walk-mode=STR   DEPRECATED (--walk only) consensus|strict|per-assembly [consensus]\n");
 			fprintf(stderr, "  --max-occ=INT     drop reads/anchors occurring >INT times; <0 = auto (#taxa); 0 = off [%ld]\n", (long)opt.max_occ);
+			fprintf(stderr, "  --max-locate=INT  locate at most INT occurrences of each read; the rest are not\n");
+			fprintf(stderr, "                    sampled, so a repetitive read's gameteSet / reference copies may be\n");
+			fprintf(stderr, "                    incomplete, and a read whose reference copy is not sampled is called\n");
+			fprintf(stderr, "                    PLACED instead of EXACT (refmap's analogue of mem -p) [%d]\n", opt.max_locate);
 			fprintf(stderr, "  --two-flank       require both flanks to anchor concordantly (drop ONE_SIDE)\n");
 			fprintf(stderr, "  --max-bracket=NUM with --two-flank, max |cR-cL| for a PLACED; 0 = off [%ld]\n", (long)opt.max_bracket);
 			fprintf(stderr, "  --lift-win=NUM    liftover projection window [%ld]\n", (long)opt.lift_win);
 			fprintf(stderr, "  --lift-mad=NUM    liftover max residual MAD [%ld]\n", (long)opt.lift_mad);
+			fprintf(stderr, "  --lift-local-win=NUM  project via nearest collinear flanking anchors within NUM bp first,\n"
+			                "                    falling back to the --lift-win median (0 = off) [0]\n");
+			fprintf(stderr, "  --lift-local-tol=NUM  collinearity tolerance for --lift-local-win [1000]\n");
+			fprintf(stderr, "  --lift-chain-nb=INT   with --lift-local-win: drop anchors not collinear with one of their next\n"
+			                "                    INT anchors, project via the nearest kept anchors (0 = off) [0]\n");
+			fprintf(stderr, "  --lift-chain-interp   with --lift-chain-nb: interpolate across indels between the kept\n"
+			                "                    anchors instead of extrapolating from the nearer one\n");
 			fprintf(stderr, "  --kmer=INT        place a read from INT-bp k-mers by agreement (0 = off, whole-read)\n");
 			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
@@ -1784,6 +3557,68 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --report-occ      append the raw FM-index interval size (occurrence count) as an extra\n");
 			fprintf(stderr, "                    trailing column (0 = off, opt-in; pangenome-wide -- counts exact matches\n");
 			fprintf(stderr, "                    to the reference + all assemblies together, not per-genome; 0 for --kmer mode)\n");
+			usage_anchor_dist(&opt);
+			fprintf(stderr, "  --paired          reads are mate pairs: <R1.fq> <R2.fq>, or one interleaved file. Each\n");
+			fprintf(stderr, "                    pair adds ONE PS4G/npy event (the founders both mates share) at the\n");
+			fprintf(stderr, "                    better-placed mate; a projected mate far from its mate is moved next\n");
+			fprintf(stderr, "                    to it when one of its assembly projections lands there; stdout gains\n");
+			fprintf(stderr, "                    a trailing pair-class column (NONE/SOLO/CONC/RESC/MOVED/DISC).\n");
+			fprintf(stderr, "                    -p does not apply to refmap; raise --max-locate instead\n");
+			fprintf(stderr, "  --pe-isize=MEAN,SD  --paired: fixed insert size [estimated per batch]\n");
+			fprintf(stderr, "  --pe-slack=NUM    --paired: bp added to the max insert before mates are discordant [%ld]\n", (long)opt.pe_slack);
+			fprintf(stderr, "  --pe-near-win=NUM --paired: a MOVED mate keeps the founders whose own projection lies\n");
+			fprintf(stderr, "                    on its mate's contig within NUM bp (founder set only; the mate gap\n");
+			fprintf(stderr, "                    is max insert + --pe-slack); 0 = that gap [%ld]\n", (long)opt.pe_near_win);
+			fprintf(stderr, "  --pe-trust-exact  --paired: a discordant EXACT + PLACED pair with no rescue moves the\n");
+			fprintf(stderr, "                    PLACED mate onto the EXACT one (default: keep them as two events)\n");
+			fprintf(stderr, "  Error-profile / span filters (off by default; a rejected read, or both mates of a rejected\n");
+			fprintf(stderr, "  pair, is reported as FILTERED and adds nothing to --ps4g/--npy/--ps4g-per-read):\n");
+			fprintf(stderr, "  --err-max-events=INT|auto  max mismatch events (edits explaining the read against one\n");
+			fprintf(stderr, "                    carrier of its exact core) per read, or per pair (sum) with --paired;\n");
+			fprintf(stderr, "                    auto = calibrate on the first --err-calib reads/pairs (off)\n");
+			fprintf(stderr, "  --err-calib=NUM   reads (pairs with --paired) in the calibration pre-pass [%ld]\n", (long)opt.err_calib);
+			fprintf(stderr, "  --err-alpha=FLOAT auto: smallest K with P(Poisson(mu_err) > K) <= FLOAT [%g]\n", opt.err_alpha);
+			fprintf(stderr, "  --err-hist=FILE   write the calibration histogram and error-model fit (TSV)\n");
+			fprintf(stderr, "  --err-stats       append events, reference span and filter reason columns to each row\n");
+			fprintf(stderr, "  --max-ref-span=NUM  max reference span (bp): EXACT first-to-last reference copy, PLACED\n");
+			fprintf(stderr, "                    spread of all lift projections (another sequence = infinite); with\n");
+			fprintf(stderr, "                    --paired, first-to-last coordinate of both mates (0 = off)\n");
+			fprintf(stderr, "  --pe-drop-disc    --paired: FILTER discordant pairs instead of two single-end events\n");
+			fprintf(stderr, "  Edit mode (any of the next four; default off = legacy events): read ends are never free.\n");
+			fprintf(stderr, "  edits = substituted + inserted + deleted bases + bases past a contig end (each costs 1),\n");
+			fprintf(stderr, "  against the one carrier the extension of the exact core ends on; match_frac = '=' bases /\n");
+			fprintf(stderr, "  read length. --err-max-events then caps edits, and --err-stats/--err-hist add match_frac:\n");
+			fprintf(stderr, "  --err-noclip      count edits per base (a contig-end overhang costs its length)\n");
+			fprintf(stderr, "  --err-clip-reject FILTER a read (pair) whose carrier ends inside it (reason C)\n");
+			fprintf(stderr, "  --err-cigar       append the extended CIGAR (=XIDS) against that carrier to each row\n");
+			fprintf(stderr, "  --min-match-frac=FLOAT  FILTER reads below FLOAT (with --paired: sum '=' / sum length\n");
+			fprintf(stderr, "                    of both mates) (reason m) [0 = off]\n");
+			fprintf(stderr, "  Read filters (whole-read --lift mode; all off by default; a rejected read is\n");
+			fprintf(stderr, "  reported as FILTERED and adds nothing to --ps4g/--npy):\n");
+			fprintf(stderr, "  --placed-min-chr-agree=FRAC  PLACED: min fraction of projecting assemblies on the\n");
+			fprintf(stderr, "                    majority reference sequence (0 = off)\n");
+			fprintf(stderr, "  --placed-min-proj=INT  PLACED: min #assemblies projecting through the lift (0 = off)\n");
+			fprintf(stderr, "  --placed-max-spread=NUM  PLACED: max spread (bp) of projections on the majority seq (0 = off)\n");
+			fprintf(stderr, "  --exact-max-ref-hits=INT  EXACT: max #reference occurrences (0 = off)\n");
+			fprintf(stderr, "  --exact-min-asm-agree=FRAC  EXACT: min fraction of lift-projected assembly hits landing\n");
+			fprintf(stderr, "                    within --exact-agree-dist of the reported reference hit (0 = off)\n");
+			fprintf(stderr, "  --exact-min-asm-proj=INT  apply --exact-min-asm-agree only with >= INT projections [%d]\n", opt.exact_min_asm_proj);
+			fprintf(stderr, "  --exact-agree-dist=NUM  see --exact-min-asm-agree [%ld]\n", (long)opt.exact_agree_dist);
+			fprintf(stderr, "  --min-core-len=INT  EXACT/PLACED: min exact-match length (SMEM core on fallback) (0 = off)\n");
+			fprintf(stderr, "  --filter-stats    append core_len,n_proj,n_chr_agree,spread,n_ref_hits,a_proj,a_agree,\n");
+			fprintf(stderr, "                    filter-reason columns to each output row\n");
+			fprintf(stderr, "  Edit-distance statistics (off by default; placement output is unchanged):\n");
+			fprintf(stderr, "  --ed-stats=FILE   per read (and per pair with --paired): best edit distance (subs + indel bases\n");
+			fprintf(stderr, "                    + unaligned read bases) to EACH assembly, NA = none within --ed-max; TSV,\n");
+			fprintf(stderr, "                    or a uint8 matrix (255 = NA, last column = flags) if FILE ends in .npy\n");
+			fprintf(stderr, "  --ed-hist=FILE    histograms: best over the panel, per assembly, closest distinct wrong copy,\n");
+			fprintf(stderr, "                    assemblies at the best value, and a sequencing-error fit of the best\n");
+			fprintf(stderr, "  --ed-max=INT      edit cap [%d]\n", opt.ed_cap);
+			fprintf(stderr, "  --ed-tiles=INT    disjoint exact seeds per read; exact up to INT-1 edits [%d]\n", opt.ed_tiles);
+			fprintf(stderr, "  --ed-max-occ=NUM  skip a tile occurring more than NUM times (repeats) [%ld]\n", (long)opt.ed_max_occ);
+			fprintf(stderr, "  --ed-budget=NUM   expanded search states per tile [%ld]\n", (long)opt.ed_budget);
+			fprintf(stderr, "  --ed-max-loc=INT  occurrences located per aligned interval [%d]\n", opt.ed_max_loc);
+			fprintf(stderr, "  --ed-frac=FLOAT   compute for a fixed hash subsample of this fraction of reads (pairs) [%g]\n", opt.ed_frac);
 		}
 		if (strcmp(argv[0], "chain") == 0) {
 			fprintf(stderr, "  --ref-prefix=STR  reference = sequences whose name starts with STR [required]\n");
@@ -1800,6 +3635,13 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "                    divergent to share a SMEM, so the coordinate is colinear and exact\n");
 			fprintf(stderr, "                    rather than a breakpoint: ordinary|pav|drop\n");
 			fprintf(stderr, "                    [ordinary = emit as a normal row at its exact position]\n");
+			fprintf(stderr, "  --insertion-rows=STR  TRUE INSERTION rows -- same routing as --diverged-rows, but\n");
+			fprintf(stderr, "                    for reads absent from the reference: ordinary|pav|drop\n");
+			fprintf(stderr, "                    [pav = grid-snapped, prefixed `pav:<contig>` (default, unchanged)]\n");
+			fprintf(stderr, "                    ordinary emits the read inline on its real contig at the exact\n");
+			fprintf(stderr, "                    (unsnapped) median -- more precise than pav-grid snapping (which\n");
+			fprintf(stderr, "                    floors, not centers) and keeps evidence positionally inline with\n");
+			fprintf(stderr, "                    ordinary rows for windowing, at the cost of the `pav:` marker\n");
 			fprintf(stderr, "  --pav-grid=NUM    snap the emitted pav: position to this grid; a breakpoint is\n");
 			fprintf(stderr, "                    approximate, so this is the resolution actually claimed\n");
 			fprintf(stderr, "                    (0 = emit the exact projected position) [%d]\n", opt.pav_grid);
@@ -1808,10 +3650,31 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --pav-min-len=INT min LONGEST assembly-only SMEM to emit a pav: row; the\n");
 			fprintf(stderr, "                    assembly-only path has no colinear reference confirmation, so it\n");
 			fprintf(stderr, "                    needs a longer floor than -l [%d]\n", opt.pav_min_len);
+			fprintf(stderr, "  --support=STR     founder set of a chained read: chain = intersection over the\n");
+			fprintf(stderr, "                    reference-hitting chain's SMEMs (default, unchanged); best = the\n");
+			fprintf(stderr, "                    assemblies covering the most read bases, counting the chain's SMEMs\n");
+			fprintf(stderr, "                    plus assembly-only SMEMs (for diverged / out-of-panel alleles)\n");
+			fprintf(stderr, "  --support-tol=INT --support=best: keep assemblies within INT covered bases of the best [%d]\n", opt.support_tol);
+			fprintf(stderr, "  --support-win=NUM --support=best --lift: an assembly-only SMEM counts only if it\n");
+			fprintf(stderr, "                    projects within NUM bp of the chain's reference span (0 = off) [%ld]\n", (long)opt.support_win);
+			fprintf(stderr, "  --dup-count       a read named <name>;x=N stands for N identical reads: it adds N\n");
+			fprintf(stderr, "                    to the PS4G/npy counts (collapse duplicates first, keep the counts)\n");
 			fprintf(stderr, "  --trim-polya=INT  trim a terminal poly-A (3') / poly-T (5') run of >=INT bp before\n");
 			fprintf(stderr, "                    searching. MEASURED AS A NO-OP here (SMEMs already isolate the\n");
 			fprintf(stderr, "                    genomic core); low-complexity anchors are gated instead [%d]\n", opt.trim_polya);
 			fprintf(stderr, "  -l INT      min SMEM length [%ld]\n", (long)opt.min_len);
+			fprintf(stderr, "  --ps4g=FILE       write PS4G v2.0 gamete-support counts, aggregated over all rows\n");
+			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
+			fprintf(stderr, "  --label-bed=FILE  diploid training labels: chrom start end sampleA [sampleB]\n");
+			fprintf(stderr, "  --bin-size=NUM    PS4G/npy reference position bin size in bp [%ld]\n", (long)opt.bin_size);
+			fprintf(stderr, "  --npy-binary      npy: write presence (1) instead of read counts\n");
+			fprintf(stderr, "  --lift-local-win=NUM  --lift projection: nearest collinear flanking anchors within\n"
+			                "                    NUM bp first (0 = off) [0]; --lift-local-tol=NUM tolerance [1000]\n");
+			usage_anchor_dist(&opt);
+			fprintf(stderr, "                    chain: a row's founder set is the read's chain-wide intersection;\n");
+			fprintf(stderr, "                    a spliced read gives one row per exon segment, each judged at\n");
+			fprintf(stderr, "                    its own start; use --insertion-rows=ordinary so insertion rows\n");
+			fprintf(stderr, "                    are not --pav-grid snapped before the anchor-distance lookup\n");
 		}
 		if (strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -d          use BWA-SW for local alignment\n");
@@ -1832,6 +3695,11 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (strcmp(argv[0], "sw") == 0 || strcmp(argv[0], "search") == 0) {
 			fprintf(stderr, "  -e          end-to-end mode (forcing -k to 1)\n");
+			fprintf(stderr, "  --paired    mate pairs (<R1> <R2>, or one interleaved file); needs a LARGE -p (start at\n");
+			fprintf(stderr, "              -p 1024: sw's -p is a per-read position budget, 0 locates one per hit). A pair\n");
+			fprintf(stderr, "              with hits on the same contig, opposite strands, implied starts within the\n");
+			fprintf(stderr, "              insert is CONC: its PAF lines keep only those positions. Every line gets a\n");
+			fprintf(stderr, "              pe:Z: tag (CONC/DISC/SOLO/NONE). --pe-isize=MEAN,SD, --pe-slack=NUM [0]\n");
 			fprintf(stderr, "  -j INT      min MEM length to initiate alignment [%d]\n", opt.swo.min_mem_len);
 			fprintf(stderr, "  -k INT      require INT-mer match at the end of alignment [%d]\n", opt.swo.end_len);
 			fprintf(stderr, "  -b          align both strands (effective with --all-e2e)\n");
@@ -1849,6 +3717,70 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		return 0;
 	}
 
+	if (opt.max_locate < 1) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --max-locate must be >= 1\n");
+		return 1;
+	}
+	if (opt.max_locate != RB3_RM_MAX_ASSEMBLY && opt.algo != RB3_SA_REFMAP) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --max-locate applies to refmap only (mem/chain: use -p)\n");
+		return 1;
+	}
+	if (opt.paired) { // check the paired-end setup before the (slow) index load
+		int n_files = argc - o.ind - 1;
+		const char *err = 0;
+		int is_mem = (opt.algo == RB3_SA_MEM_TG || opt.algo == RB3_SA_MEM_ORI);
+		int is_chain = (opt.algo == RB3_SA_CHAIN), is_sw = (opt.algo == RB3_SA_SW);
+		if (opt.algo != RB3_SA_REFMAP && !is_mem && !is_chain && !is_sw) err = "--paired is implemented for refmap, mem, chain and sw";
+		else if (is_sw && opt.max_pos <= 0) err = "sw --paired needs -p INT (positions to locate); use a large value, e.g. -p 1024";
+		else if (is_sw && (opt.flag & RB3_MF_WRITE_ALL)) err = "sw --paired cannot be combined with --all-e2e/-g";
+		else if (is_mem && opt.max_pos <= 0) err = "mem --paired needs -p INT (positions to locate per SMEM); use a large value, e.g. -p 1024";
+		else if (is_mem && (opt.min_gap_len > 0 || (opt.flag & RB3_MF_WRITE_COV))) err = "mem --paired cannot be combined with --gap/--cov";
+		else if ((is_mem || is_chain || is_sw) && opt.pe_trust_exact) err = "--pe-trust-exact applies to refmap only";
+		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--paired does not support --walk-mode=per-assembly";
+		else if (is_line) err = "--paired needs read names (FASTA/FASTQ), not -L";
+		else if (n_files != 1 && n_files != 2) err = "--paired takes <R1.fq> <R2.fq> or one interleaved file";
+		if (err) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
+			return 1;
+		}
+		if ((is_mem || is_chain || is_sw) && !opt.pe_slack_set) opt.pe_slack = 0; // SMEM/chain/sw positions are exact
+	} else if (opt.pe_mean > 0 || opt.pe_trust_exact || opt.pe_drop_disc) {
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --pe-isize/--pe-trust-exact/--pe-drop-disc need --paired\n");
+		return 1;
+	}
+	if (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || opt.max_ref_span > 0 || opt.pe_drop_disc
+		|| opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac != 0.0) {
+		const char *err = 0;
+		if (opt.algo != RB3_SA_REFMAP) err = "--err-*/--max-ref-span/--pe-drop-disc apply to refmap only";
+		else if (opt.err_max_ev < -2) err = "--err-max-events takes an integer >= 0 or 'auto'";
+		else if (opt.min_match_frac < 0.0 || opt.min_match_frac > 1.0) err = "--min-match-frac takes a value in [0,1]";
+		else if ((opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac > 0.0) && opt.trim_polya > 0)
+			err = "edit mode (--err-noclip/--err-clip-reject/--err-cigar/--min-match-frac) charges every read base: drop --trim-polya";
+		else if (opt.kmer_len > 0) err = "--err-*/--max-ref-span do not support --kmer";
+		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--err-*/--max-ref-span do not support --walk-mode=per-assembly";
+		else if (opt.err_calib < 1 || opt.err_alpha <= 0.0 || opt.err_alpha >= 1.0) err = "--err-calib must be >= 1 and 0 < --err-alpha < 1";
+		else if ((opt.err_max_ev == -2 || opt.err_hist_fn) && (argc - o.ind < 2 || strcmp(argv[o.ind + 1], "-") == 0))
+			err = "--err-max-events=auto/--err-hist read the input twice: give a file, not stdin";
+		if (err) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
+			return 1;
+		}
+	}
+
+	if (opt.ed_stats_fn || opt.ed_hist_fn) {
+		const char *err = 0;
+		if (opt.algo != RB3_SA_REFMAP) err = "--ed-stats/--ed-hist apply to refmap only";
+		else if (opt.ed_cap < 0 || opt.ed_cap > RB3_ED_MAX_CAP) err = "--ed-max must be in [0, 60]";
+		else if (opt.ed_tiles < 1 || opt.ed_max_loc < 1 || opt.ed_max_occ < 1 || opt.ed_budget < 1)
+			err = "--ed-tiles, --ed-max-occ, --ed-budget and --ed-max-loc must be >= 1";
+		else if (!(opt.ed_frac > 0.0 && opt.ed_frac <= 1.0)) err = "--ed-frac must be in (0, 1]";
+		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--ed-stats/--ed-hist do not support --walk-mode=per-assembly";
+		if (err) {
+			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
+			return 1;
+		}
+	}
+
 	ret = rb3_fmi_load_all(&p.fmi, argv[o.ind], load_flag);
 	if (ret < 0) return 1;
 	if (opt.max_pos > 0 && (p.fmi.ssa == 0 || p.fmi.sid == 0)) {
@@ -1861,8 +3793,14 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "ERROR: BWT doesn't contain both strands\n");
 		return 1;
 	}
-	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.ref_seq = 0;
+	p.is_ref = 0, p.n_ref = 0, p.lift = 0, p.lift_ridx = 0, p.ref_seq = 0;
 	p.gtab = 0, p.ps4g_acc = 0, p.ps4g_per_read_fp = 0, p.label_bed = 0;
+	p.fp2 = 0, p.isize_fixed = 0, p.pe_warned = 0;
+	memset(&p.isize, 0, sizeof(p.isize)), memset(p.pe_cnt, 0, sizeof(p.pe_cnt));
+	if (opt.pe_mean > 0) { // --pe-isize: same max-insert rule as the estimator (mean + 4 sd)
+		p.isize.ok = 1, p.isize_fixed = 1, p.isize.mean = opt.pe_mean, p.isize.sd = opt.pe_sd;
+		p.isize.max_ins = (int64_t)(opt.pe_mean + 4.0 * opt.pe_sd + .5);
+	}
 	rb3_hitcount_init(&p.hitcount, opt.target_hits);
 	if (opt.algo == RB3_SA_REFMAP || opt.algo == RB3_SA_CHAIN) { // mark the reference sequences by name prefix
 		int64_t k, plen;
@@ -1929,6 +3867,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 		if (opt.lift_fn) { // E4: load the assembly->reference liftover
+			rb3_lift_set_local(lift_local_win_opt, lift_local_tol_opt);
+			rb3_lift_set_chain(lift_chain_nb_opt, lift_chain_interp_opt);
 			p.lift = rb3_lift_restore(opt.lift_fn);
 			if (p.lift == 0) {
 				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to load liftover '%s'\n", opt.lift_fn);
@@ -1940,6 +3880,30 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		}
 		if (opt.algo == RB3_SA_CHAIN || opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn) {
 			p.gtab = rb3_gtab_build(p.fmi.sid); // gamete indices for PS4G, npy, the per-read PS4G file, and chain
+			if (opt.npy_fn && opt.anchor_dist_npy) {
+				int64_t k;
+				if (p.lift == 0) {
+					if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --anchor-dist-npy requires --lift=FILE\n");
+					free(p.is_ref);
+					return 1;
+				}
+				for (k = 0; k < p.fmi.sid->n_seq; ++k) // any reference sequence's gamete is THE reference gamete
+					if (p.is_ref[k]) { ref_gamete = p.gtab->sid2g[k]; break; }
+				p.lift_ridx = rb3_lift_ridx_build(p.lift, p.gtab->sid2g, p.gtab->n_gamete);
+				if (rb3_verbose >= 3)
+					fprintf(stderr, "[M::%s] built lift reference-position index for --anchor-dist-npy (ref_gamete=%d)\n", __func__, ref_gamete);
+				// chain shares this block unchanged: chain_emit/chain_emit_pav feed the same accumulator
+				// (one event per emitted row: reference sequence, row start, the read's founder set) and
+				// rb3_ps4g_npy_finalize derives the ternary/distance columns per (contig,bin,gameteSet)
+				// row exactly as for refmap. So for a chained read: 1 = founder carries EVERY SMEM of the
+				// winning chain (the chain-wide intersection, the same set stdout/PS4G report); each exon
+				// segment is its own row, judged against that founder's lift anchors at the segment's own
+				// start bin. Grid-snapped insertion rows (--insertion-rows=pav, the chain default) are
+				// looked up at the snapped coordinate, up to --pav-grid bp from the real breakpoint.
+				if (opt.algo == RB3_SA_CHAIN && opt.insertion_rows == 1 && opt.pav_grid > 0 && rb3_verbose >= 2)
+					fprintf(stderr, "WARNING: chain --anchor-dist-npy with --insertion-rows=pav: insertion rows are snapped to "
+									"--pav-grid=%d before the anchor-distance lookup; --insertion-rows=ordinary keeps them exact\n", opt.pav_grid);
+			}
 			if (opt.algo == RB3_SA_CHAIN && opt.ref_fasta) { // load ref contigs for the GT-AG splice check
 				int64_t n_load = chain_load_ref(&p, opt.ref_fasta);
 				if (n_load < 0) {
@@ -1972,7 +3936,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			}
 		}
 	} else if (opt.ps4g_fn || opt.npy_fn || opt.ps4g_per_read_fn || opt.label_bed_fn || opt.target_hits > 0) {
-		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap\n");
+		if (rb3_verbose >= 1) fprintf(stderr, "ERROR: --ps4g/--npy/--label-bed/--target-hits only apply to refmap/chain\n");
 		return 1;
 	}
 	if (opt.algo == RB3_SA_CHAIN) puts("readName\trefContig\trefPos\tgameteSet");
@@ -1981,7 +3945,64 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		puts("CC\tQH  refCount   score     editDist   cs   strand   nOut   totAln");
 		puts("CC");
 	}
-	for (j = o.ind + 1; j < argc; ++j) {
+	if (opt.algo == RB3_SA_REFMAP && opt.max_locate != RB3_RM_MAX_ASSEMBLY && opt.max_occ > 0
+		&& opt.max_occ <= opt.max_locate && opt.kmer_len <= 0 && rb3_verbose >= 2)
+		fprintf(stderr, "WARNING: --max-locate=%d has no effect: --max-occ=%ld already drops (MULTI) every read with more "
+						"occurrences, so all occurrences of the reads kept are located\n", opt.max_locate, (long)opt.max_occ);
+	p.ed_gtab = 0, p.ed_fp = 0, p.ed_npy = 0, p.ed_rows = 0, p.ed_hist = 0;
+	if (opt.algo == RB3_SA_REFMAP && (opt.ed_stats_fn || opt.ed_hist_fn)) { // --ed-stats/--ed-hist
+		size_t l = opt.ed_stats_fn? strlen(opt.ed_stats_fn) : 0;
+		p.ed_gtab = rb3_gtab_build(p.fmi.sid); // a separate table: p.gtab stays as the placement flags left it
+		ed_prof = getenv("RB3_ED_PROF") != 0;
+		if (opt.ed_stats_fn) {
+			p.ed_npy = (l >= 4 && strcmp(opt.ed_stats_fn + l - 4, ".npy") == 0);
+			p.ed_fp = fopen(opt.ed_stats_fn, p.ed_npy? "wb" : "w");
+			if (p.ed_fp == 0) {
+				if (rb3_verbose >= 1) fprintf(stderr, "ERROR: failed to write --ed-stats '%s'\n", opt.ed_stats_fn);
+				return 1;
+			}
+			if (p.ed_npy) rb3_ed_npy_header(p.ed_fp, 0, p.ed_gtab->n_gamete + 2); // rewritten at the end
+			else {
+				int32_t a;
+				fprintf(p.ed_fp, "#ropebwt3 refmap --ed-stats: best edit distance (substitutions + indel bases + unaligned read bases)\n");
+				fprintf(p.ed_fp, "#to each assembly; NA = none within cap %d reachable from %d exact tiles; best = over the panel,\n", opt.ed_cap, opt.ed_tiles);
+				fprintf(p.ed_fp, "#n_best = assemblies at best, wrong = closest distinct wrong copy (> best+1); flags T truncated,\n");
+				fprintf(p.ed_fp, "#R repetitive tile skipped, N no usable tile, L some copies not located; tiles = complete exact\n");
+				fprintf(p.ed_fp, "#tiles: a value <= tiles is exact, a larger one an upper bound, NA none found <= cap (or below\n");
+				fprintf(p.ed_fp, "#tiles); mate . single-end, 1/2 mates, P pair (per-assembly sum of the mates)\n");
+				fprintf(p.ed_fp, "read\tmate\tbest\tn_best\twrong\tflags\ttiles");
+				for (a = 0; a < p.ed_gtab->n_gamete; ++a) fprintf(p.ed_fp, "\t%s", p.ed_gtab->name[a]);
+				fputc('\n', p.ed_fp);
+			}
+		}
+		if (opt.ed_hist_fn) p.ed_hist = rb3_edhist_init(p.ed_gtab->n_gamete, opt.ed_cap);
+	}
+	p.err_edit = (opt.err_noclip || opt.err_clip_rej || opt.err_cigar || opt.min_match_frac > 0.0);
+	p.err_on = (opt.err_max_ev != -1 || opt.err_hist_fn || opt.err_stats || p.err_edit);
+	p.err_cut = opt.err_max_ev >= 0? opt.err_max_ev : -1;
+	memset(p.err_nfilt, 0, sizeof(p.err_nfilt));
+	if (opt.algo == RB3_SA_REFMAP && (opt.err_max_ev == -2 || opt.err_hist_fn)) // calibration pre-pass
+		if (refmap_err_calibrate(&p, argv[o.ind + 1], opt.paired && argc - o.ind - 1 == 2? argv[o.ind + 2] : 0, is_line) < 0)
+			return 1;
+	if (opt.paired) { // one pass over R1 (+ R2, or interleaved)
+		p.fp = rb3_seq_open(argv[o.ind + 1], is_line);
+		if (p.fp && argc - o.ind - 1 == 2) p.fp2 = rb3_seq_open(argv[o.ind + 2], is_line);
+		if (p.fp == 0 || (argc - o.ind - 1 == 2 && p.fp2 == 0)) {
+			if (rb3_verbose >= 1)
+				fprintf(stderr, "ERROR: failed to load the sequence file '%s'\n", p.fp == 0? argv[o.ind + 1] : argv[o.ind + 2]);
+		} else kt_pipeline(2, worker_pipeline, &p, 3);
+		if (p.fp) rb3_seq_close(p.fp);
+		if (p.fp2) rb3_seq_close(p.fp2);
+		if (rb3_verbose >= 3) {
+			int64_t tot = 0;
+			for (j = 0; j < 5; ++j) tot += p.pe_cnt[j];
+			fprintf(stderr, "[M::%s] %ld pairs: %ld CONC, %ld RESC, %ld SOLO, %ld DISC, %ld NONE; insert size %s mean %.1f sd %.1f max %ld (+%ld slack)\n",
+					__func__, (long)tot, (long)p.pe_cnt[RB3_PE_CONC], (long)p.pe_cnt[RB3_PE_RESC], (long)p.pe_cnt[RB3_PE_SOLO],
+					(long)p.pe_cnt[RB3_PE_DISC], (long)p.pe_cnt[RB3_PE_NONE], p.isize_fixed? "(fixed)" : "(estimated)",
+					p.isize.mean, p.isize.sd, (long)(p.isize.ok? p.isize.max_ins : RB3_PE_DEFAULT_MAX_INS), (long)opt.pe_slack);
+		}
+	}
+	for (j = o.ind + 1; !opt.paired && j < argc; ++j) {
 		if (rb3_hitcount_reached(&p.hitcount)) break; // --target-hits already satisfied; skip remaining input files
 		p.fp = rb3_seq_open(argv[j], is_line);
 		if (p.fp == 0) {
@@ -1997,16 +4018,24 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		if (rb3_hitcount_short(&p.hitcount, &tgt, &n) && rb3_verbose >= 1)
 			fprintf(stderr, "WARNING: --target-hits=%ld requested but the input was exhausted after only %ld PLACED/EXACT records\n", (long)tgt, (long)n);
 	}
+	if (opt.algo == RB3_SA_REFMAP && (p.err_cut >= 0 || opt.max_ref_span > 0 || opt.pe_drop_disc) && rb3_verbose >= 3)
+		fprintf(stderr, "[M::%s] FILTERED %s: %ld by events (> %d), %ld by span (> %ld bp), %ld by --pe-drop-disc\n", __func__,
+				opt.paired? "mates" : "reads", (long)p.err_nfilt[0], p.err_cut, (long)p.err_nfilt[1], (long)opt.max_ref_span, (long)p.err_nfilt[2]);
+	if (opt.algo == RB3_SA_REFMAP && (opt.min_match_frac > 0.0 || opt.err_clip_rej) && rb3_verbose >= 3)
+		fprintf(stderr, "[M::%s] FILTERED %s (edit mode): %ld by match_frac (< %g), %ld by contig-end overhang\n", __func__,
+				opt.paired? "mates" : "reads", (long)p.err_nfilt[3], opt.min_match_frac, (long)p.err_nfilt[4]);
 	if (p.ps4g_acc) {
 		kstring_t cmd = {0,0,0};
 		int32_t k;
 		rb3_sprintf_lite(&cmd, "ropebwt3");
 		for (k = 0; k < argc; ++k) rb3_sprintf_lite(&cmd, " %s", argv[k]);
-		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary, opt.ps4g_fn, opt.npy_fn, cmd.s);
+		rb3_ps4g_npy_finalize(p.ps4g_acc, p.gtab, p.fmi.sid, p.label_bed, opt.npy_binary,
+							  p.lift_ridx, opt.anchor_dist_thresh, ref_gamete, opt.ps4g_fn, opt.npy_fn, cmd.s);
 		free(cmd.s);
 		rb3_ps4g_acc_destroy(p.ps4g_acc);
 	}
 	if (p.ps4g_per_read_fp) fclose(p.ps4g_per_read_fp);
+	if (p.ed_gtab) refmap_ed_finish(&p);
 	rb3_bed_destroy(p.label_bed);
 	rb3_gtab_destroy(p.gtab);
 	if (p.ref_seq) {
@@ -2016,6 +4045,7 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 	}
 	rb3_fmi_free(&p.fmi);
 	free(p.is_ref);
+	rb3_lift_ridx_destroy(p.lift_ridx);
 	rb3_lift_destroy(p.lift);
 	return 0;
 }
