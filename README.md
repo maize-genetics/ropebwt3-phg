@@ -704,6 +704,8 @@ the shared boundary computation and the joint two-flank step the same run takes 
 
 ### <a name="grits"></a>GRITS pipeline (reads → founder-support matrix)
 
+New to these features? Start with the plain-language overview: [docs/grits-overview.md](docs/grits-overview.md).
+
 The alignment step of the GRITS founder-imputation pipeline is one `refmap` run
 over a pangenome index of the founder assemblies, with B73 as the reference. It
 writes the PS4G gamete-support file and the `--npy` matrix (count block +
