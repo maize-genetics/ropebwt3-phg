@@ -29,5 +29,5 @@ $RB refmap --ref-prefix=B73 --max-occ=-1 --lift "$DIR/pangenome.lift" "$IDX" "$D
 # 5. Fallback (no lift build): the outward walk. It brackets the insertion
 #    breakpoint (cL/cR at the A|B junction) and reports the inserted size, where
 #    the projection instead returns one approximate coordinate.
-echo "# refmap walk (bracket the breakpoint; no setup):"
-$RB refmap --ref-prefix=B73 "$IDX" "$DIR/queries.fa"
+echo "# refmap --walk (DEPRECATED; brackets the breakpoint, no lift needed):"
+$RB refmap --ref-prefix=B73 --walk "$IDX" "$DIR/queries.fa"

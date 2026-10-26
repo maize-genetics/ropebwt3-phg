@@ -3546,7 +3546,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 			fprintf(stderr, "  --kmer-step=INT   k-mer tiling step [%d]\n", opt.kmer_step);
 			fprintf(stderr, "  --min-agree=INT   min agreeing k-mers to place [%d]\n", opt.min_agree);
 			fprintf(stderr, "  --kmer-cluster=NUM  agreeing k-mers must fall within NUM bp [%ld]\n", (long)opt.kmer_cluster);
-			fprintf(stderr, "  -l INT      min anchor length when re-mapping a flank [%ld]\n", (long)opt.min_len);
+			fprintf(stderr, "  -l INT      min exact-match length: a read with no whole-read match is placed by its\n");
+			fprintf(stderr, "              longest exact match of at least INT bp (with --walk: min flank anchor) [%ld]\n", (long)opt.min_len);
 			fprintf(stderr, "  --ps4g=FILE       write PS4G v2.0 gamete-support counts (EXACT+PLACED reads)\n");
 			fprintf(stderr, "  --ps4g-per-read=FILE write a per-read PS4G file (exact gameteSet per read)\n");
 			fprintf(stderr, "  --npy=FILE        write a dense (bin x gamete+2) numpy training/inference array\n");
