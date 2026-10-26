@@ -531,9 +531,9 @@ ropebwt3 extract idx.fmd Oh43_chr1:1000000-1008000 Mo17_chr3:5000-5100:-
 ropebwt3 extract -t4 -f queries.tsv idx.fmd > out.fa   # TSV: qid contig start end [strand]
 
 # 2. a B73 interval, taken from founder Oh43
-ropebwt3 extract --lift=idx.lift --lift-k=50 --ref-prefix=B73 --to=Oh43 idx.fmd B73_chr1:1000000-1008000
+ropebwt3 extract --lift=idx.lift --ref-prefix=B73 --to=Oh43 idx.fmd B73_chr1:1000000-1008000
 # only report where the B73 intervals land in each founder, without the sequence
-ropebwt3 extract --lift=idx.lift --lift-k=50 --ref-prefix=B73 --project-only -f ref.tsv idx.fmd > proj.tsv
+ropebwt3 extract --lift=idx.lift --ref-prefix=B73 --project-only -f ref.tsv idx.fmd > proj.tsv
 ```
 
 **Why `isa`.** The index can only be read backwards from fixed starting points. Without
@@ -579,8 +579,9 @@ reported on stderr and skipped; the other queries still run, and the exit status
   - the whole interval is deleted in the founder.
 
   Failed translations don't change the exit status.
-- **Set `--lift-k` to the `-k` the lift was built with** (default 100; the GRITS lift uses
-  `-k 50`). The lift file doesn't record it, and it matters for inverted regions.
+- **If the lift was built with a `-k` other than the default 100** (for example the `-k 50` lift
+  recommended for `refmap` in the GRITS pipeline), pass the same value as `--lift-k`. The lift
+  file doesn't record it, and it shifts results in inverted regions by k-1 bp.
 
 **`--project-only` output** is a table, one row per query:
 
