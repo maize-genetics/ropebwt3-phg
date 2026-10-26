@@ -1,5 +1,15 @@
 # refmap error-profile filter and reference-span cap
 
+> **This is a developer design note.** It records how the error-profile filter works internally, how it was tested and
+> what was measured, and it uses the code's own terms. To *use* the feature, read the plain-language
+> [GRITS overview](../grits-overview.md) and the README instead.
+
+**In short:** two optional filters that remove reads likely to be placed in the wrong spot.
+1. The **error filter** counts how many differences a read has against the genome it matched. Sequencing
+   errors rarely add more than one or two, so reads with more are probably from somewhere else.
+2. The **span cap** removes reads (or pairs) whose possible positions on B73 are spread over too wide a
+   distance.
+
 ![workflow](plan_diagram.png)
 
 *Hand-authored `plan_diagram.svg`; regenerate the PNG with
@@ -27,7 +37,9 @@ core (`refmap_err_events`):
 - Cost: about 150 extension steps per non-exact read, no locate. A 20k-pair run went from
   index load to done in 7 s.
 
-Pair events = sum over the mates (a mate with no exact core at all counts as the cap).
+For a pair, the event count is the two mates' counts added together. A mate that has no exact
+match long enough to start from cannot be counted, so it is given the maximum count (20). So in
+practice a pair with one unplaceable mate is always over the limit.
 
 Validation on wgsim Oh43 pairs (in panel, so every event is a sequencing error): all 14,769
 error-free pairs have 0 events; 4,165 of 4,492 one-error pairs have exactly 1. (wgsim's
@@ -35,23 +47,45 @@ per-mate error fields are not reliable per mate, only per pair.)
 
 ## Calibration (`--err-max-events=auto`, `--err-hist`)
 
-A pre-pass reads the first `--err-calib` reads (pairs with `--paired`; default 1,000,000),
-counts events exactly as the main pass does, and fits a two-component Poisson mixture by EM:
-component 0 = the sequencing-error floor, component 1 = the divergence tail (last bin censored).
-The cutoff is the smallest K with P(Poisson(mu0) > K) <= `--err-alpha` (default 0.001). The
-fit is on the pair-sum histogram with `--paired`, the per-read histogram otherwise.
+**What it is for.** The right limit depends on the sequencing error rate of the run, which differs
+between runs. With `--err-max-events=auto`, refmap picks the limit from the data instead of you
+choosing a number.
+
+**How.** Before the real run, refmap reads the first `--err-calib` reads (default 1,000,000; pairs
+with `--paired`) and counts their events, giving a histogram: how many reads have 0, 1, 2, ...
+events. Most reads have few events, from sequencing errors. A smaller group have many, because they
+come from sequence that differs from every genome in the index. refmap fits these two groups as two
+Poisson distributions. The limit is then the smallest event count that sequencing errors alone exceed
+less than once in 1,000 reads (`--err-alpha`, default 0.001). The histogram is of pairs with
+`--paired`, reads otherwise.
+
+*Technical detail:* the fit is a two-component Poisson mixture estimated by EM. Component 0 is the
+sequencing-error floor (mean mu0), and component 1 is the divergence tail, with the last histogram
+bin treated as censored. The cutoff is the smallest K with P(Poisson(mu0) > K) <= alpha.
 `--err-hist=FILE` writes both histograms with the fit, the expected error-only count and the
 posterior probability that each count is sequencing error.
 
 ## Span
 
-- Single-end EXACT: first-to-last reference copy located; copies on two sequences = infinite.
-- Single-end PLACED: spread of every assembly's lift projection; projections on two sequences
-  = infinite. So `--max-ref-span=N` on a PLACED read equals preset F's
+**What it is.** A read can point to more than one position on B73: several B73 copies, or several
+founder copies that translate to different B73 places. The **span** is the distance between the
+first and last of those positions. A read whose candidate positions are close together has a small
+span, and one whose candidates are far apart has a large span. `--max-ref-span=N` removes reads with
+a span over N bp.
+
+**Candidates on different chromosomes** have no meaningful distance. They are given a span of
+"infinite", meaning larger than any limit, so any `--max-ref-span` removes them. `--err-stats`
+writes it as `inf`.
+
+How the span is measured for each kind of read:
+
+- Single-end EXACT: from the first to the last B73 copy of the read.
+- Single-end PLACED: the spread of every assembly's lift projection. So `--max-ref-span=N` on a PLACED read equals preset F's
   `--placed-min-chr-agree=1 --placed-max-spread=N` (refmap-read-filters 1d7a3cc), which only
   measures the majority sequence's spread.
-- `--paired`: first-to-last coordinate of both mates after rescue (CONC/RESC/DISC on one
-  sequence); DISC across sequences = infinite; SOLO = the placed mate's own span. CONC pairs are
+- `--paired`: from the first to the last position of both mates together, after rescue (pair
+  classes `CONC`, `RESC`, or `DISC` on one chromosome). A `DISC` pair whose mates are on different
+  chromosomes is infinite. For a `SOLO` pair it is the placed mate's own span. CONC pairs are
   at most max insert + `--pe-slack` by construction, so a cap at or above that bites on DISC
   and SOLO pairs. `--pe-drop-disc` drops DISC pairs outright.
 
@@ -123,10 +157,17 @@ Per read (single-end), the same shape one step earlier: 0/1 events 4-9% wrong, 2
 in panel and drifts up with divergence (Ia453 0.40, A188xEP1 0.58): one-SNP divergent reads
 look like sequencing error. The drift only raises the cutoff (keeps more).
 
-**Paired cutoff table** (kept = % of PS4G events; wrong % of kept vs removed; founder =
-true founder in the event's set, Oh43 / B73xOh43 = either parent):
+**Paired cutoff table.** Each cell lists several numbers separated by `/`:
 
-| cutoff | Oh43 kept / wrong k / wrong r / founder | Ia453 kept / wrong k / r | A188xEP1 kept / wrong k / r | B73xOh43 kept / founder |
+- **kept**: % of PS4G events (read pairs) that pass the filter.
+- **wrong k**: % of the *kept* events that are misplaced (on the wrong chromosome or ≥ 20 kb from
+  the true position). Lower is better.
+- **wrong r** (or just **r**): % of the *removed* events that were misplaced. Higher means the filter
+  removes mostly bad events.
+- **founder**: % of kept events whose founder set contains the true founder (for B73xOh43, either
+  parent). Higher is better.
+
+| cutoff | Oh43: kept / wrong k / wrong r / founder | Ia453: kept / wrong k / wrong r | A188xEP1: kept / wrong k / wrong r | B73xOh43: kept / founder |
 |---|---|---|---|---|
 | none | 100 / 6.43 / - / 97.77 | 100 / 8.76 / - | 100 / 14.38 / - | 100 / 98.15 |
 | ev <= 1 | 94.1 / 5.12 / 28.5 / 99.08 | 86.0 / 6.10 / 33.0 | 71.1 / 6.49 / 42.6 | 94.1 / 99.28 |
@@ -140,7 +181,8 @@ true founder in the event's set, Oh43 / B73xOh43 = either parent):
 | ev <= 2 + span <= 1x | 86.9 / 3.35 / 43.7 / 99.34 | 79.1 / 3.96 / 44.7 | 65.5 / 3.96 / 50.1 | 90.5 / 99.55 |
 | ev <= 3 + span <= 1x | 87.2 / 3.42 / 44.9 / 99.26 | 79.9 / 4.05 / 46.6 | 66.8 / 4.12 / 52.2 | 90.9 / 99.48 |
 
-**Single-end cutoff table** (per read; kept / wrong kept / wrong removed):
+**Single-end cutoff table** (per read; kept / wrong k / wrong r as above; the number in
+parentheses is the founder %):
 
 | cutoff | Oh43 sim (founder kept) | Ia453 | A188xEP1 |
 |---|---|---|---|

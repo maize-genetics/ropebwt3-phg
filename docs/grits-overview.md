@@ -58,7 +58,11 @@ and counts every difference: a wrong base costs 1, a k-base insertion or deletio
 past the end of the genome costs 1 (nothing is clipped for free). Reads with more differences than the limit are
 FILTERED.
 
-**Flags:** `--err-noclip --err-max-events=1` (keep reads with at most one difference). Optional extras:
+**Flags:** `--err-noclip --err-max-events=1`, which keeps reads with at most one difference.
+`--err-max-events` sets the limit. `--err-noclip` switches on the counting described above. Without it,
+an older, looser count is used: everything hanging past a contig end counts as a single difference
+however long it is, and an insertion or deletion longer than 1 bp is not recognised as one event.
+Optional extras:
 `--err-stats` adds the counts to each output row, `--err-cigar` writes the read-vs-genome alignment (for example
 `75=1X74=`), `--min-match-frac=0.99` filters on the fraction of exactly matching bases, `--err-hist=FILE` writes a
 histogram of differences for the whole run.
