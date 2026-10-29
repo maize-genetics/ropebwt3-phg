@@ -1087,6 +1087,12 @@ check_eq "filters off: stdout identical to the plain --paired run" "$(cmp -s "$T
 check_eq "--err-max-events on chain is an error" "$?$(grep -c 'apply to refmap only' "$TMP/err_e1.log")" "11"
 "$RB" $ERM --err-max-events=auto "$PIDX" - < "$ERR/se.fa" > /dev/null 2>"$TMP/err_e2.log"
 check_eq "--err-max-events=auto on stdin is an error" "$?$(grep -c 'not stdin' "$TMP/err_e2.log")" "11"
+# every input counts, not just the first: --paired R2 from stdin used to be eaten by the
+# calibration pre-pass (the main pass then failed with "the first file has more reads")
+"$RB" $ERM --err-max-events=auto --paired "$PIDX" "$PE/r1.fa" - < "$PE/r2.fa" > /dev/null 2>"$TMP/err_e2p.log"
+check_eq "--paired --err-max-events=auto with R2 on stdin is an error" "$?$(grep -c 'not stdin' "$TMP/err_e2p.log")" "11"
+"$RB" $ERM --err-hist="$TMP/err_e2h.tsv" "$PIDX" "$ERR/se.fa" - < "$ERR/se.fa" > /dev/null 2>"$TMP/err_e2h.log"
+check_eq "--err-hist with a trailing stdin input is an error" "$?$(grep -c 'not stdin' "$TMP/err_e2h.log")" "11"
 "$RB" $ERM --pe-drop-disc "$PIDX" "$ERR/se.fa" > /dev/null 2>"$TMP/err_e3.log"
 check_eq "--pe-drop-disc without --paired is an error" "$?" "1"
 

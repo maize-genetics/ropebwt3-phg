@@ -1911,6 +1911,16 @@ typedef struct {
 	void **km;
 } err_cal_t;
 
+// 1 if any of the n input file names is "-" (stdin). The calibration pre-pass reopens R1 (and R2
+// with --paired) for its own read, so none of the inputs may be a stream it would consume.
+static int rb3_any_stdin(int n, char *const *fn)
+{
+	int i;
+	for (i = 0; i < n; ++i)
+		if (strcmp(fn[i], "-") == 0) return 1;
+	return 0;
+}
+
 static void err_cal_worker(void *data, long i, int tid)
 {
 	err_cal_t *c = (err_cal_t*)data;
@@ -3764,8 +3774,8 @@ int main_search(int argc, char *argv[]) // "sw" and "mem" share the same CLI
 		else if (opt.kmer_len > 0) err = "--err-*/--max-ref-span do not support --kmer";
 		else if (opt.walk_mode == RB3_WALK_PERASSEMBLY) err = "--err-*/--max-ref-span do not support --walk-mode=per-assembly";
 		else if (opt.err_calib < 1 || opt.err_alpha <= 0.0 || opt.err_alpha >= 1.0) err = "--err-calib must be >= 1 and 0 < --err-alpha < 1";
-		else if ((opt.err_max_ev == -2 || opt.err_hist_fn) && (argc - o.ind < 2 || strcmp(argv[o.ind + 1], "-") == 0))
-			err = "--err-max-events=auto/--err-hist read the input twice: give a file, not stdin";
+		else if ((opt.err_max_ev == -2 || opt.err_hist_fn) && (argc - o.ind < 2 || rb3_any_stdin(argc - o.ind - 1, &argv[o.ind + 1])))
+			err = "--err-max-events=auto/--err-hist read the input twice: give files, not stdin ('-')";
 		if (err) {
 			if (rb3_verbose >= 1) fprintf(stderr, "ERROR: %s\n", err);
 			return 1;
