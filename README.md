@@ -259,7 +259,7 @@ appended to both mates' stdout rows as one extra column:
 |---|---|---|
 | `CONC` | both mates placed on one contig within `max_ins + --pe-slack` | one event, at the anchor mate |
 | `RESC` / `MOVED` | discordant, but a PLACED mate has a lift projection near the other mate; the `MOVED` mate is re-placed there | one event |
-| `SOLO` | only one mate placed | one event |
+| `SOLO` | only one mate placed | one event, with the placed mate's founder set |
 | `DISC` | discordant, not rescuable | each mate is its own event, as in single-end mode |
 | `NONE` | neither mate placed | none |
 

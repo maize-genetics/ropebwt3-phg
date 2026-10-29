@@ -563,6 +563,22 @@ check_line_in "per-read: P3 (SOLO) uses the placed mate's set" "$TMP/pe.pr" "$(p
 check_eq "per-read: discordant P4 gives one line per mate" "$(grep -c '^P4/[12]	' "$TMP/pe.pr")" "2"
 check_eq "per-read: 49 events (+ header)" "$(wc -l < "$TMP/pe.pr" | tr -d ' ')" "50"
 
+# SOLO pair whose other mate is not placed: that mate's raw hits (still in its gamete list) are not
+# evidence, so the event is the anchor's own set. FILTERED mate: --placed-min-proj=3 rejects the
+# PLACED mates of P1/P5/P7 (2, 2 and 1 lift projections). UNPLACED mate: --lift-win=10 leaves
+# them without a projection. Either way P1/P5/P7 turn SOLO, anchored at their EXACT mate 2.
+"$RB" $PRM --paired --placed-min-proj=3 --ps4g-per-read="$TMP/pe_fm.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_fm.tsv" 2>/dev/null
+check_eq "FILTERED mate: P1/P5/P7 become SOLO" "$(awk -F'\t' '$1=="P1/1"||$1=="P5/1"||$1=="P7/1"{printf "%s/%s ", $3, $NF}' "$TMP/pe_fm.tsv")" \
+	"FILTERED/SOLO FILTERED/SOLO FILTERED/SOLO "
+check_line_in "FILTERED mate: P1 (SOLO) event = the EXACT mate's set {B73,Mo17,Oh43}, not {Mo17}" "$TMP/pe_fm.pr" "$(printf 'P1\tchr1\t10300\t0,2,3')"
+check_line_in "FILTERED mate: P5 (SOLO) event = all four, not the filtered TE mate's {Ki3,Mo17}" "$TMP/pe_fm.pr" "$(printf 'P5\tchr1\t9600\t0,1,2,3')"
+check_line_in "FILTERED mate: P7 (SOLO) event = all four, not the filtered mate's {Ki3}" "$TMP/pe_fm.pr" "$(printf 'P7\tchr1\t6000\t0,1,2,3')"
+"$RB" $PRM --paired --lift-win=10 --ps4g-per-read="$TMP/pe_um.pr" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_um.tsv" 2>/dev/null
+check_eq "UNPLACED mate: P1/P5/P7 become SOLO" "$(awk -F'\t' '$1=="P1/1"||$1=="P5/1"||$1=="P7/1"{printf "%s/%s ", $3, $NF}' "$TMP/pe_um.tsv")" \
+	"UNPLACED/SOLO UNPLACED/SOLO UNPLACED/SOLO "
+check_line_in "UNPLACED mate: P1 (SOLO) event = the EXACT mate's set" "$TMP/pe_um.pr" "$(printf 'P1\tchr1\t10300\t0,2,3')"
+check_line_in "UNPLACED mate: P7 (SOLO) event = all four, not the unplaced mate's {Ki3}" "$TMP/pe_um.pr" "$(printf 'P7\tchr1\t6000\t0,1,2,3')"
+
 # single-end run of the same reads, for contrast: P1 then gives two separate events
 "$RB" $PRM --ps4g="$TMP/pe_se.ps4g" "$PIDX" "$PE/r1.fa" "$PE/r2.fa" > "$TMP/pe_se.tsv" 2>/dev/null
 check_eq "without --paired: 11 columns, files read one after another" \

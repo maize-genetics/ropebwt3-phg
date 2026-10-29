@@ -1638,16 +1638,21 @@ static void refmap_count_hit(const pipeline_t *p, int8_t status)
 	rb3_hitcount_add(&((pipeline_t*)p)->hitcount, status == RB3_RM_PLACED || status == RB3_RM_EXACT);
 }
 
+static inline int refmap_is_placed(const refmap_rst_t *r) { return r->status == RB3_RM_EXACT || r->status == RB3_RM_PLACED; }
+
 // --paired: the single PS4G/npy event of a pair, at the anchor mate a's position, carrying the
 // founders both mates share (rb3_pe_event_gametes). --ps4g-per-read gets one line, named after
-// the fragment (the mate name without "/1" or "/2").
+// the fragment (the mate name without "/1" or "/2"). A mate that is not EXACT/PLACED (the
+// unplaced or FILTERED mate of a SOLO pair) still holds the gametes of its raw hits from
+// refmap_query(); they are not evidence, so it contributes an empty set and the event is the
+// anchor's own set.
 static void refmap_pair_event(const pipeline_t *p, const m_seq_t *s, const refmap_rst_t *a, const refmap_rst_t *b)
 {
-	int32_t *g, n, k;
+	int32_t *g, n, k, nb = refmap_is_placed(b)? b->n_gametes : 0;
 	if (a->status == RB3_RM_FILTERED) return; // --err-max-events/--max-ref-span/--pe-drop-disc rejected the pair
-	if (a->n_gametes <= 0 && b->n_gametes <= 0) return;
-	g = RB3_MALLOC(int32_t, a->n_gametes + b->n_gametes);
-	n = rb3_pe_event_gametes(a->gametes, a->n_gametes, a->capped, b->gametes, b->n_gametes, b->capped, g);
+	if (a->n_gametes <= 0 && nb <= 0) return;
+	g = RB3_MALLOC(int32_t, a->n_gametes + nb + 1);
+	n = rb3_pe_event_gametes(a->gametes, a->n_gametes, a->capped, nb > 0? b->gametes : 0, nb, b->capped, g);
 	if (n > 0 && p->ps4g_acc) rb3_ps4g_acc_add(p->ps4g_acc, a->ref_sid, a->cL, g, n);
 	if (n > 0 && p->ps4g_per_read_fp) {
 		const char *nm = p->fmi.sid->name[a->ref_sid], *us = strchr(nm, '_');
@@ -1818,7 +1823,6 @@ static void write_refmap(step_t *t)
 /********************************************************************
  * refmap --err-max-events / --max-ref-span / --pe-drop-disc
  ********************************************************************/
-static inline int refmap_is_placed(const refmap_rst_t *r) { return r->status == RB3_RM_EXACT || r->status == RB3_RM_PLACED; }
 
 static inline void refmap_filter1(pipeline_t *p, refmap_rst_t *r, char why, int which)
 {
