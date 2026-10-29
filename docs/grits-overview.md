@@ -105,8 +105,8 @@ you collapse identical reads first and keep their counts.
 ## The recommended GRITS command
 
 ```sh
-ropebwt3 lift -k 50 -s 200 -t 16 -o idx.k50s200.lift idx.fmd B73.fa     # once per index
-ropebwt3 isa idx.fmd                                                    # once per index (for extract)
+ropebwt3 lift --ref-prefix=B73 -k 50 -s 200 -t 16 -o idx.k50s200.lift idx.fmd B73.fa  # once per index
+ropebwt3 isa idx.fmd                                                                   # once per index (for extract)
 
 ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 -l 19 --lift=idx.k50s200.lift -t 16 \
   --anchor-dist-npy --anchor-dist-thresh=2000 --ps4g=out.ps4g --npy=out.npy \
