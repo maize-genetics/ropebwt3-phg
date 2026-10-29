@@ -228,7 +228,7 @@ static void test_finalize_spliced_segments(const rb3_sid_t *sid, const rb3_gtab_
 	rb3_ps4g_acc_destroy(acc);
 }
 
-// Regression test for the ps4g.c:409-412 fix: the reference gamete's ternary
+// Regression test for the ref_gamete fix in rb3_ps4g_npy_finalize: the reference gamete's ternary
 // column must reflect whether THIS row's read genuinely carries the reference
 // gamete (in_set) -- not be hardcoded to match(1) regardless of gameteSet
 // content. Before the fix, EVERY row read back state=1 for the reference

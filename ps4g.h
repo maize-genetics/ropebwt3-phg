@@ -69,10 +69,12 @@ void rb3_bed_destroy(rb3_bed_t *b);
 // rb3_lift_ternary_state against a distance-thresh cutoff of anchor_thresh bp),
 // then a per-founder distance-to-nearest-lift-anchor block (-1 = no anchor on this
 // reference sequence), before the existing gA/gB label columns. ref_gamete (the
-// gamete index of the reference genome itself, or -1 if unknown/not applicable) is
-// always forced to ternary=match/distance=0 rather than run through the liftover
-// lookup, since the reference has zero liftover anchors by construction (it never
-// appears as an assembly/csid) and would otherwise read as spurious deletions. A
+// gamete index of the reference genome itself, or -1 if unknown/not applicable) has
+// its distance forced to 0 rather than looked up in the liftover, since the reference
+// has zero liftover anchors by construction (it never appears as an assembly/csid)
+// and would otherwise read as a spurious deletion. Its ternary state is not forced:
+// like any founder it is match (1) when the row's gameteSet contains it and, with
+// distance 0, diverged (0) otherwise -- never deletion (-1). A
 // companion "<npy>.layout.tsv" sidecar recording the column layout is written
 // alongside the usual .bins.tsv/.gametes.tsv only when ridx is non-NULL.
 void rb3_ps4g_npy_finalize(rb3_ps4g_acc_t *acc, const rb3_gtab_t *gtab, const rb3_sid_t *sid,
