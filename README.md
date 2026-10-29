@@ -104,6 +104,47 @@ You can use option `-p` to get the positions of a subset of SMEMs.
 In addition, you can use `--gap` to obtain regions not covered by long SMEMs or
 `--cov` to get the total length of regions covered by long SMEMs.
 
+#### <a name="mem-paired"></a>Paired-end `mem` (`--paired`)
+
+`mem --paired -p INT` takes the same inputs as [`refmap --paired`](#refmap-paired): R1 and R2
+files, or one interleaved file. Each SMEM hit implies where the whole read starts on that contig. Two mates are concordant on a contig when they hit it on
+opposite strands with implied starts within the insert size. In a pangenome, the concordant
+contigs are the assemblies that carry the whole fragment. A concordant pair (`CONC`) prints only
+its concordant positions; `DISC`, `SOLO` and `NONE` pairs print everything. Every row gets a
+trailing class column.
+
+One exception: if a mate's longest SMEM has more occurrences than `-p` located, that mate's hits
+are only a sample. It cannot rule out its partner's hits, so the partner keeps all of its
+positions. The insert size is estimated from mates with whole-read SMEMs, or set with
+`--pe-isize`. `--pe-slack` defaults to 0 here, because SMEM positions are exact.
+
+**With `--paired`, raise `-p` well above what you would use single-end.** `-p` caps how many
+occurrences of each SMEM are located. In a pangenome, even a low-copy repeat exceeds a small cap.
+The located positions are then only a sample, which often misses the read's true locus, and the
+mate can't confirm the locus. Pairing is what makes a large `-p` affordable: the concordance
+filter prunes a repetitive read's extra copies down to the one next to its mate, so founder sets
+don't grow. `-p` keeps its usual default (`--paired` without `-p` is an error). Measured on 500k
+simulated 150 bp pairs from an in-panel maize line, 25-genome index, 16 threads:
+
+| `-p` | true founder at true locus | mean founder set | wrong B73 placement | discordant pairs | wall time |
+|---|---|---|---|---|---|
+| 128 | 91.4% | 9.1 | 3.8% | 29.5k | 77 s |
+| 1024 | **96.2%** | **8.8** | **1.8%** | 8.9k | 171 s |
+
+At `-p 128`, reads whose longest SMEM was only partly located caused 7.3 of the 8.5 pp of misses;
+fully located reads miss 1.3% of the time. **Start with `-p 1024`.** Go higher only if many reads
+are still capped: in a single-end run, compare column 4 (the SMEM's occurrence count) with column 5
+(positions located). In paired `CONC` rows, column 5 counts only the concordant positions. The cost is time and output size; memory barely changes (about 9 GB).
+
+`DISC` pairs, whose mates have no concordant contig, are printed and labelled rather than
+dropped. Filtering them downstream works like minimap2's proper-pair filter: wrong B73
+placements fall from 1.8% to 1.5% of reads, at the cost of 1.5% of reads in-panel and 5% for a
+held-out line (whose divergence from every founder yields more discordant pairs).
+
+```sh
+ropebwt3 mem --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.mem.tsv
+```
+
 ### <a name="bwasw"></a>Local alignment
 
 Ropebwt3 implements a revised [BWA-SW algorithm][bwasw] to align query
@@ -122,6 +163,32 @@ written to the `rh` tag.
 
 **Local alignment is tens of times slower than finding SMEMs.** It is not designed
 for aligning high-throughput sequence reads.
+
+#### <a name="sw-paired"></a>Paired-end `sw` (`--paired`)
+
+`sw --paired -p INT` uses the same inputs and the same per-assembly concordance as
+[`mem --paired`](#mem-paired). Each PAF hit's located positions imply where the whole read starts on each
+contig. Two mates are concordant on a contig when they hit it on opposite strands with implied
+starts within the insert. A `CONC` pair's lines keep only concordant positions: a concordant
+one becomes the primary (columns 6–9) and the rest go in `ap:Z`. A hit left with none is
+dropped. `rh:i` still reports the hit's full occurrence count. Every line gets a `pe:Z:` tag
+(`CONC`/`DISC`/`SOLO`/`NONE`); `DISC` pairs keep all their positions.
+
+**Use a large `-p`; start with `-p 1024`.** In `sw`, `-p` is a per-read *budget* of positions,
+and `-p 0` (the default) locates just one occurrence per hit. A mate whose best hit was only
+partly located cannot veto its partner's positions. `--paired` without `-p` is an error, and so
+is `--paired` with `--all-e2e`. `--pe-slack` defaults to 0.
+
+Measured on 500k simulated 150 bp pairs, `-p 1024`, 16 threads. For an in-panel line, the true
+founder was at the true locus for 96.69% of reads single-end and 96.64% paired. Mean founder set
+fell from 12.0 to 8.7 assemblies, and wrong B73 placements from 4.2% to 1.8% of reads. Dropping
+`DISC` pairs gives 97.95% locus precision and 1.33% wrong B73, at the cost of 2.5% of reads
+(8.4% for a held-out line). Runtime is about 240 s per 500k pairs and 17–20 GB RAM, about 1.4×
+slower than `mem --paired`.
+
+```sh
+ropebwt3 sw --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.paf
+```
 
 ### <a name="e2e"></a>Haplotype diversity with end-to-end alignment
 
@@ -225,7 +292,7 @@ Options:
 * `--ps4g-per-read=FILE` writes one PS4G row per read (its exact founder set) instead
   of aggregated counts.
 * `--max-locate=INT` caps how many occurrences of each read are located [256]; see
-  [Paired-end reads](#refmap) below for when it matters.
+  [Paired-end reads](#refmap-paired) below for when it matters.
 * **Read filters, error/edit filters and edit-distance statistics** (all off by
   default): `--placed-*`, `--exact-*`, `--min-core-len`, `--err-*`, `--min-match-frac`,
   `--max-ref-span`, `--ed-*`. The recommended set is explained under
@@ -248,7 +315,7 @@ See [docs/usage.md](docs/usage.md) for a full guide (§7 PS4G/numpy output,
 §8 `--target-hits`) and a runnable example ([docs/examples/](docs/examples/),
 `sh docs/examples/run.sh`).
 
-#### Paired-end reads (`--paired`)
+#### <a name="refmap-paired"></a>Paired-end reads (`--paired`)
 
 `refmap --paired` reads mate pairs, from two files (`R1.fq R2.fq`) or from one interleaved file
 whose mates sit next to each other. Mate names must match up to a trailing `/1` or `/2`. Each
@@ -279,8 +346,8 @@ pairs, or from `--pe-isize=MEAN,SD` (`max_ins = MEAN + 4*SD`). `--pe-slack` defa
 the lift-projection error scale. An EXACT mate's other reference copies count as
 alternative positions too, so pairing also picks the right copy of a duplicated sequence.
 `--pe-trust-exact` (opt-in) moves the PLACED mate of an unrescuable EXACT + PLACED pair onto the
-EXACT mate. The PS4G/npy layout is unchanged. `--paired` also works with `mem`, `sw` and `chain`; each
-is described in its own section below.
+EXACT mate. The PS4G/npy layout is unchanged. `--paired` also works with
+[`mem`](#mem-paired), [`sw`](#sw-paired) and [`chain`](#chain-paired); each is described under its own command.
 
 **`-p` has no effect on `refmap`; use `--max-locate=INT` [256].** It sets how many occurrences of
 each read refmap locates; the rest are not sampled. Too small a value truncates a read's
@@ -299,47 +366,6 @@ paired-mode loss of true-founder recall does not come from sampling. Raise `--ma
 ```sh
 ropebwt3 refmap --ref-prefix=B73 --lift=pan.lift --paired --ps4g=pe.ps4g --npy=pe.npy \
   pan.fmd R1.fq R2.fq > pe.tsv
-```
-
-#### Paired-end `mem` (`--paired`)
-
-`mem --paired -p INT` takes the same inputs as `refmap --paired`. Each SMEM hit implies where the
-whole read starts on that contig. Two mates are concordant on a contig when they hit it on
-opposite strands with implied starts within the insert size. In a pangenome, the concordant
-contigs are the assemblies that carry the whole fragment. A concordant pair (`CONC`) prints only
-its concordant positions; `DISC`, `SOLO` and `NONE` pairs print everything. Every row gets a
-trailing class column.
-
-One exception: if a mate's longest SMEM has more occurrences than `-p` located, that mate's hits
-are only a sample. It cannot rule out its partner's hits, so the partner keeps all of its
-positions. The insert size is estimated from mates with whole-read SMEMs, or set with
-`--pe-isize`. `--pe-slack` defaults to 0 here, because SMEM positions are exact.
-
-**With `--paired`, raise `-p` well above what you would use single-end.** `-p` caps how many
-occurrences of each SMEM are located. In a pangenome, even a low-copy repeat exceeds a small cap.
-The located positions are then only a sample, which often misses the read's true locus, and the
-mate can't confirm the locus. Pairing is what makes a large `-p` affordable: the concordance
-filter prunes a repetitive read's extra copies down to the one next to its mate, so founder sets
-don't grow. `-p` keeps its usual default (`--paired` without `-p` is an error). Measured on 500k
-simulated 150 bp pairs from an in-panel maize line, 25-genome index, 16 threads:
-
-| `-p` | true founder at true locus | mean founder set | wrong B73 placement | discordant pairs | wall time |
-|---|---|---|---|---|---|
-| 128 | 91.4% | 9.1 | 3.8% | 29.5k | 77 s |
-| 1024 | **96.2%** | **8.8** | **1.8%** | 8.9k | 171 s |
-
-At `-p 128`, reads whose longest SMEM was only partly located caused 7.3 of the 8.5 pp of misses;
-fully located reads miss 1.3% of the time. **Start with `-p 1024`.** Go higher only if many reads
-are still capped: in a single-end run, compare column 4 (the SMEM's occurrence count) with column 5
-(positions located). In paired `CONC` rows, column 5 counts only the concordant positions. The cost is time and output size; memory barely changes (about 9 GB).
-
-`DISC` pairs, whose mates have no concordant contig, are printed and labelled rather than
-dropped. Filtering them downstream works like minimap2's proper-pair filter: wrong B73
-placements fall from 1.8% to 1.5% of reads, at the cost of 1.5% of reads in-panel and 5% for a
-held-out line (whose divergence from every founder yields more discordant pairs).
-
-```sh
-ropebwt3 mem --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.mem.tsv
 ```
 
 ### <a name="chain"></a>RNAseq: chaining and PAV placement
@@ -459,7 +485,7 @@ Options:
   bp from the chain [10000].
 * `--dup-count` a read named `<name>;x=N` stands for N identical reads and adds N to the
   PS4G/npy counts, so duplicates can be collapsed before running `chain`.
-* `--paired` mate pairs; see [Paired-end `chain`](#chain) below.
+* `--paired` mate pairs; see [Paired-end `chain`](#chain-paired) below.
 * `--pav-grid=NUM` snap the emitted breakpoint to this grid. A breakpoint is
   approximate, so this is the resolution actually being claimed; `0` emits the exact
   projected position [5000].
@@ -483,33 +509,7 @@ Options:
   Measured as a no-op here — SMEM search already isolates the informative core —
   and kept only because it may matter for other read types.
 
-#### Paired-end `sw` (`--paired`)
-
-`sw --paired -p INT` uses the same inputs and the same per-assembly concordance as
-`mem --paired`. Each PAF hit's located positions imply where the whole read starts on each
-contig. Two mates are concordant on a contig when they hit it on opposite strands with implied
-starts within the insert. A `CONC` pair's lines keep only concordant positions: a concordant
-one becomes the primary (columns 6–9) and the rest go in `ap:Z`. A hit left with none is
-dropped. `rh:i` still reports the hit's full occurrence count. Every line gets a `pe:Z:` tag
-(`CONC`/`DISC`/`SOLO`/`NONE`); `DISC` pairs keep all their positions.
-
-**Use a large `-p`; start with `-p 1024`.** In `sw`, `-p` is a per-read *budget* of positions,
-and `-p 0` (the default) locates just one occurrence per hit. A mate whose best hit was only
-partly located cannot veto its partner's positions. `--paired` without `-p` is an error, and so
-is `--paired` with `--all-e2e`. `--pe-slack` defaults to 0.
-
-Measured on 500k simulated 150 bp pairs, `-p 1024`, 16 threads. For an in-panel line, the true
-founder was at the true locus for 96.69% of reads single-end and 96.64% paired. Mean founder set
-fell from 12.0 to 8.7 assemblies, and wrong B73 placements from 4.2% to 1.8% of reads. Dropping
-`DISC` pairs gives 97.95% locus precision and 1.33% wrong B73, at the cost of 2.5% of reads
-(8.4% for a held-out line). Runtime is about 240 s per 500k pairs and 17–20 GB RAM, about 1.4×
-slower than `mem --paired`.
-
-```sh
-ropebwt3 sw --paired -p 1024 -t 16 pan.fmd R1.fq R2.fq > pe.paf
-```
-
-#### Paired-end `chain` (`--paired`)
+#### <a name="chain-paired"></a>Paired-end `chain` (`--paired`)
 
 `chain --paired` takes the same inputs as `refmap --paired` (R1 R2, or one interleaved file).
 Each mate is chained as in single-end mode, then the pair is classified:
@@ -691,7 +691,7 @@ the earlier behaviour byte-for-byte):
   `--err-clip-reject` are alternative cut-offs.
 
 Paired reads: add `--paired` and give both files (`pan.fmd r1.fq r2.fq`); a pair
-then contributes one PS4G/npy event (see [Paired-end reads](#refmap)).
+then contributes one PS4G/npy event (see [Paired-end reads](#refmap-paired)).
 `--ed-stats=FILE[.npy]`/`--ed-hist=FILE` additionally write each read's best edit
 distance to every assembly; they do not change placement output.
 
