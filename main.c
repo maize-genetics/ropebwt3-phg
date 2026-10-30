@@ -19,6 +19,8 @@ int main_fa2line(int argc, char *argv[]);
 int main_fa2kmer(int argc, char *argv[]);
 int main_plain2fmd(int argc, char *argv[]);
 int main_stat(int argc, char *argv[]);
+int main_isa(int argc, char *argv[]);
+int main_extract(int argc, char *argv[]);
 
 static int usage(FILE *fp)
 {
@@ -37,8 +39,10 @@ static int usage(FILE *fp)
 	fprintf(fp, "    plain2fmd  convert BWT in plain text to FMD\n");
 	fprintf(fp, "    ssa        generate sampled suffix array\n");
 	fprintf(fp, "    lift       build assembly->reference liftover for refmap --lift\n");
+	fprintf(fp, "    isa        derive extraction entry points (sampled inverse SA) from the .ssa\n");
 	fprintf(fp, "  Miscellaneous:\n");
 	fprintf(fp, "    get        retrieve the i-th sequence from BWT\n");
+	fprintf(fp, "    extract    extract sequence by coordinate (optionally projected from a reference)\n");
 	fprintf(fp, "    stat       basic statistics of BWT\n");
 	fprintf(fp, "    kount      count (high-occurrence) k-mers\n");
 	fprintf(fp, "    fa2line    convert FASTX to lines\n");
@@ -65,6 +69,8 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "stat") == 0) ret = main_stat(argc-1, argv+1);
 	else if (strcmp(argv[1], "suffix") == 0) ret = main_suffix(argc-1, argv+1);
 	else if (strcmp(argv[1], "get") == 0) ret = main_get(argc-1, argv+1);
+	else if (strcmp(argv[1], "isa") == 0) ret = main_isa(argc-1, argv+1);
+	else if (strcmp(argv[1], "extract") == 0) ret = main_extract(argc-1, argv+1);
 	else if (strcmp(argv[1], "kount") == 0) ret = main_kount(argc-1, argv+1);
 	else if (strcmp(argv[1], "fa2line") == 0) ret = main_fa2line(argc-1, argv+1);
 	else if (strcmp(argv[1], "fa2kmer") == 0) ret = main_fa2kmer(argc-1, argv+1);

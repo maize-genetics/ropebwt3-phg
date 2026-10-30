@@ -18,17 +18,19 @@ query (say 150 bp) that hits several genomes but **not** the reference, because
 the region is part of an insertion relative to the reference. `mem` and `sw`
 cannot give you a reference coordinate for it; `refmap` can.
 
-`refmap` places such a query in one of two ways:
+`refmap` places such a query by **`--lift`**, which is required. It projects the carrier
+hit to a reference coordinate through a precomputed carrier→reference map (the "second
+SSA", built once by `ropebwt3 lift`). It is fast and accurate for bulk read placement
+(95.5% precision, 77.9% recall, ~15× faster than the old walk on a 4-genome maize
+benchmark). See [lift-second-ssa.md](lift-second-ssa.md).
 
-* **`--lift` (recommended)** — project the carrier hit to a reference coordinate
-  through a precomputed carrier→reference map (the "second SSA", built once by
-  `ropebwt3 lift`). Fast and accurate for bulk read placement (95.5% precision,
-  77.9% recall, ~15× faster than the walk on a 4-genome maize benchmark). See
-  [lift-second-ssa.md](lift-second-ssa.md).
-* **walk (default, no extra build)** — walk outward through the carriers to the
-  insertion breakpoints and re-anchor there; this *brackets* the breakpoint and
-  reports the inserted size, which is what you want for structural detail on a
-  single locus.
+The older **walk** (`--walk`, **deprecated**) instead walks outward through the carriers
+to the insertion breakpoints. It brackets the breakpoint and reports the inserted size,
+but it is slow, no longer the default, and will be removed. It is described below only
+so existing scripts can be migrated.
+
+For reads that should be filtered or paired (the GRITS pipeline), see the README sections
+"Placing a query on a reference genome" and "GRITS pipeline"; this guide covers the basics.
 
 If the query *is* present in the reference, `refmap` reports its exact
 coordinates (`status = EXACT`) instead. A query occurring more than `--max-occ`
@@ -45,7 +47,7 @@ times (a repeat/retro) is reported as `MULTI` and not placed.
 | `<base>.fmd` | `ropebwt3 build -d` | the BWT itself |
 | `<base>.fmd.ssa` | `ropebwt3 ssa` | sampled suffix array → coordinates |
 | `<base>.fmd.len.gz` | `seqtk comp` / awk | sequence names and lengths |
-| `<base>.lift` *(optional)* | `ropebwt3 lift` | carrier→reference map, for `--lift` |
+| `<base>.lift` | `ropebwt3 lift` | carrier→reference map, for `--lift` (required) |
 
 The reference is selected by **sequence-name prefix**, so name the reference
 sequences with a common prefix (e.g. `B73_chr1`, `B73_chr2`, …) distinct from
@@ -112,15 +114,15 @@ ropebwt3 ssa -s8 -o docs/examples/pangenome.fmd.ssa docs/examples/pangenome.fmd
 # 3. names + lengths (seqtk alternative shown; the script uses awk)
 seqtk comp docs/examples/pangenome.fa | cut -f1,2 | gzip > docs/examples/pangenome.fmd.len.gz
 
-# 4. RECOMMENDED: build the lift map once, then place by projection.
+# 4. build the lift map once, then place by projection.
 #    (tiny example uses -k 31 -s 10; real genomes: defaults -k 100 -s 2000, ref FASTA)
 ropebwt3 lift --ref-prefix=B73 -k 31 -s 10 -o docs/examples/pangenome.lift \
   docs/examples/pangenome.fmd docs/examples/pangenome.fa
 ropebwt3 refmap --ref-prefix=B73 --max-occ=-1 --lift docs/examples/pangenome.lift \
   docs/examples/pangenome.fmd docs/examples/queries.fa
 
-# 5. or the no-setup fallback (walk)
-ropebwt3 refmap --ref-prefix=B73 docs/examples/pangenome.fmd docs/examples/queries.fa
+# 5. DEPRECATED: the old flank walk (needs no lift; must be requested with --walk)
+ropebwt3 refmap --ref-prefix=B73 --walk docs/examples/pangenome.fmd docs/examples/queries.fa
 ```
 
 ---
@@ -128,8 +130,13 @@ ropebwt3 refmap --ref-prefix=B73 docs/examples/pangenome.fmd docs/examples/queri
 ## 5. Output
 
 One tab-separated line per query. Full captured output (with a column legend and
-the strict / per-carrier variants) is in
+the strict / per-assembly variants) is in
 [`docs/examples/refmap.out`](examples/refmap.out).
+
+The output below is from the walk (step 5), because on this 1,100 bp toy it shows the
+breakpoint exactly. The `--lift` run (step 4) gives the same statuses, but places the
+insertion queries at an approximate single coordinate (`cL = cR = 500`, `insSize` 0): the
+projection is built for whole genomes, and on a toy this small it can only be approximate.
 
 ```
 qname          qlen status   nCar carriers                       refName  strand cL  cR  span ins
@@ -146,7 +153,7 @@ unrelated       120 UNPLACED    0 .                              .        .     
 |---|---|---|
 | 1 | qname | query name |
 | 2 | qlen | query length |
-| 3 | status | `PLACED`, `ONE_SIDE`, `EXACT`, or `UNPLACED` |
+| 3 | status | `EXACT`, `PLACED`, `MULTI`, `FILTERED`, `UNPLACED` (or `ONE_SIDE`, walk only) |
 | 4 | nCarrier | number of carrier genomes the query was found in |
 | 5 | carriers | carrier names with strand (`name:+`/`name:-`), or `.` |
 | 6 | refName | reference sequence placed on, or `.` |
@@ -156,6 +163,9 @@ unrelated       120 UNPLACED    0 .                              .        .     
 | 10 | refSpan | `cR - cL`; reference bases spanned (0 = clean insertion point) |
 | 11 | insSize | implied inserted size in the carriers (bp) |
 | 12 | occ | *(only with `--report-occ`)* raw FM-index occurrence count, i.e. a "copy number" |
+
+Other options (`--paired`, `--err-stats`, `--err-cigar`, `--filter-stats`) append further
+columns; each is described with its option in the README.
 
 #### `--report-occ`: copy number, off by default
 
@@ -213,6 +223,7 @@ read_c  151  MULTI   0    .                         .        .      .         . 
 | `ONE_SIDE` | walk only: one flank anchored (the other diverges or is too far) — low precision; `--two-flank` or `--lift` avoids it |
 | `EXACT` | the query occurs in the reference itself; `cL`/`cR` are its coordinates |
 | `MULTI` | the query occurs more than `--max-occ` times (repeat/retro); deliberately not placed |
+| `FILTERED` | rejected by one of the optional read filters (off by default; see the README's GRITS pipeline section); adds nothing to `--ps4g`/`--npy` |
 | `UNPLACED` | the query is in no genome; the walk found no anchor within `--max-walk`; or `--lift` found no confident collinear projection (the NULL slot) |
 
 > **Microhomology.** With real sequence, the inserted bases often share a few
@@ -227,18 +238,14 @@ read_c  151  MULTI   0    .                         .        .      .         . 
 
 ```
 --ref-prefix=STR   reference = sequences whose name starts with STR   [required]
---lift=FILE        project carrier hits via a `ropebwt3 lift` map (recommended)
+--lift=FILE        project carrier hits via a `ropebwt3 lift` map     [required]
 --lift-win=NUM     lift projection window                             [500000]
 --lift-mad=NUM     lift max residual MAD (bp) before returning NULL   [200000]
---max-occ=N        drop queries/anchors occurring > N times (MULTI); N<0 = auto (#taxa)
---kmer=INT         place a read from INT-bp k-mers by agreement (0 = off, whole-read)
---kmer-step=INT    k-mer tiling step                                  [15]
---min-agree=INT    min agreeing k-mers to place                       [2]
---kmer-cluster=NUM agreeing k-mers must fall within NUM bp            [2000]
---max-walk=NUM     walk: max bases to walk outward per flank          [5000]
---walk-mode=STR    walk: consensus | strict | per-carrier             [consensus]
---two-flank        walk: require both flanks to anchor (drops ONE_SIDE)
--l INT             min anchor length when re-mapping a flank          [19]
+--lift-local-win=NUM, --lift-chain-nb=INT, --lift-chain-interp
+                   more precise projection (the GRITS "PLACED fix"; see README)
+--max-occ=N        drop queries/anchors occurring > N times (MULTI); N<0 = auto (#taxa); 0 = off [0]
+-l INT             min exact-match length: a read with no whole-read match is placed
+                   by its longest exact match of at least INT bp                [31]
 -t INT             number of threads                                  [4]
 -L                 one sequence per line in the input
 --ps4g=FILE        write PS4G v2.0 gamete-support counts (EXACT+PLACED reads)
@@ -248,19 +255,34 @@ read_c  151  MULTI   0    .                         .        .      .         . 
 --npy-binary       npy: write presence (1) instead of read counts
 --target-hits=NUM  stop once NUM PLACED/EXACT records are written (0 = off) [0]
 --report-occ       append a trailing "copy number" column (0 = off, opt-in)
+
+Deprecated (documented only for migrating old scripts):
+--walk             use the old flank walk instead of --lift
+--max-walk=NUM     walk: max bases to walk outward per flank          [5000]
+--walk-mode=STR    walk: consensus | strict | per-assembly            [consensus]
+--two-flank        walk: require both flanks to anchor (drops ONE_SIDE)
+--kmer=INT         place a read from INT-bp k-mers by agreement (0 = off, whole-read)
+--kmer-step=INT, --min-agree=INT, --kmer-cluster=NUM   --kmer tuning
 ```
 
-### `--lift` (recommended)
+Paired-end input, the read filters, the edit-distance filter and statistics, and
+`--ps4g-per-read`/`--max-locate` are listed by `ropebwt3 refmap` with no arguments and
+explained in the README.
+
+### `--lift`
 
 Build the map once with `ropebwt3 lift` (see
 [lift-second-ssa.md](lift-second-ssa.md)), then pass `--lift FILE` to `refmap`.
 Each carrier hit is projected to a reference coordinate by a windowed slope=±1
 robust fit; where there is no confident collinear support the read is left
 `UNPLACED` (the NULL slot) rather than placed wrong. This is faster and more
-precise than the walk for bulk read placement. Pair it with `--max-occ=-1` so
+precise than the old walk. Pair it with `--max-occ=-1` so
 repeat/retro reads are flagged `MULTI`.
 
-### `--kmer` (error-robust, high-precision)
+### `--kmer` (deprecated)
+
+> **Deprecated.** Use `chain` for multi-seed agreement instead (see the README). Kept here
+> only for migrating old scripts.
 
 Real reads carry sequencing error, so a 150 bp read rarely matches the index
 exactly. `--kmer 75` (with `--lift`) instead tiles the read into 75 bp k-mers,
@@ -280,7 +302,7 @@ well-calibrated, error-robust precision predictor (`agree≥4` ≈ 95% precision
 maize-NAM-calibrated table lets you threshold directly (cumulative precision at
 1% error: MAPQ≥9 → 92%, ≥13 → 97%). The raw counts are there for custom rules.
 
-### `--walk-mode`
+### `--walk-mode` (deprecated, `--walk` only)
 
 When carriers disagree within a flank (here `Ki3_chr1` has a SNP in the
 insertion):
@@ -290,14 +312,14 @@ insertion):
 * **`strict`** stops at the first disagreement. In the example the Ki3 SNP sits in
   the left flank, so the left anchor fails and `ins_query` becomes `ONE_SIDE`
   (only `cR` reported).
-* **`per-carrier`** walks each carrier individually and prints one line per
+* **`per-assembly`** walks each carrier individually and prints one line per
   carrier — useful when carriers carry different insertion alleles. Ki3 still
   places correctly because its own path is followed through its SNP.
 
-See the strict and per-carrier blocks in
+See the strict and per-assembly blocks in
 [`docs/examples/refmap.out`](examples/refmap.out).
 
-### `--max-walk`
+### `--max-walk` (deprecated, `--walk` only)
 
 Caps how far each flank walks outward. A query buried inside an insertion larger
 than the cap stays `UNPLACED` (no reference anchor is reached). Raise it for

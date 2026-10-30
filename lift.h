@@ -17,6 +17,17 @@ int rb3_lift_project(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cpos,
 					 int64_t win, int64_t max_mad, int32_t min_support,
 					 int64_t *out_rsid, int64_t *out_rpos);
 
+// Enable local projection (nearest collinear flanking anchors within local_win bp,
+// collinearity tolerance local_tol bp) before the wide-window median. 0 = off.
+void rb3_lift_set_local(int64_t local_win, int64_t local_tol);
+
+// With local projection on, replace the flanking-pair rule by a chain-filtered one: keep
+// anchors collinear with one of their next nb anchors, interpolate between the nearest
+// kept anchors of the dominant reference/strand. 0 = off (flanking pair). interp: always
+// interpolate between the nearest kept anchors (else extrapolate from the nearer one when
+// the two disagree).
+void rb3_lift_set_chain(int32_t nb, int interp);
+
 // Like rb3_lift_project, but when the locus is not colinear (a PAV/insertion between
 // the flanking anchors) it returns the nearest reference anchor = the closest
 // breakpoint, with *out_mode=1 (colinear projection sets *out_mode=0).
@@ -24,6 +35,53 @@ int rb3_lift_project_bp(const rb3_lift_t *lf, void *km, int32_t csid, int64_t cp
 						int64_t win, int64_t max_mad, int32_t min_support,
 						int64_t *out_rsid, int64_t *out_rpos, int *out_mode);
 
+// A reference-position index over the same liftover points as rb3_lift_t, but
+// grouped by (gamete, reference sequence) and sorted by reference position --
+// rb3_lift_t's own pt[] is sorted by (assembly sequence, assembly position), which
+// cannot answer "nearest anchor to reference position X for founder G" directly.
+// Built once per run (see rb3_lift_ridx_build); the index only holds a permutation
+// into the rb3_lift_t it was built from, so `lf` must outlive the returned index.
+typedef struct rb3_lift_ridx_s rb3_lift_ridx_t;
+
+// sid2g[seqIdx] = gamete (founder) index of sequence seqIdx, seqIdx in [0,n_seq)
+// (rb3_gtab_t.sid2g from ps4g.h) -- needed because a liftover point's csid is an
+// assembly SEQUENCE index (one founder owns many chromosomes/scaffolds), not a
+// gamete index directly.
+rb3_lift_ridx_t *rb3_lift_ridx_build(const rb3_lift_t *lf, const int32_t *sid2g, int32_t n_gamete);
+void rb3_lift_ridx_destroy(rb3_lift_ridx_t *ridx);
+
+// Distance (bp) from reference position (rsid,rpos) to the nearest liftover anchor
+// belonging to `gamete` on that same reference sequence. Returns -1 if that gamete
+// has no anchor at all on rsid (e.g. the reference gamete itself, which has zero
+// liftover points by construction -- it never appears as an assembly/csid).
+int64_t rb3_lift_nearest_ref(const rb3_lift_ridx_t *ridx, int32_t gamete, int64_t rsid, int64_t rpos);
+
+// Inverse projection, reference -> assembly: project reference position (rsid,rpos)
+// into founder `gamete`'s assembly using that founder's liftover anchors on rsid,
+// with exactly the algorithm of rb3_lift_project (the local bracket when
+// rb3_lift_set_local is on, then the +-win median/MAD fit) but with the reference as
+// the key axis. Returns 1 and sets *out_csid (assembly SEQUENCE index, as in
+// rb3_lift_t), *out_cpos (forward strand), *out_sign (+1 same orientation, -1
+// inverted) and *out_method (1 local bracket, 2 local one-sided, 3 wide median);
+// returns 0 when there is no confident collinear projection. out_sign/out_method
+// may be NULL. anchor_k = the k of `ropebwt3 lift -k` that built the map (it is not
+// stored in the .lift file): on a slope -1 locus the result is shifted by k-1 so
+// that base r maps to its own homologous base (points pair k-mer leftmost bases).
+// Unlike the forward projector, the local bracket picks the better-fitting slope
+// rather than +1 first, since here the orientation decides the output strand.
+int rb3_lift_project_inv(const rb3_lift_ridx_t *ridx, void *km, int32_t gamete, int64_t rsid, int64_t rpos,
+						 int64_t win, int64_t max_mad, int32_t min_support, int32_t anchor_k,
+						 int64_t *out_csid, int64_t *out_cpos, int *out_sign, int *out_method);
+
+// Ternary read-sharing state for one (founder, row): match (1) if the founder is in
+// the row's matched-founder set, independent of distance; otherwise diverged (0) if
+// dist is within thresh bp of an anchor, deletion (-1) if dist exceeds thresh or the
+// founder has no anchor at all (dist < 0) on this reference sequence. A small, pure
+// function so it can be unit-tested on its own, independent of the liftover index.
+int8_t rb3_lift_ternary_state(int in_gameteset, int64_t dist, int64_t thresh);
+
 int main_lift(int argc, char *argv[]);
+
+extern __thread int rb3_lift_last_path;
 
 #endif
