@@ -37,6 +37,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <math.h>
 #include "rb3priv.h"
 #include "io.h"
@@ -46,6 +47,7 @@
 #include <pthread.h>
 
 static FILE *qc_chain_fp = 0; // --chains output (NULL = off)
+static FILE *qc_var_fp = 0;   // --variants output (NULL = off)
 static pthread_mutex_t qc_chain_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *qc_cls_name[] = { "syn", "syn_inv", "other_chr", "scaffold" };
 
@@ -53,6 +55,322 @@ static const char *qc_cls_name[] = { "syn", "syn_inv", "other_chr", "scaffold" }
 #define QC_SYN_INV 1
 #define QC_OTHER   2
 #define QC_SCAF    3
+
+/* ---- base-level comparison between chained anchors (asmqc-fa) -----------
+ *
+ * For two consecutive anchors of a syntenic chain, the reference segment R and the
+ * assembly segment A between them (A reverse-complemented on an inverted chain) are
+ * compared base by base:
+ *   - equal length and <= QA_GAPLESS_MM mismatches: gapless, mismatches = SNPs;
+ *   - otherwise, if the banded matrix is small enough: affine-gap global alignment
+ *     (band = |len difference| + QA_W), accepted at >= QA_MIN_ID identity over aligned
+ *     columns plus gap bases; mismatches = SNPs, gap runs = insertion / deletion events;
+ *   - otherwise (or when rejected at the top level): unique QA_SK-mers shared by R and A,
+ *     longest collinear chain of them, recursion into the sub-gaps;
+ *   - whatever cannot be aligned is a replacement, counted like AnchorWave does: the
+ *     reference bp as one deletion and the assembly bp as one insertion.
+ * Anchor k-mers themselves are exact matches and count as aligned bp.
+ */
+#define QA_MATCH 2
+#define QA_MIS   4
+#define QA_GO    4
+#define QA_GE    2
+#define QA_W     32
+#define QA_W2    256    // retry band for alignments rejected at QA_W
+#define QA_BIG_INDEL 50 // gap runs this long are real indels and do not count against identity
+#define QA_MAX_CELLS 20000000LL
+#define QA_MAX_LEN   200000
+#define QA_MIN_ID    0.70
+#define QA_GAPLESS_MM 0.03
+#define QA_SK    17
+#define QA_NEG   (-1000000000)
+#define QA_HIST  4096   // exact indel-size bins 1..QA_HIST-1, last bin = larger
+
+typedef struct qa_var_s { int64_t pos, rlen, alen; uint8_t r, a, type; } qa_var_t;
+
+typedef struct {
+	uint8_t *tb; int64_t m_tb;
+	int32_t *h0, *h1, *f0, *f1; int32_t m_w;
+	uint8_t *rc; int64_t m_rc;
+	int32_t *ev; int64_t n_ev, m_ev;        // pending events of one DP: >0 insertion, <0 deletion
+	uint64_t *ka, *kb; int64_t m_ka, m_kb;  // seeding scratch
+	int dump;                               // --variants: collect SNP / replacement records
+	struct qa_var_s *v, *pv;                // committed / pending (one DP)
+	int64_t n_v, m_v, n_pv, m_pv;
+} qa_buf_t;
+#define QA_VSNP 0
+#define QA_VREP 1
+
+static inline void qa_var_push(qa_var_t **v, int64_t *n, int64_t *m, int64_t pos, int64_t rlen, int64_t alen, uint8_t r, uint8_t a, uint8_t type)
+{
+	if (*n == *m) *m = *m? *m * 2 : 1024, *v = (qa_var_t*)realloc(*v, *m * sizeof(qa_var_t));
+	(*v)[*n].pos = pos, (*v)[*n].rlen = rlen, (*v)[*n].alen = alen, (*v)[*n].r = r, (*v)[*n].a = a, (*v)[*n].type = type;
+	++*n;
+}
+
+typedef struct {
+	int64_t aln, snp, ins_n, ins_bp, ins_max, del_n, del_bp, del_max, rep_n;
+	int64_t *hist;                          // [2*QA_HIST]: insertion sizes, then deletion sizes
+} qa_stat_t;
+
+static void qa_buf_free(qa_buf_t *b)
+{
+	free(b->tb); free(b->h0); free(b->h1); free(b->f0); free(b->f1); free(b->rc); free(b->ev); free(b->ka); free(b->kb); free(b->v); free(b->pv);
+	memset(b, 0, sizeof(*b));
+}
+
+static inline void qa_event(qa_stat_t *st, int64_t len, int is_del)
+{
+	int64_t bin = len < QA_HIST? len : QA_HIST - 1;
+	if (len <= 0) return;
+	if (st->hist == 0) st->hist = (int64_t*)calloc(2 * QA_HIST, sizeof(int64_t));
+	st->hist[is_del * QA_HIST + bin]++;
+	if (is_del) { st->del_n++, st->del_bp += len; if (len > st->del_max) st->del_max = len; }
+	else { st->ins_n++, st->ins_bp += len; if (len > st->ins_max) st->ins_max = len; }
+}
+
+static void qa_replace(qa_stat_t *st, int64_t lr, int64_t la, qa_buf_t *b, int64_t r0)
+{
+	if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0, lr, la, 0, 0, QA_VREP);
+	if (lr > 0) qa_event(st, lr, 1);
+	if (la > 0) qa_event(st, la, 0);
+	if (lr > 0 && la > 0) st->rep_n++;
+}
+
+static inline void qa_push_ev(qa_buf_t *b, int32_t v)
+{
+	if (b->n_ev == b->m_ev) b->m_ev = b->m_ev? b->m_ev * 2 : 256, b->ev = (int32_t*)realloc(b->ev, b->m_ev * sizeof(int32_t));
+	b->ev[b->n_ev++] = v;
+}
+
+static inline int qa_acgt(uint8_t c) { return c >= 1 && c <= 4; }
+
+/* Banded affine-gap global alignment of R[0,lr) vs A[0,la). Returns 1 and adds to st when the
+ * alignment is accepted, 0 when rejected (low identity), -1 when the matrix is too large. */
+static int qa_dp(const uint8_t *R, int32_t lr, const uint8_t *A, int32_t la, qa_buf_t *b, qa_stat_t *st, int64_t r0, int32_t bw)
+{
+	int32_t dlo = (la < lr? la - lr : 0) - bw, dhi = (la > lr? la - lr : 0) + bw, W = dhi - dlo + 1, i, x, j;
+	int64_t cells = (int64_t)(lr + 1) * W, aln = 0, mm = 0, k;
+	int32_t *Hp, *Hc, *Fp, *Fc, *t;
+	int state = 0, run = 0;
+	if (lr > QA_MAX_LEN || la > QA_MAX_LEN || cells > QA_MAX_CELLS) return -1;
+	if (cells > b->m_tb) b->m_tb = cells, b->tb = (uint8_t*)realloc(b->tb, cells);
+	if (W + 2 > b->m_w) {
+		b->m_w = W + 2;
+		b->h0 = (int32_t*)realloc(b->h0, b->m_w * 4), b->h1 = (int32_t*)realloc(b->h1, b->m_w * 4);
+		b->f0 = (int32_t*)realloc(b->f0, b->m_w * 4), b->f1 = (int32_t*)realloc(b->f1, b->m_w * 4);
+	}
+	Hp = b->h0, Hc = b->h1, Fp = b->f0, Fc = b->f1;
+	for (x = 0; x < W; ++x) { // row 0: H[0][j] reached by an insertion run from (0,0)
+		j = dlo + x;
+		Fp[x] = QA_NEG;
+		if (j < 0 || j > la) { Hp[x] = QA_NEG, b->tb[x] = 0; continue; }
+		Hp[x] = j == 0? 0 : -(QA_GO + QA_GE * j);
+		b->tb[x] = j == 0? 0 : (1 | (j > 1? 4 : 0));
+	}
+	for (i = 1; i <= lr; ++i) {
+		int32_t e = QA_NEG;
+		uint8_t *tbr = b->tb + (int64_t)i * W;
+		for (x = 0; x < W; ++x) {
+			int32_t fo, fe, f, eo, ee, dg, h, src;
+			uint8_t tv = 0;
+			j = i + dlo + x;
+			if (j < 0 || j > la) { Hc[x] = Fc[x] = QA_NEG, e = QA_NEG, tbr[x] = 0; continue; }
+			fo = x + 1 < W && Hp[x + 1] > QA_NEG? Hp[x + 1] - QA_GO - QA_GE : QA_NEG;
+			fe = x + 1 < W && Fp[x + 1] > QA_NEG? Fp[x + 1] - QA_GE : QA_NEG;
+			f = fo >= fe? fo : fe;
+			if (fe > fo) tv |= 8;
+			eo = x > 0 && Hc[x - 1] > QA_NEG? Hc[x - 1] - QA_GO - QA_GE : QA_NEG;
+			ee = x > 0 && e > QA_NEG? e - QA_GE : QA_NEG;
+			e = eo >= ee? eo : ee;
+			if (ee > eo) tv |= 4;
+			dg = j > 0 && Hp[x] > QA_NEG? Hp[x] + (R[i - 1] == A[j - 1] && qa_acgt(R[i - 1])? QA_MATCH : -QA_MIS) : QA_NEG;
+			h = dg, src = 0;
+			if (e > h) h = e, src = 1;
+			if (f > h) h = f, src = 2;
+			Hc[x] = h, Fc[x] = f, tbr[x] = tv | src;
+		}
+		t = Hp, Hp = Hc, Hc = t;
+		t = Fp, Fp = Fc, Fc = t;
+	}
+	// traceback from (lr, la)
+	b->n_ev = 0, b->n_pv = 0;
+	i = lr, j = la;
+	while (i > 0 || j > 0) {
+		uint8_t tv;
+		if (i == 0 || j == 0) { // matrix edge: flush the open run, the rest is one insertion or deletion
+			if (run) qa_push_ev(b, state == 1? run : -run), run = 0;
+			if (j > 0) qa_push_ev(b, j);
+			if (i > 0) qa_push_ev(b, -i);
+			break;
+		}
+		tv = b->tb[(int64_t)i * W + (j - i - dlo)];
+		if (state == 0) {
+			int src = tv & 3;
+			if (src == 0) {
+				++aln;
+				if (R[i - 1] != A[j - 1] && qa_acgt(R[i - 1]) && qa_acgt(A[j - 1])) {
+					++mm;
+					if (b->dump) qa_var_push(&b->pv, &b->n_pv, &b->m_pv, r0 + i - 1, 1, 1, R[i - 1], A[j - 1], QA_VSNP);
+				}
+				--i, --j;
+			} else state = src;
+		} else if (state == 1) { // insertion: consumes A
+			++run, --j;
+			if (!(tv & 4)) qa_push_ev(b, run), run = 0, state = 0;
+		} else { // deletion: consumes R
+			++run, --i;
+			if (!(tv & 8)) qa_push_ev(b, -run), run = 0, state = 0;
+		}
+	}
+	{ // identity over aligned columns AND short-gap bases, so gappy alignments of unrelated sequence are
+	  // rejected while a long real indel (TE insertion) inside an otherwise good alignment is kept
+		int64_t gap_bp = 0;
+		for (k = 0; k < b->n_ev; ++k) {
+			int64_t g = b->ev[k] > 0? b->ev[k] : -b->ev[k];
+			if (g < QA_BIG_INDEL) gap_bp += g;
+		}
+		if (lr > 50 || la > 50) // tiny segments (between seeds) keep their best alignment as is
+			if (aln == 0 || (double)(aln - mm) < QA_MIN_ID * (aln + gap_bp)) return 0;
+	}
+	st->aln += aln, st->snp += mm;
+	for (k = 0; k < b->n_pv; ++k) qa_var_push(&b->v, &b->n_v, &b->m_v, b->pv[k].pos, 1, 1, b->pv[k].r, b->pv[k].a, QA_VSNP);
+	for (k = 0; k < b->n_ev; ++k)
+		if (b->ev[k] > 0) qa_event(st, b->ev[k], 0);
+		else qa_event(st, -b->ev[k], 1);
+	return 1;
+}
+
+static int qa_cmp_u64(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+	return x < y? -1 : x > y? 1 : 0;
+}
+
+// k-mers occurring exactly once in s[0,l): packed (code << 30 | pos), sorted by code; returns count
+static int64_t qa_uniq_kmers(const uint8_t *s, int64_t l, uint64_t **buf, int64_t *m)
+{
+	int64_t i, n = 0, w = 0, len = 0;
+	uint64_t code = 0, mask = (1ULL << (2 * QA_SK)) - 1;
+	if (l < QA_SK) return 0;
+	if (l > *m) *m = l, *buf = (uint64_t*)realloc(*buf, l * sizeof(uint64_t));
+	for (i = 0; i < l; ++i) {
+		if (!qa_acgt(s[i])) { len = 0, code = 0; continue; }
+		code = (code << 2 | (uint64_t)(s[i] - 1)) & mask;
+		if (++len >= QA_SK) (*buf)[n++] = code << 30 | (uint64_t)(i - QA_SK + 1);
+	}
+	qsort(*buf, n, sizeof(uint64_t), qa_cmp_u64);
+	for (i = 0; i < n; ) { // keep codes that occur once
+		int64_t j = i + 1;
+		while (j < n && (*buf)[j] >> 30 == (*buf)[i] >> 30) ++j;
+		if (j - i == 1) (*buf)[w++] = (*buf)[i];
+		i = j;
+	}
+	return w;
+}
+
+static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0);
+
+static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
+{
+	int64_t nr, na, i, j, ns = 0, *sr, *sa, *tail, *prev, nl = 0, *keep, nk, pr, pa, rb = r0;
+	nr = qa_uniq_kmers(R, lr, &b->ka, &b->m_ka);
+	na = qa_uniq_kmers(A, la, &b->kb, &b->m_kb);
+	sr = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
+	sa = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
+	for (i = j = 0; i < nr && j < na; ) { // shared unique k-mers
+		uint64_t ci = b->ka[i] >> 30, cj = b->kb[j] >> 30;
+		if (ci < cj) ++i;
+		else if (ci > cj) ++j;
+		else sr[ns] = (int64_t)(b->ka[i] & 0x3fffffff), sa[ns] = (int64_t)(b->kb[j] & 0x3fffffff), ++ns, ++i, ++j;
+	}
+	if (ns == 0) { free(sr); free(sa); qa_replace(st, lr, la, b, r0); return; }
+	{ // order by reference position, then longest increasing subsequence on assembly position
+		uint64_t *o = (uint64_t*)malloc(ns * sizeof(uint64_t));
+		int64_t *tr = (int64_t*)malloc(ns * sizeof(int64_t)), *ta = (int64_t*)malloc(ns * sizeof(int64_t));
+		for (i = 0; i < ns; ++i) o[i] = (uint64_t)sr[i] << 32 | (uint64_t)i;
+		qsort(o, ns, sizeof(uint64_t), qa_cmp_u64);
+		for (i = 0; i < ns; ++i) tr[i] = sr[o[i] & 0xffffffff], ta[i] = sa[o[i] & 0xffffffff];
+		memcpy(sr, tr, ns * sizeof(int64_t)), memcpy(sa, ta, ns * sizeof(int64_t));
+		free(o); free(tr); free(ta);
+	}
+	tail = (int64_t*)malloc(ns * sizeof(int64_t)), prev = (int64_t*)malloc(ns * sizeof(int64_t));
+	for (i = 0; i < ns; ++i) {
+		int64_t lo = 0, hi = nl;
+		while (lo < hi) { int64_t mid = (lo + hi) >> 1; if (sa[tail[mid]] < sa[i]) lo = mid + 1; else hi = mid; }
+		prev[i] = lo > 0? tail[lo - 1] : -1;
+		tail[lo] = i;
+		if (lo == nl) ++nl;
+	}
+	keep = (int64_t*)malloc(nl * sizeof(int64_t));
+	for (nk = nl, i = nl > 0? tail[nl - 1] : -1; i >= 0; i = prev[i]) keep[--nk] = i;
+	// walk the seeds; merge overlapping seeds on one diagonal, drop other overlaps, recurse into gaps
+	pr = 0, pa = 0;
+	for (i = 0; i < nl; ++i) {
+		int64_t r0 = sr[keep[i]], a0 = sa[keep[i]], r1 = r0 + QA_SK, a1 = a0 + QA_SK;
+		if (r0 < pr || a0 < pa) {
+			if (r0 - a0 == pr - pa && r1 > pr) { st->aln += r1 - pr; pr = r1, pa = a1; } // same diagonal: extend
+			continue;
+		}
+		qa_align(R + pr, r0 - pr, A + pa, a0 - pa, depth + 1, b, st, rb + pr);
+		st->aln += QA_SK;
+		pr = r1, pa = a1;
+	}
+	qa_align(R + pr, lr - pr, A + pa, la - pa, depth + 1, b, st, rb + pr);
+	free(sr); free(sa); free(tail); free(prev); free(keep);
+}
+
+static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
+{
+	int r;
+	if (lr <= 0 && la <= 0) return;
+	if (lr <= 0) { qa_event(st, la, 0); return; }
+	if (la <= 0) { qa_event(st, lr, 1); return; }
+	if (lr == la) { // gapless fast path
+		int64_t i, mm = 0, lim = (int64_t)(QA_GAPLESS_MM * lr);
+		for (i = 0; i < lr && mm <= lim; ++i)
+			if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) ++mm;
+		if (mm <= lim) {
+			st->aln += lr, st->snp += mm;
+			if (b->dump && mm)
+				for (i = 0; i < lr; ++i)
+					if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) qa_var_push(&b->v, &b->n_v, &b->m_v, r0 + i, 1, 1, R[i], A[i], QA_VSNP);
+			return;
+		}
+	}
+	r = qa_dp(R, (int32_t)lr, A, (int32_t)la, b, st, r0, QA_W);
+	if (r == 0) { // rejected: retry once with a wide band (compensating indels further apart than QA_W)
+		int r2 = qa_dp(R, (int32_t)lr, A, (int32_t)la, b, st, r0, QA_W2);
+		if (r2 == 1) return;
+	}
+	if (r == 1) return;
+	if (depth >= 3 || (r == 0 && (lr < 1000 || la < 1000))) { qa_replace(st, lr, la, b, r0); return; }
+	qa_seeded(R, lr, A, la, depth, b, st, r0);
+}
+
+/* Compare the gap between consecutive chain anchors u -> v (reference ascending). */
+static void qa_gap(const uint8_t *rs, const uint8_t *cs, int64_t ur, int64_t uc, int64_t vr, int64_t vc, int strand, int32_t k,
+				   qa_buf_t *b, qa_stat_t *st)
+{
+	int64_t lr = vr - (ur + k), la, i;
+	const uint8_t *R = rs + ur + k, *A;
+	if (strand == 0) la = vc - (uc + k), A = cs + uc + k;
+	else { // reference ascending = assembly descending: assembly segment [vc + k, uc), reverse-complemented
+		la = uc - (vc + k);
+		if (la > b->m_rc) b->m_rc = la, b->rc = (uint8_t*)realloc(b->rc, la);
+		for (i = 0; i < la; ++i) {
+			uint8_t c = cs[uc - 1 - i];
+			b->rc[i] = qa_acgt(c)? 5 - c : c;
+		}
+		A = b->rc;
+	}
+	if (lr < 0 || la < 0) { // anchors overlap on one side: net indel only
+		int64_t d = la - lr; // = delta_asm - delta_ref
+		if (d > 0) qa_event(st, d, 0); else if (d < 0) qa_event(st, -d, 1);
+		return;
+	}
+	qa_align(R, lr, A, la, 0, b, st, ur + k);
+}
 
 typedef struct {
 	int64_t st, en;  // reference [st,en)
@@ -65,6 +383,7 @@ typedef struct {
 	int64_t tight_bp, tight_present, tight_missing;
 	int64_t n_ivl, m_ivl;
 	qc_ivl_t *ivl;
+	qa_stat_t b;            // base-level comparison (asmqc-fa only)
 } qc_acc_t;
 
 typedef struct {
@@ -84,7 +403,10 @@ typedef struct {
 	int32_t **ref_cum;      // [r] prefix count of panel-anchorable stride positions
 	int64_t *ref_nb;        // [r] number of stride bins
 	qc_acc_t *acc;          // [t * n_ref + r]
+	const uint8_t **seq;    // [sid] nt6 sequences; NULL = anchors only (lift mode)
 } qc_ctx_t;
+
+static pthread_mutex_t qc_acc_lock = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct { int64_t r, c; } qc_pt_t;
 typedef struct { double f; int32_t i, s; } qc_cand_t;
@@ -119,6 +441,18 @@ static const char *qc_suffix(const char *name) // part after the first '_' (the 
 	return p? p + 1 : name;
 }
 
+static int qc_is_chr(const char *lab) { return strncasecmp(lab, "chr", 3) == 0; }
+
+// same chromosome label, ignoring a case-insensitive "chr" prefix and leading zeros ("chr01" == "chr1" == "Chr1")
+static int qc_same_chrom(const char *a, const char *b)
+{
+	if (qc_is_chr(a)) a += 3;
+	if (qc_is_chr(b)) b += 3;
+	while (*a == '0' && a[1] != 0) ++a;
+	while (*b == '0' && b[1] != 0) ++b;
+	return strcasecmp(a, b) == 0;
+}
+
 static inline double qc_gap_pen(int64_t d)
 {
 	return d == 0? 0.0 : 2.0 + 4.0 * log2(1.0 + (double)d);
@@ -149,11 +483,10 @@ static int qc_cmp_blk(const void *a, const void *b)
 }
 
 /* Chain one (assembly sequence, reference sequence) group; pts sorted by r then c. */
-static void qc_chain_group(const qc_ctx_t *q, int32_t taxon, int32_t csid, int32_t rsid, int64_t n, const qc_pt_t *pts)
+static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t rsid, int64_t n, const qc_pt_t *pts, qa_buf_t *qb)
 {
 	const qc_opt_t *o = q->opt;
 	int32_t r = q->seq_ref[rsid], s, i, j, k = o->k, n_ch = 0, m_ch = 0;
-	qc_acc_t *a = &q->acc[(int64_t)taxon * q->n_ref + r];
 	double *f[2];
 	int32_t *p[2];
 	uint8_t *used;
@@ -161,8 +494,8 @@ static void qc_chain_group(const qc_ctx_t *q, int32_t taxon, int32_t csid, int32
 	qc_chain_t *ch = 0, *blk = 0;
 	int32_t n_blk = 0, m_blk = 0;
 	int64_t bp_strand[2] = {0, 0}, nc = 0;
-	int is_syn = (strcmp(qc_suffix(q->sid->name[csid]), qc_suffix(q->sid->name[rsid])) == 0);
-	int is_scaf = (strncmp(qc_suffix(q->sid->name[csid]), "chr", 3) != 0);
+	int is_syn = qc_same_chrom(qc_suffix(q->sid->name[csid]), qc_suffix(q->sid->name[rsid]));
+	int is_scaf = !qc_is_chr(qc_suffix(q->sid->name[csid]));
 	// syntenic chains may bridge AnchorWave-scale deletions; chains to other chromosomes and
 	// scaffolds use a stricter cap so sparse stray anchors are not bridged into long false spans
 	int64_t max_gap = is_syn? o->max_gap : o->max_gap_off;
@@ -305,41 +638,126 @@ static void qc_chain_group(const qc_ctx_t *q, int32_t taxon, int32_t csid, int32
 				}
 			}
 		}
-		free(c->idx);
 	}
+	// base level (asmqc-fa): like AnchorWave, every reference base gets at most one alignment.
+	// Inverted syntenic chains claim their gaps first (AnchorWave aligns inversions), then forward
+	// chains by anchor count; an anchor or gap already >= half claimed (per base) is skipped.
+	if (q->seq && is_syn && n_ch > 0) {
+		int64_t nb = q->sid->len[rsid] + 2, z;
+		uint64_t *cl = (uint64_t*)calloc(nb / 64 + 1, 8);
+		int32_t *ord = (int32_t*)malloc(n_ch * sizeof(int32_t)), no = 0, dom = bp_strand[1] > bp_strand[0]? 1 : 0, pass;
+		for (pass = 0; pass < 2; ++pass)
+			for (i = 0; i < n_ch; ++i)
+				if ((pass == 0) == (ch[i].s != dom)) ord[no++] = i;
+		for (z = 1; z < no; ++z) { // stable by anchor count, descending, within each pass
+			int32_t x = ord[z], y = (int32_t)z;
+			while (y > 0 && (ch[ord[y-1]].s != dom) == (ch[x].s != dom) && ch[ord[y-1]].n < ch[x].n) ord[y] = ord[y-1], --y;
+			ord[y] = x;
+		}
+#define QC_CLAIMED(x) (cl[(x) >> 6] >> ((x) & 63) & 1)
+#define QC_CLAIM(x)   (cl[(x) >> 6] |= 1ULL << ((x) & 63))
+		for (z = 0; z < no; ++z) {
+			qc_chain_t *c = &ch[ord[z]];
+			for (j = 0; j < c->n_idx; ++j) {
+				const qc_pt_t *v = &pts[c->idx[j]];
+				int64_t b0, b1, x, tot, got;
+				if (j > 0) { // the gap before this anchor
+					const qc_pt_t *u = &pts[c->idx[j-1]];
+					int64_t g0 = u->r + k, g1 = v->r, skip = 0;
+					if (g1 > g0) {
+						tot = g1 - g0;
+						for (x = g0, got = 0; x < g1; ++x) got += QC_CLAIMED(x);
+						if (got * 2 >= tot) skip = 1;
+						else for (x = g0; x < g1; ++x) QC_CLAIM(x);
+					}
+					if (!skip) qa_gap(q->seq[rsid], q->seq[csid], u->r, u->c, v->r, v->c, c->s, k, qb, &a->b);
+				}
+				// the anchor itself (exact match)
+				b0 = v->r, b1 = v->r + k;
+				for (x = b0, got = 0; x < b1; ++x) got += QC_CLAIMED(x);
+				if (got * 2 < k) {
+					a->b.aln += k;
+					for (x = b0; x < b1; ++x) QC_CLAIM(x);
+				}
+			}
+		}
+#undef QC_CLAIMED
+#undef QC_CLAIM
+		free(cl); free(ord);
+		if (qb->dump && qb->n_v > 0) {
+			int64_t z2;
+			static const char nt[] = "NACGTN";
+			pthread_mutex_lock(&qc_chain_lock);
+			for (z2 = 0; z2 < qb->n_v; ++z2) {
+				const qa_var_t *w = &qb->v[z2];
+				if (w->type == QA_VSNP)
+					fprintf(qc_var_fp, "%s\t%s\t%ld\tSNP\t%c\t%c\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, nt[w->r < 6? w->r : 5], nt[w->a < 6? w->a : 5]);
+				else
+					fprintf(qc_var_fp, "%s\t%s\t%ld\tREP\t%ld\t%ld\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, (long)w->rlen, (long)w->alen);
+			}
+			pthread_mutex_unlock(&qc_chain_lock);
+			qb->n_v = 0;
+		}
+	}
+	for (i = 0; i < n_ch; ++i) free(ch[i].idx);
 	free(ch); free(used); free(cand);
 	for (s = 0; s < 2; ++s) free(f[s]), free(p[s]);
 }
 
-static void qc_worker(void *data, long t, int tid) // one taxon per job
+static void qc_acc_merge(qc_acc_t *d, const qc_acc_t *x)
+{
+	int64_t i;
+	d->n_pts += x->n_pts, d->n_chain += x->n_chain, d->n_chain_inv += x->n_chain_inv, d->n_chained_anchor += x->n_chained_anchor;
+	d->ins_n += x->ins_n, d->ins_bp += x->ins_bp, d->del_n += x->del_n, d->del_bp += x->del_bp;
+	if (x->ins_max > d->ins_max) d->ins_max = x->ins_max;
+	if (x->del_max > d->del_max) d->del_max = x->del_max;
+	d->tight_bp += x->tight_bp, d->tight_present += x->tight_present, d->tight_missing += x->tight_missing;
+	for (i = 0; i < x->n_ivl; ++i) qc_add_ivl(d, x->ivl[i].st, x->ivl[i].en, x->ivl[i].cls);
+	d->b.aln += x->b.aln, d->b.snp += x->b.snp, d->b.rep_n += x->b.rep_n;
+	d->b.ins_n += x->b.ins_n, d->b.ins_bp += x->b.ins_bp, d->b.del_n += x->b.del_n, d->b.del_bp += x->b.del_bp;
+	if (x->b.ins_max > d->b.ins_max) d->b.ins_max = x->b.ins_max;
+	if (x->b.del_max > d->b.del_max) d->b.del_max = x->b.del_max;
+	if (x->b.hist) {
+		if (d->b.hist == 0) d->b.hist = (int64_t*)calloc(2 * QA_HIST, sizeof(int64_t));
+		for (i = 0; i < 2 * QA_HIST; ++i) d->b.hist[i] += x->b.hist[i];
+	}
+}
+
+static void qc_worker(void *data, long sx, int tid) // one assembly sequence per job
 {
 	qc_ctx_t *q = (qc_ctx_t*)data;
-	int64_t sx, m_tmp = 0, m_pts = 0;
-	rb3_liftpt_t *tmp = 0;
-	qc_pt_t *pts = 0;
+	int64_t n = q->sn[sx], i, i0;
+	int32_t t = q->seq_taxon[sx];
+	rb3_liftpt_t *tmp;
+	qc_pt_t *pts;
+	qa_buf_t qb;
 	(void)tid;
-	for (sx = 0; sx < q->sid->n_seq; ++sx) {
-		int64_t n, i, i0;
-		const rb3_liftpt_t *lp;
-		if (q->seq_taxon[sx] != t) continue;
-		lp = q->sp[sx], n = q->sn[sx];
-		if (n == 0) continue;
-		if (n > m_tmp) m_tmp = n, tmp = (rb3_liftpt_t*)realloc(tmp, n * sizeof(rb3_liftpt_t));
-		if (n > m_pts) m_pts = n, pts = (qc_pt_t*)realloc(pts, n * sizeof(qc_pt_t));
-		memcpy(tmp, lp, n * sizeof(rb3_liftpt_t));
-		qsort(tmp, n, sizeof(rb3_liftpt_t), qc_cmp_lpt);
-		for (i0 = 0, i = 1; i <= n; ++i) {
-			if (i == n || tmp[i].rsid != tmp[i0].rsid) {
-				int64_t j;
-				if (q->seq_ref[tmp[i0].rsid] >= 0) {
-					for (j = i0; j < i; ++j) pts[j - i0].r = tmp[j].rpos, pts[j - i0].c = tmp[j].cpos;
-					qc_chain_group(q, (int32_t)t, (int32_t)sx, tmp[i0].rsid, i - i0, pts);
-				}
-				i0 = i;
+	if (t < 0 || n == 0) return;
+	memset(&qb, 0, sizeof(qb));
+	qb.dump = (qc_var_fp != 0 && q->seq != 0);
+	tmp = (rb3_liftpt_t*)malloc(n * sizeof(rb3_liftpt_t));
+	pts = (qc_pt_t*)malloc(n * sizeof(qc_pt_t));
+	memcpy(tmp, q->sp[sx], n * sizeof(rb3_liftpt_t));
+	qsort(tmp, n, sizeof(rb3_liftpt_t), qc_cmp_lpt);
+	for (i0 = 0, i = 1; i <= n; ++i) {
+		if (i == n || tmp[i].rsid != tmp[i0].rsid) {
+			int64_t j;
+			int32_t r = q->seq_ref[tmp[i0].rsid];
+			if (r >= 0) {
+				qc_acc_t loc;
+				memset(&loc, 0, sizeof(loc));
+				for (j = i0; j < i; ++j) pts[j - i0].r = tmp[j].rpos, pts[j - i0].c = tmp[j].cpos;
+				qc_chain_group(q, &loc, (int32_t)sx, tmp[i0].rsid, i - i0, pts, &qb);
+				pthread_mutex_lock(&qc_acc_lock);
+				qc_acc_merge(&q->acc[(int64_t)t * q->n_ref + r], &loc);
+				pthread_mutex_unlock(&qc_acc_lock);
+				free(loc.ivl); free(loc.b.hist);
 			}
+			i0 = i;
 		}
 	}
 	free(tmp); free(pts);
+	qa_buf_free(&qb);
 }
 
 static int64_t qc_union(const qc_acc_t *a, uint32_t cls_mask, qc_ivl_t *buf)
@@ -363,11 +781,28 @@ static void qc_print_row(FILE *fp, const char *taxon, const char *chrom, int64_t
 {
 	double fi = a->tight_present + a->tight_missing > 0? (double)a->tight_present / (a->tight_present + a->tight_missing) : 0.0;
 	double div = fi > 0.0? 1.0 - pow(fi, 1.0 / k) : 1.0;
-	fprintf(fp, "%s\t%s\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%.6f\t%.6f\n",
+	const qa_stat_t *bs = &a->b;
+	int64_t q1 = 0, q2 = 0, q3 = 0, ni = bs->ins_n + bs->del_n, cum = 0, z;
+	if (bs->hist && ni > 0) { // indel-size quartiles over insertions and deletions together
+		for (z = 1; z < QA_HIST; ++z) {
+			int64_t c0 = cum;
+			cum += bs->hist[z] + bs->hist[QA_HIST + z];
+			if (!q1 && cum * 4 >= ni) q1 = z;
+			if (!q2 && cum * 2 >= ni) q2 = z;
+			if (!q3 && cum * 4 >= 3 * ni) q3 = z;
+			(void)c0;
+		}
+	}
+	fprintf(fp, "%s\t%s\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%.6f\t%.6f"
+			"\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%.6f\t%.6f\t%.3f\t%ld\t%ld\t%ld\t%ld\t%ld\n",
 			taxon, chrom, (long)len, (long)n_anch, (long)a->n_pts, (long)mapped, len? (double)mapped / len : 0.0,
 			(long)inv, (long)other, (long)scaf, (long)(len - mapped), (long)a->n_chain, (long)a->n_chain_inv,
 			(long)a->ins_n, (long)a->ins_bp, (long)a->ins_max, (long)a->del_n, (long)a->del_bp, (long)a->del_max,
-			(long)a->tight_bp, len? (double)a->tight_bp / len : 0.0, (long)a->tight_present, (long)a->tight_missing, fi, div);
+			(long)a->tight_bp, len? (double)a->tight_bp / len : 0.0, (long)a->tight_present, (long)a->tight_missing, fi, div,
+			(long)bs->snp, (long)ni, (long)bs->ins_n, (long)bs->del_n, (long)bs->ins_bp, (long)bs->del_bp,
+			len? (double)bs->aln / len : 0.0, len? (double)bs->del_bp / len : 0.0, len? (double)bs->ins_bp / len : 0.0,
+			ni? (double)(bs->ins_bp + bs->del_bp) / ni : 0.0, (long)q1, (long)q2, (long)q3,
+			(long)(bs->ins_max > bs->del_max? bs->ins_max : bs->del_max), (long)bs->rep_n);
 }
 
 
@@ -376,7 +811,7 @@ static void qc_print_row(FILE *fp, const char *taxon, const char *chrom, int64_t
  * marks the anchorable stride bins used as the divergence denominator; NULL derives it from
  * the points (panel mode: a bin is anchorable if any assembly carries its k-mer). */
 static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_prefix,
-				  const rb3_liftpt_t **sp, const int64_t *sn, uint8_t **any_in, int n_threads, FILE *fp, int print_header)
+				  const rb3_liftpt_t **sp, const int64_t *sn, uint8_t **any_in, const uint8_t **seqs, int n_threads, FILE *fp, int print_header)
 {
 	qc_ctx_t q;
 	char **taxa = 0;
@@ -386,7 +821,7 @@ static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_pre
 	uint8_t **any;
 
 	memset(&q, 0, sizeof(q));
-	q.opt = opt, q.sid = sid, q.sp = sp, q.sn = sn;
+	q.opt = opt, q.sid = sid, q.sp = sp, q.sn = sn, q.seq = seqs;
 	q.seq_taxon = (int32_t*)malloc(sid->n_seq * sizeof(int32_t));
 	q.seq_ref = (int32_t*)malloc(sid->n_seq * sizeof(int32_t));
 	plen = strlen(ref_prefix);
@@ -441,7 +876,7 @@ static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_pre
 	}
 
 	q.acc = (qc_acc_t*)calloc((int64_t)q.n_taxa * q.n_ref, sizeof(qc_acc_t));
-	kt_for(n_threads, qc_worker, &q, q.n_taxa);
+	kt_for(n_threads, qc_worker, &q, sid->n_seq);
 
 	// report
 	for (i = 0; i < (int64_t)q.n_taxa * q.n_ref; ++i)
@@ -449,7 +884,9 @@ static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_pre
 	buf = (qc_ivl_t*)malloc((max_ivl + 1) * sizeof(qc_ivl_t));
 	if (print_header) fprintf(fp, "taxon\tchrom\tref_len\tn_anchorable\tn_pts\tmapped_bp\tfrac_mapped\tinv_bp\tother_chr_bp\tscaf_bp\tgap_bp"
 		   "\tn_chain\tn_chain_inv\tins_n\tins_bp_lb\tins_max\tdel_n\tdel_bp_lb\tdel_max"
-		   "\ttight_bp\tfrac_tight\ttight_present\ttight_missing\tfrac_intact\tdiv_est\n");
+		   "\ttight_bp\tfrac_tight\ttight_present\ttight_missing\tfrac_intact\tdiv_est"
+		   "\tnumSNPs\tnumIndels\tnumIns\tnumDel\tnumBasesInserted\tnumBasesDeleted\tpercentRefAligned\tpercentRefDeleted"
+		   "\tpercentRefInserted\tmeanIndelSize\tlowerQuartileIndelSize\tmedianIndelSize\tupperQuartileIndelSize\tlargestIndel\tnumReplacements\n");
 	for (t = 0; t < q.n_taxa; ++t) {
 		qc_acc_t tot;
 		int64_t tl = 0, tanch = 0, tm = 0, tinv = 0, toth = 0, tsc = 0;
@@ -465,17 +902,14 @@ static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_pre
 			sc = qc_union(a, 1u<<QC_SCAF, buf);
 			qc_print_row(fp, taxa[t], sid->name[sx], sid->len[sx], q.ref_cum[r][q.ref_nb[r]], a, m, inv, oth, sc, opt->k);
 			tl += sid->len[sx], tanch += q.ref_cum[r][q.ref_nb[r]], tm += m, tinv += inv, toth += oth, tsc += sc;
-			tot.n_pts += a->n_pts, tot.n_chain += a->n_chain, tot.n_chain_inv += a->n_chain_inv;
-			tot.ins_n += a->ins_n, tot.ins_bp += a->ins_bp, tot.del_n += a->del_n, tot.del_bp += a->del_bp;
-			if (a->ins_max > tot.ins_max) tot.ins_max = a->ins_max;
-			if (a->del_max > tot.del_max) tot.del_max = a->del_max;
-			tot.tight_bp += a->tight_bp, tot.tight_present += a->tight_present, tot.tight_missing += a->tight_missing;
+			{ qc_acc_t tmp_a = *a; tmp_a.n_ivl = 0; qc_acc_merge(&tot, &tmp_a); } // intervals are not needed for ALL
 		}
 		qc_print_row(fp, taxa[t], "ALL", tl, tanch, &tot, tm, tinv, toth, tsc, opt->k);
+		free(tot.ivl); free(tot.b.hist);
 	}
 	free(buf);
 
-	for (i = 0; i < (int64_t)q.n_taxa * q.n_ref; ++i) free(q.acc[i].ivl);
+	for (i = 0; i < (int64_t)q.n_taxa * q.n_ref; ++i) free(q.acc[i].ivl), free(q.acc[i].b.hist);
 	for (r = 0; r < q.n_ref; ++r) free(q.ref_cum[r]);
 	for (t = 0; t < q.n_taxa; ++t) free(taxa[t]);
 	free(q.acc); free(q.ref_cum); free(q.ref_nb); free(taxa);
@@ -493,6 +927,7 @@ static ko_longopt_t qc_long_options[] = {
 	{ "ref-name",    ko_required_argument, 307 },
 	{ "chains",      ko_required_argument, 308 },
 	{ "block-diag",  ko_required_argument, 309 },
+	{ "variants",    ko_required_argument, 310 },
 	{ 0, 0, 0 }
 };
 
@@ -518,6 +953,11 @@ static int qc_opt_parse1(qc_opt_t *opt, int c, const char *arg, int *n_threads, 
 	else if (c == 305) opt->tight_diag = rb3_parse_num(arg);
 	else if (c == 306) opt->max_gap_off = rb3_parse_num(arg);
 	else if (c == 309) opt->block_diag = rb3_parse_num(arg);
+	else if (c == 310) {
+		qc_var_fp = fopen(arg, "w");
+		if (qc_var_fp == 0) { fprintf(stderr, "ERROR: cannot write '%s'\n", arg); exit(1); }
+		fprintf(qc_var_fp, "#asm_seq\tref_seq\tpos(1-based)\ttype\tref|ref_len\talt|asm_len\n");
+	}
 	else if (c == 308) {
 		qc_chain_fp = fopen(arg, "w");
 		if (qc_chain_fp == 0) { fprintf(stderr, "ERROR: cannot write '%s'\n", arg); exit(1); }
@@ -539,6 +979,7 @@ static void qc_opt_usage(const qc_opt_t *opt, int n_threads)
 	fprintf(stderr, "  --max-gap-off NUM  same, for chains to other chromosomes / scaffolds [%ld]\n", (long)opt->max_gap_off);
 	fprintf(stderr, "  --min-span NUM  min reference span of a kept chain [%ld]\n", (long)opt->min_span);
 	fprintf(stderr, "  --chains FILE   also write every kept chain (reference span, assembly span, strand, class)\n");
+	fprintf(stderr, "  --variants FILE (asmqc-fa) also write every SNP and replaced segment on the reference\n");
 	fprintf(stderr, "  --tight-gap NUM / --tight-diag NUM  collinear-interval limits for the divergence estimate [%ld/%ld]\n",
 			(long)opt->tight_gap, (long)opt->tight_diag);
 }
@@ -575,7 +1016,7 @@ int main_asmqc(int argc, char *argv[])
 	sp = (const rb3_liftpt_t**)malloc(sid->n_seq * sizeof(rb3_liftpt_t*));
 	sn = (int64_t*)malloc(sid->n_seq * sizeof(int64_t));
 	for (sx = 0; sx < sid->n_seq; ++sx) sp[sx] = rb3_lift_seq_points(lf, sx, &sn[sx]);
-	ret = qc_run(&opt, sid, ref_prefix, sp, sn, 0, n_threads, stdout, 1);
+	ret = qc_run(&opt, sid, ref_prefix, sp, sn, 0, 0, n_threads, stdout, 1);
 	if (qc_chain_fp) fclose(qc_chain_fp), qc_chain_fp = 0;
 	free(sp); free(sn);
 	rb3_sid_destroy(sid);
@@ -865,7 +1306,13 @@ int main_asmqc_fa(int argc, char *argv[])
 			free(fill);
 		}
 		fprintf(stderr, "[M::%s::%.1f] %s: %d sequences, %ld anchors unique in both\n", __func__, rb3_realtime() - t0, taxon, as.n, (long)np);
-		ret |= qc_run(&opt, &sid, ref_pfx, sp, sn, any, n_threads, stdout, !header_done);
+		{
+			const uint8_t **seqs = (const uint8_t**)malloc(n_all * sizeof(uint8_t*));
+			for (s = 0; s < ref.n; ++s) seqs[s] = ref.seq[s];
+			for (s = 0; s < as.n; ++s) seqs[ref.n + s] = as.seq[s];
+			ret |= qc_run(&opt, &sid, ref_pfx, sp, sn, any, seqs, n_threads, stdout, !header_done);
+			free((void*)seqs);
+		}
 		fflush(stdout);
 		header_done = 1;
 		free(pt); free(sp); free(sn); free(sid.name); free(sid.len);
@@ -874,6 +1321,7 @@ int main_asmqc_fa(int argc, char *argv[])
 	}
 	fprintf(stderr, "[M::%s::%.1f] done\n", __func__, rb3_realtime() - t0);
 	if (qc_chain_fp) fclose(qc_chain_fp), qc_chain_fp = 0;
+	if (qc_var_fp) fclose(qc_var_fp), qc_var_fp = 0;
 	for (r = 0; r < ref.n; ++r) free(any[r]);
 	free(any); free(T.a); free(T.slot); free(ref_taxon); free(ref_pfx);
 	qf_seqs_free(&ref);
