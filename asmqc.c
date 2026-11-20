@@ -11,7 +11,9 @@
  * Method (lift-only mode), for every assembly sequence x reference sequence pair:
  *  1. Sort that pair's liftover points by reference position and chain them in
  *     both orientations (minimap2-style DP with bounded look-back; a log-scaled
- *     penalty on |delta_asm - delta_ref| so multi-kb TE indels do not break a chain).
+ *     penalty on |delta_asm - delta_ref| so multi-kb TE indels do not break a chain;
+ *     syntenic chains bridge gaps up to --max-gap, 3 Mb by default, to match
+ *     AnchorWave's multi-Mb deletions; off-chromosome chains use --max-gap-off).
  *  2. Greedily extract chains (best score first, points used once). Chains to the
  *     assembly sequence with the same chromosome suffix as the reference sequence
  *     are syntenic; the orientation carrying more reference bp is "forward", the
@@ -59,7 +61,7 @@ typedef struct {
 
 typedef struct {
 	int32_t k, stride, h, min_anchor;
-	int64_t max_gap, min_span, tight_gap, tight_diag;
+	int64_t max_gap, max_gap_off, min_span, tight_gap, tight_diag;
 } qc_opt_t;
 
 typedef struct {
@@ -143,6 +145,9 @@ static void qc_chain_group(const qc_ctx_t *q, int32_t taxon, int32_t csid, int32
 	int64_t bp_strand[2] = {0, 0}, nc = 0;
 	int is_syn = (strcmp(qc_suffix(q->sid->name[csid]), qc_suffix(q->sid->name[rsid])) == 0);
 	int is_scaf = (strncmp(qc_suffix(q->sid->name[csid]), "chr", 3) != 0);
+	// syntenic chains may bridge AnchorWave-scale deletions; chains to other chromosomes and
+	// scaffolds use a stricter cap so sparse stray anchors are not bridged into long false spans
+	int64_t max_gap = is_syn? o->max_gap : o->max_gap_off;
 
 	a->n_pts += n;
 	if (n < 2) return;
@@ -156,8 +161,8 @@ static void qc_chain_group(const qc_ctx_t *q, int32_t taxon, int32_t csid, int32
 			for (j = i - 1; j >= 0 && i - j <= o->h; --j) {
 				int64_t dr = pts[i].r - pts[j].r, dc = ci - (s? -pts[j].c : pts[j].c), d;
 				double sc;
-				if (dr > o->max_gap) break;
-				if (dr <= 0 || dc <= 0 || dc > o->max_gap) continue;
+				if (dr > max_gap) break;
+				if (dr <= 0 || dc <= 0 || dc > max_gap) continue;
 				d = dc > dr? dc - dr : dr - dc;
 				sc = f[s][j] + (dr < k || dc < k? (dr < dc? dr : dc) : k) - qc_gap_pen(d);
 				if (sc > best) best = sc, bj = j;
@@ -290,6 +295,7 @@ int main_asmqc(int argc, char *argv[])
 		{ "min-span",   ko_required_argument, 303 },
 		{ "tight-gap",  ko_required_argument, 304 },
 		{ "tight-diag", ko_required_argument, 305 },
+		{ "max-gap-off", ko_required_argument, 306 },
 		{ 0, 0, 0 }
 	};
 	qc_opt_t opt;
@@ -304,7 +310,7 @@ int main_asmqc(int argc, char *argv[])
 
 	memset(&opt, 0, sizeof(opt));
 	opt.k = 100, opt.stride = 2000, opt.h = 50, opt.min_anchor = 3;
-	opt.max_gap = 1000000, opt.min_span = 1000, opt.tight_gap = 1000, opt.tight_diag = 20;
+	opt.max_gap = 3000000, opt.max_gap_off = 1000000, opt.min_span = 1000, opt.tight_gap = 1000, opt.tight_diag = 20;
 	while ((c = ketopt(&o, argc, argv, 1, "k:s:t:h:n:", long_options)) >= 0) {
 		if (c == 'k') opt.k = atoi(o.arg);
 		else if (c == 's') opt.stride = (int32_t)rb3_parse_num(o.arg);
@@ -316,6 +322,7 @@ int main_asmqc(int argc, char *argv[])
 		else if (c == 303) opt.min_span = rb3_parse_num(o.arg);
 		else if (c == 304) opt.tight_gap = rb3_parse_num(o.arg);
 		else if (c == 305) opt.tight_diag = rb3_parse_num(o.arg);
+		else if (c == 306) opt.max_gap_off = rb3_parse_num(o.arg);
 	}
 	if (argc - o.ind < 2 || ref_prefix == 0) {
 		fprintf(stderr, "Usage: ropebwt3 asmqc --ref-prefix=STR [options] <idx.lift> <idx.fmd.len.gz>\n");
@@ -325,7 +332,8 @@ int main_asmqc(int argc, char *argv[])
 		fprintf(stderr, "  -t INT          threads (one assembly per job) [%d]\n", n_threads);
 		fprintf(stderr, "  -h INT          chaining look-back in anchors [%d]\n", opt.h);
 		fprintf(stderr, "  -n INT          min anchors per chain [%d]\n", opt.min_anchor);
-		fprintf(stderr, "  --max-gap NUM   max reference/assembly gap inside a chain [%ld]\n", (long)opt.max_gap);
+		fprintf(stderr, "  --max-gap NUM   max reference/assembly gap inside a syntenic chain [%ld]\n", (long)opt.max_gap);
+		fprintf(stderr, "  --max-gap-off NUM  same, for chains to other chromosomes / scaffolds [%ld]\n", (long)opt.max_gap_off);
 		fprintf(stderr, "  --min-span NUM  min reference span of a kept chain [%ld]\n", (long)opt.min_span);
 		fprintf(stderr, "  --tight-gap NUM / --tight-diag NUM  collinear-interval limits for the divergence estimate [%ld/%ld]\n",
 				(long)opt.tight_gap, (long)opt.tight_diag);
