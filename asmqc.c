@@ -112,6 +112,7 @@ static inline void qa_var_push(qa_var_t **v, int64_t *n, int64_t *m, int64_t pos
 
 typedef struct {
 	int64_t aln, snp, ins_n, ins_bp, ins_max, del_n, del_bp, del_max, rep_n;
+	int64_t pen;                           // AnchorWave penalty of everything added (4/SNP, min(4+2l,80+l)/indel)
 	int64_t snp_d10, snp_d40;              // SNPs with >= 10 / >= 40 other SNPs within +-50 bp (local mismatch >= ~10% / ~40%)
 	int64_t *hist;                          // [2*QA_HIST]: insertion sizes, then deletion sizes
 } qa_stat_t;
@@ -127,6 +128,7 @@ static inline void qa_event(qa_stat_t *st, int64_t len, int is_del, qa_buf_t *b,
 	if (len > 0 && b && b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, pos, is_del? len : 0, is_del? 0 : len, 0, 0, is_del? QA_VDEL : QA_VINS);
 	int64_t bin = len < QA_HIST? len : QA_HIST - 1;
 	if (len <= 0) return;
+	st->pen += (4 + 2 * len < 80 + len)? 4 + 2 * len : 80 + len;
 	if (st->hist == 0) st->hist = (int64_t*)calloc(2 * QA_HIST, sizeof(int64_t));
 	st->hist[is_del * QA_HIST + bin]++;
 	if (is_del) { st->del_n++, st->del_bp += len; if (len > st->del_max) st->del_max = len; }
@@ -228,7 +230,7 @@ static int qa_ksw(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa
 		} else if (op == 1) { qa_event(st, len, 0, b, r0 + i); j += len; } // I: assembly has extra bases
 		else if (op == 2) { qa_event(st, len, 1, b, r0 + i); i += len; }   // D: reference bases missing
 	}
-	st->snp += n_snp;
+	st->snp += n_snp, st->pen += 4 * n_snp;
 	qa_snp_classes(sp, n_snp, st);
 	kfree(0, ez.cigar);
 	free(sp); free(t);
@@ -515,7 +517,7 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 		for (i = 0; i < lr && mm <= lim; ++i)
 			if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) ++mm;
 		if (mm <= lim) {
-			st->aln += lr, st->snp += mm;
+			st->aln += lr, st->snp += mm, st->pen += 4 * mm;
 			if (mm) {
 				int64_t *sp = (int64_t*)malloc(mm * sizeof(int64_t)), n = 0;
 				for (i = 0; i < lr; ++i)
@@ -699,6 +701,72 @@ static int qc_cmp_blk(const void *a, const void *b)
 	return x->rst < y->rst? -1 : x->rst > y->rst? 1 : 0;
 }
 
+/* ---- soft anchors (QA_SOFT=1) ---------------------------------------------
+ * Anchors are exact unique matches, but an alignment that crosses one can still score better under
+ * AnchorWave's model (e.g. pairing two TE copies across it). Walking a chain, when a gap next to anchor
+ * v is problematic (>= 1 kb deleted/inserted or a replacement), compare AnchorWave penalties:
+ * keep v: P(u,v) + P(v,w) (v itself is an exact match, penalty 0) vs drop v: P(u,w). Drop v when that
+ * is cheaper; the window keeps growing while dropping helps, up to QC_SOFT_MAX bp on either side. */
+#define QC_SOFT_MAX 60000
+static int64_t qc_soft_n[4]; // anchors seen, problem anchors, windows tried, anchors dropped (for QA_SOFT=2 stats)
+static int qc_soft_on(void)
+{
+	static int on = -1;
+	if (on < 0) { char *e = getenv("QA_SOFT"); on = e? atoi(e) : 0; }
+	return on;
+}
+
+static int64_t qc_gap_aw_pen(const qc_ctx_t *q, int32_t rsid, int32_t csid, const qc_pt_t *u, const qc_pt_t *v, int s, int32_t k, qa_buf_t *qb, int *problem)
+{
+	qa_stat_t t;
+	int dump = qb->dump;
+	memset(&t, 0, sizeof(t));
+	qb->dump = 0;
+	qa_gap(q->seq[rsid], q->seq[csid], u->r, u->c, v->r, v->c, s, k, qb, &t);
+	qb->dump = dump;
+	if (problem) *problem = (t.del_bp + t.ins_bp >= 1000 || t.rep_n > 0);
+	free(t.hist);
+	return t.pen;
+}
+
+static void qc_soften_chain(const qc_ctx_t *q, qc_chain_t *c, const qc_pt_t *pts, int32_t rsid, int32_t csid, int32_t k, qa_buf_t *qb)
+{
+	int32_t j, nk = 1, *kp;
+	int64_t puv = -1;
+	int prob_uv = 0;
+	if (c->n_idx < 3) return;
+	kp = (int32_t*)malloc(c->n_idx * sizeof(int32_t));
+	kp[0] = c->idx[0];
+	for (j = 1; j < c->n_idx; ++j) {
+		const qc_pt_t *u = &pts[kp[nk - 1]], *v = &pts[c->idx[j]], *w;
+		int64_t pvw, puw, dr, dc;
+		int prob_vw = 0;
+		if (puv < 0) puv = qc_gap_aw_pen(q, rsid, csid, u, v, c->s, k, qb, &prob_uv);
+		if (j + 1 >= c->n_idx) { kp[nk++] = c->idx[j]; break; }
+		w = &pts[c->idx[j + 1]];
+		pvw = qc_gap_aw_pen(q, rsid, csid, v, w, c->s, k, qb, &prob_vw);
+		dr = w->r - u->r, dc = c->s? u->c - w->c : w->c - u->c;
+		__sync_fetch_and_add(&qc_soft_n[0], 1);
+		if (prob_uv || prob_vw) __sync_fetch_and_add(&qc_soft_n[1], 1);
+		if ((prob_uv || prob_vw) && dr <= QC_SOFT_MAX && dc > 0 && dc <= QC_SOFT_MAX) {
+			int prob_uw = 0;
+			__sync_fetch_and_add(&qc_soft_n[2], 1);
+			puw = qc_gap_aw_pen(q, rsid, csid, u, w, c->s, k, qb, &prob_uw);
+			if (puw < puv + pvw) { // dropping v is cheaper: the window now runs u -> w
+				puv = puw, prob_uv = prob_uw;
+				__sync_fetch_and_add(&qc_soft_n[3], 1);
+				continue;
+			}
+		}
+		kp[nk++] = c->idx[j];
+		puv = pvw, prob_uv = prob_vw;
+	}
+	if (kp[nk - 1] != c->idx[c->n_idx - 1]) kp[nk++] = c->idx[c->n_idx - 1];
+	memcpy(c->idx, kp, nk * sizeof(int32_t));
+	c->n_idx = nk;
+	free(kp);
+}
+
 /* Chain one (assembly sequence, reference sequence) group; pts sorted by r then c. */
 static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t rsid, int64_t n, const qc_pt_t *pts, qa_buf_t *qb)
 {
@@ -862,6 +930,8 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 	// anchors and balanced gaps first, then lopsided gaps (> 2 kb, one side < half the other) -- so a
 	// transposed or rearranged block inside a long gap of the main chain is aligned by its own chain, and
 	// the main chain's gap only deletes what is left unclaimed.
+	if (q->seq && is_syn && n_ch > 0 && qc_soft_on())
+		for (i = 0; i < n_ch; ++i) qc_soften_chain(q, &ch[i], pts, rsid, csid, k, qb);
 	if (q->seq && is_syn && n_ch > 0) {
 		int64_t nb = q->sid->len[rsid] + 2, z;
 		uint64_t *cl = (uint64_t*)calloc(nb / 64 + 1, 8);
@@ -955,6 +1025,7 @@ static void qc_acc_merge(qc_acc_t *d, const qc_acc_t *x)
 	if (x->del_max > d->del_max) d->del_max = x->del_max;
 	d->tight_bp += x->tight_bp, d->tight_present += x->tight_present, d->tight_missing += x->tight_missing;
 	for (i = 0; i < x->n_ivl; ++i) qc_add_ivl(d, x->ivl[i].st, x->ivl[i].en, x->ivl[i].cls);
+	d->b.pen += x->b.pen;
 	d->b.aln += x->b.aln, d->b.snp += x->b.snp, d->b.rep_n += x->b.rep_n, d->b.snp_d10 += x->b.snp_d10, d->b.snp_d40 += x->b.snp_d40;
 	d->b.ins_n += x->b.ins_n, d->b.ins_bp += x->b.ins_bp, d->b.del_n += x->b.del_n, d->b.del_bp += x->b.del_bp;
 	if (x->b.ins_max > d->b.ins_max) d->b.ins_max = x->b.ins_max;
@@ -1562,6 +1633,7 @@ int main_asmqc_fa(int argc, char *argv[])
 		qf_seqs_free(&as);
 		free(taxon);
 	}
+	if (qc_soft_on() >= 2) fprintf(stderr, "[M::%s] soft anchors: %ld anchors, %ld next to a problem gap, %ld merged windows tried, %ld anchors dropped\n", __func__, (long)qc_soft_n[0], (long)qc_soft_n[1], (long)qc_soft_n[2], (long)qc_soft_n[3]);
 	fprintf(stderr, "[M::%s::%.1f] done\n", __func__, rb3_realtime() - t0);
 	if (qc_chain_fp) fclose(qc_chain_fp), qc_chain_fp = 0;
 	if (qc_var_fp) fclose(qc_var_fp), qc_var_fp = 0;
