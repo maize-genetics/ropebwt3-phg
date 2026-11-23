@@ -3,7 +3,7 @@ CFLAGS=		-g -Wall -Wc++-compat -O3
 CPPFLAGS=
 INCLUDES=
 OBJS=		libsais.o libsais64.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o \
-			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o pairing.o isa.o extract.o snap.o errprof.o edstats.o asmqc.o
+			dawg.o fm-index.o ssa.o sais-ss.o build.o search.o bwa-sw.o lift.o ps4g.o hitcount.o pairing.o isa.o extract.o snap.o errprof.o edstats.o asmqc.o ksw2_extd2_sse.o
 PROG=		ropebwt3
 LIBS=		-lpthread -lz -lm
 
@@ -25,6 +25,9 @@ endif
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 all:$(PROG)
+
+ksw2_extd2_sse.o:ksw2_extd2_sse.c ksw2.h kalloc.h
+		$(CC) -c $(CFLAGS) -msse4.1 -DHAVE_KALLOC $(CPPFLAGS) $(INCLUDES) $< -o $@
 
 ropebwt3:$(OBJS) main.o
 		$(CC) $(CFLAGS) $^ -o $@ $(LIBS)

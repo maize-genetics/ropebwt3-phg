@@ -44,6 +44,8 @@
 #include "lift.h"
 #include "ketopt.h"
 #include "kthread.h"
+#define HAVE_KALLOC
+#include "ksw2.h"
 #include <pthread.h>
 
 static FILE *qc_chain_fp = 0; // --chains output (NULL = off)
@@ -58,32 +60,29 @@ static const char *qc_cls_name[] = { "syn", "syn_inv", "other_chr", "scaffold" }
 
 /* ---- base-level comparison between chained anchors (asmqc-fa) -----------
  *
- * For two consecutive anchors of a syntenic chain, the reference segment R and the
- * assembly segment A between them (A reverse-complemented on an inverted chain) are
- * compared base by base:
+ * Between two consecutive anchors of a syntenic chain, the reference segment R and the assembly
+ * segment A (reverse-complemented on an inverted chain) are compared with AnchorWave's gap model:
+ * match 0, mismatch 4, 2-piece affine gaps min(4+2l, 80+l) (ksw2, converted to an equivalent
+ * positive-match scoring, see qa_ksw):
  *   - equal length and <= QA_GAPLESS_MM mismatches: gapless, mismatches = SNPs;
- *   - otherwise, if the banded matrix is small enough: affine-gap global alignment
- *     (band = |len difference| + QA_W), accepted at >= QA_MIN_ID identity over aligned
- *     columns plus gap bases; mismatches = SNPs, gap runs = insertion / deletion events;
- *   - otherwise (or when rejected at the top level): unique QA_SK-mers shared by R and A,
- *     longest collinear chain of them, recursion into the sub-gaps;
- *   - whatever cannot be aligned is a replacement, counted like AnchorWave does: the
- *     reference bp as one deletion and the assembly bp as one insertion.
- * Anchor k-mers themselves are exact matches and count as aligned bp.
+ *   - small and near-diagonal: one global alignment, unless deleting R + inserting A scores better;
+ *   - otherwise breakpoints first: extend from both flanking anchors with z-drop (crossing SNPs and
+ *     small indels, stopping where similarity collapses), re-align the extended pieces, and treat the
+ *     middle between the breakpoints as a clean indel (one side empty), or split it on shared unique
+ *     17-/13-mers (or place a short piece by 11-mer diagonal voting) and recurse, or take the better
+ *     of alignment vs replacement;
+ *   - replacement = AnchorWave's representation of unalignable sequence: R as one deletion, A as one
+ *     insertion.
+ * SNPs are also tallied by local density (>= 10 / >= 40 other SNPs within +-50 bp).
  */
-#define QA_MATCH 2
-#define QA_MIS   4
-#define QA_GO    4
-#define QA_GE    2
-#define QA_W     32
-#define QA_W2    256    // retry band for alignments rejected at QA_W
-#define QA_BIG_INDEL 50 // gap runs this long are real indels and do not count against identity
-#define QA_MAX_CELLS 20000000LL
 #define QA_MAX_LEN   200000
-#define QA_MIN_ID    0.70
 #define QA_GAPLESS_MM 0.03
 #define QA_SK    17
-#define QA_NEG   (-1000000000)
+#define QA_SK2   13     // second seeding pass for diverged segments with no shared unique 17-mer
+#define QA_VK    11     // diagonal voting k-mer (repeats allowed) for lopsided / repetitive gaps
+#define QA_VBIN  256    // diagonal bin width
+#define QA_VPAD  256    // window padding around the voted diagonal
+#define QA_VOCC  8      // ignore voting k-mers occurring more often than this in the shorter sequence
 #define QA_HIST  4096   // exact indel-size bins 1..QA_HIST-1, last bin = larger
 
 typedef struct qa_var_s { int64_t pos, rlen, alen; uint8_t r, a, type; } qa_var_t;
@@ -93,6 +92,7 @@ typedef struct {
 	int32_t *h0, *h1, *f0, *f1; int32_t m_w;
 	uint8_t *rc; int64_t m_rc;
 	int32_t *ev; int64_t n_ev, m_ev;        // pending events of one DP: >0 insertion, <0 deletion
+	uint8_t *ops; int64_t n_ops, m_ops;     // traceback path, end to start: 0 match, 1 mismatch, 2 ins, 3 del
 	uint64_t *ka, *kb; int64_t m_ka, m_kb;  // seeding scratch
 	int dump;                               // --variants: collect SNP / replacement records
 	struct qa_var_s *v, *pv;                // committed / pending (one DP)
@@ -110,12 +110,13 @@ static inline void qa_var_push(qa_var_t **v, int64_t *n, int64_t *m, int64_t pos
 
 typedef struct {
 	int64_t aln, snp, ins_n, ins_bp, ins_max, del_n, del_bp, del_max, rep_n;
+	int64_t snp_d10, snp_d40;              // SNPs with >= 10 / >= 40 other SNPs within +-50 bp (local mismatch >= ~10% / ~40%)
 	int64_t *hist;                          // [2*QA_HIST]: insertion sizes, then deletion sizes
 } qa_stat_t;
 
 static void qa_buf_free(qa_buf_t *b)
 {
-	free(b->tb); free(b->h0); free(b->h1); free(b->f0); free(b->f1); free(b->rc); free(b->ev); free(b->ka); free(b->kb); free(b->v); free(b->pv);
+	free(b->tb); free(b->h0); free(b->h1); free(b->f0); free(b->f1); free(b->rc); free(b->ev); free(b->ka); free(b->kb); free(b->v); free(b->pv); free(b->ops);
 	memset(b, 0, sizeof(*b));
 }
 
@@ -129,9 +130,9 @@ static inline void qa_event(qa_stat_t *st, int64_t len, int is_del)
 	else { st->ins_n++, st->ins_bp += len; if (len > st->ins_max) st->ins_max = len; }
 }
 
-static void qa_replace(qa_stat_t *st, int64_t lr, int64_t la, qa_buf_t *b, int64_t r0)
+static void qa_replace(qa_stat_t *st, int64_t lr, int64_t la, qa_buf_t *b, int64_t r0, int why)
 {
-	if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0, lr, la, 0, 0, QA_VREP);
+	if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0, lr, la, (uint8_t)why, 0, QA_VREP);
 	if (lr > 0) qa_event(st, lr, 1);
 	if (la > 0) qa_event(st, la, 0);
 	if (lr > 0 && la > 0) st->rep_n++;
@@ -145,99 +146,89 @@ static inline void qa_push_ev(qa_buf_t *b, int32_t v)
 
 static inline int qa_acgt(uint8_t c) { return c >= 1 && c <= 4; }
 
-/* Banded affine-gap global alignment of R[0,lr) vs A[0,la). Returns 1 and adds to st when the
- * alignment is accepted, 0 when rejected (low identity), -1 when the matrix is too large. */
-static int qa_dp(const uint8_t *R, int32_t lr, const uint8_t *A, int32_t la, qa_buf_t *b, qa_stat_t *st, int64_t r0, int32_t bw)
+static inline void qa_push_op(qa_buf_t *b, uint8_t op, int64_t n)
 {
-	int32_t dlo = (la < lr? la - lr : 0) - bw, dhi = (la > lr? la - lr : 0) + bw, W = dhi - dlo + 1, i, x, j;
-	int64_t cells = (int64_t)(lr + 1) * W, aln = 0, mm = 0, k;
-	int32_t *Hp, *Hc, *Fp, *Fc, *t;
-	int state = 0, run = 0;
-	if (lr > QA_MAX_LEN || la > QA_MAX_LEN || cells > QA_MAX_CELLS) return -1;
-	if (cells > b->m_tb) b->m_tb = cells, b->tb = (uint8_t*)realloc(b->tb, cells);
-	if (W + 2 > b->m_w) {
-		b->m_w = W + 2;
-		b->h0 = (int32_t*)realloc(b->h0, b->m_w * 4), b->h1 = (int32_t*)realloc(b->h1, b->m_w * 4);
-		b->f0 = (int32_t*)realloc(b->f0, b->m_w * 4), b->f1 = (int32_t*)realloc(b->f1, b->m_w * 4);
+	if (b->n_ops + n > b->m_ops) { b->m_ops = (b->n_ops + n) * 2; b->ops = (uint8_t*)realloc(b->ops, b->m_ops); }
+	memset(b->ops + b->n_ops, op, n); b->n_ops += n;
+}
+
+
+/* AnchorWave's gap model: match 0, mismatch 4, 2-piece affine gaps min(4+2l, 80+l) (WFA penalties in
+ * AnchorWave proali), here with ksw2's banded global alignment. ksw2 needs a positive match score
+ * (with match 0 its SIMD scores go wrong), so the penalties are converted exactly: with match +a,
+ * mismatch -(x-a), gap extend -(e-a/2) and the same opens, score = a(lr+la)/2 - penalty for every
+ * alignment, so both rank alignments identically. a = 2: +2 / -2 / open 4 ext 1 / open 80 ext 0. */
+#define QA_KSW_A     2
+#define QA_KSW_MIS   4
+#define QA_KSW_GO1   4
+#define QA_KSW_GE1   2
+#define QA_KSW_GO2   80
+#define QA_KSW_GE2   1
+#define QA_KSW_W     200            // band beyond the length difference
+#define QA_KSW_CELLS 400000000LL    // (lr + la) x band cap per alignment (~bytes of traceback)
+
+// local SNP-density classes of the SNPs of one alignment (positions ascending)
+static void qa_snp_classes(const int64_t *p, int64_t n, qa_stat_t *st)
+{
+	int64_t i, lo = 0, hi = 0;
+	for (i = 0; i < n; ++i) {
+		while (p[lo] < p[i] - 50) ++lo;
+		while (hi < n && p[hi] <= p[i] + 50) ++hi;
+		if (hi - lo - 1 >= 10) st->snp_d10++;
+		if (hi - lo - 1 >= 40) st->snp_d40++;
 	}
-	Hp = b->h0, Hc = b->h1, Fp = b->f0, Fc = b->f1;
-	for (x = 0; x < W; ++x) { // row 0: H[0][j] reached by an insertion run from (0,0)
-		j = dlo + x;
-		Fp[x] = QA_NEG;
-		if (j < 0 || j > la) { Hp[x] = QA_NEG, b->tb[x] = 0; continue; }
-		Hp[x] = j == 0? 0 : -(QA_GO + QA_GE * j);
-		b->tb[x] = j == 0? 0 : (1 | (j > 1? 4 : 0));
+}
+
+/* Global 2-piece affine alignment of R[0,lr) (target) vs A[0,la) (query). Returns 1 and adds SNPs,
+ * indels and aligned bp to st; -1 when the band would be too large; 0 (nothing added) when check_rep
+ * is set and deleting R + inserting A scores better under the same model -- the band cannot represent
+ * that path itself, AnchorWave's unbanded WFA can. */
+static inline int64_t qa_gapcost(int64_t l)
+{
+	int64_t c1 = QA_KSW_GO1 + QA_KSW_GE1 * l, c2 = QA_KSW_GO2 + QA_KSW_GE2 * l;
+	return l <= 0? 0 : c1 < c2? c1 : c2;
+}
+
+static int qa_ksw(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa_buf_t *b, qa_stat_t *st, int64_t r0, int check_rep)
+{
+#define QA_KSW_B (QA_KSW_MIS - QA_KSW_A)
+	static const int8_t mat[25] = { QA_KSW_A,-QA_KSW_B,-QA_KSW_B,-QA_KSW_B,-1, -QA_KSW_B,QA_KSW_A,-QA_KSW_B,-QA_KSW_B,-1,
+		-QA_KSW_B,-QA_KSW_B,QA_KSW_A,-QA_KSW_B,-1, -QA_KSW_B,-QA_KSW_B,-QA_KSW_B,QA_KSW_A,-1, -1,-1,-1,-1,-1 };
+	int64_t w = (lr > la? lr - la : la - lr) + QA_KSW_W, i, j, k, n_snp = 0;
+	uint8_t *t, *qs;
+	int64_t *sp;
+	ksw_extz_t ez;
+	if (lr > INT32_MAX / 4 || la > INT32_MAX / 4 || (lr + la) * (2 * w + 1) > QA_KSW_CELLS) return -1;
+	t = (uint8_t*)malloc(lr + la + 2), qs = t + lr + 1;
+	for (i = 0; i < lr; ++i) t[i] = qa_acgt(R[i])? R[i] - 1 : 4;
+	for (i = 0; i < la; ++i) qs[i] = qa_acgt(A[i])? A[i] - 1 : 4;
+	memset(&ez, 0, sizeof(ez));
+	ksw_extd2_sse(0, (int)la, qs, (int)lr, t, 5, mat, QA_KSW_GO1, QA_KSW_GE1 - QA_KSW_A / 2, QA_KSW_GO2, QA_KSW_GE2 - QA_KSW_A / 2,
+				  (int)w, -1, 0, 0, &ez);
+	// back in AnchorWave units: penalty = a(lr+la)/2 - score
+	if (check_rep && (ez.score <= KSW_NEG_INF / 2 || (QA_KSW_A / 2) * (lr + la) - ez.score > qa_gapcost(lr) + qa_gapcost(la))) {
+		// AnchorWave's own scoring prefers deleting R and inserting A over this alignment
+		kfree(0, ez.cigar); free(t);
+		return 0;
 	}
-	for (i = 1; i <= lr; ++i) {
-		int32_t e = QA_NEG;
-		uint8_t *tbr = b->tb + (int64_t)i * W;
-		for (x = 0; x < W; ++x) {
-			int32_t fo, fe, f, eo, ee, dg, h, src;
-			uint8_t tv = 0;
-			j = i + dlo + x;
-			if (j < 0 || j > la) { Hc[x] = Fc[x] = QA_NEG, e = QA_NEG, tbr[x] = 0; continue; }
-			fo = x + 1 < W && Hp[x + 1] > QA_NEG? Hp[x + 1] - QA_GO - QA_GE : QA_NEG;
-			fe = x + 1 < W && Fp[x + 1] > QA_NEG? Fp[x + 1] - QA_GE : QA_NEG;
-			f = fo >= fe? fo : fe;
-			if (fe > fo) tv |= 8;
-			eo = x > 0 && Hc[x - 1] > QA_NEG? Hc[x - 1] - QA_GO - QA_GE : QA_NEG;
-			ee = x > 0 && e > QA_NEG? e - QA_GE : QA_NEG;
-			e = eo >= ee? eo : ee;
-			if (ee > eo) tv |= 4;
-			dg = j > 0 && Hp[x] > QA_NEG? Hp[x] + (R[i - 1] == A[j - 1] && qa_acgt(R[i - 1])? QA_MATCH : -QA_MIS) : QA_NEG;
-			h = dg, src = 0;
-			if (e > h) h = e, src = 1;
-			if (f > h) h = f, src = 2;
-			Hc[x] = h, Fc[x] = f, tbr[x] = tv | src;
-		}
-		t = Hp, Hp = Hc, Hc = t;
-		t = Fp, Fp = Fc, Fc = t;
-	}
-	// traceback from (lr, la)
-	b->n_ev = 0, b->n_pv = 0;
-	i = lr, j = la;
-	while (i > 0 || j > 0) {
-		uint8_t tv;
-		if (i == 0 || j == 0) { // matrix edge: flush the open run, the rest is one insertion or deletion
-			if (run) qa_push_ev(b, state == 1? run : -run), run = 0;
-			if (j > 0) qa_push_ev(b, j);
-			if (i > 0) qa_push_ev(b, -i);
-			break;
-		}
-		tv = b->tb[(int64_t)i * W + (j - i - dlo)];
-		if (state == 0) {
-			int src = tv & 3;
-			if (src == 0) {
-				++aln;
-				if (R[i - 1] != A[j - 1] && qa_acgt(R[i - 1]) && qa_acgt(A[j - 1])) {
-					++mm;
-					if (b->dump) qa_var_push(&b->pv, &b->n_pv, &b->m_pv, r0 + i - 1, 1, 1, R[i - 1], A[j - 1], QA_VSNP);
+	sp = (int64_t*)malloc((lr < la? lr : la) * sizeof(int64_t) + 8);
+	for (k = 0, i = j = 0; k < ez.n_cigar; ++k) {
+		int op = ez.cigar[k] & 0xf, len = ez.cigar[k] >> 4, z;
+		if (op == 0) { // M: target i, query j
+			for (z = 0; z < len; ++z, ++i, ++j) {
+				if (t[i] != qs[j] && t[i] < 4 && qs[j] < 4) {
+					sp[n_snp++] = r0 + i;
+					if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0 + i, 1, 1, R[i], A[j], QA_VSNP);
 				}
-				--i, --j;
-			} else state = src;
-		} else if (state == 1) { // insertion: consumes A
-			++run, --j;
-			if (!(tv & 4)) qa_push_ev(b, run), run = 0, state = 0;
-		} else { // deletion: consumes R
-			++run, --i;
-			if (!(tv & 8)) qa_push_ev(b, -run), run = 0, state = 0;
-		}
+			}
+			st->aln += len;
+		} else if (op == 1) { qa_event(st, len, 0); j += len; } // I: assembly has extra bases
+		else if (op == 2) { qa_event(st, len, 1); i += len; }   // D: reference bases missing
 	}
-	{ // identity over aligned columns AND short-gap bases, so gappy alignments of unrelated sequence are
-	  // rejected while a long real indel (TE insertion) inside an otherwise good alignment is kept
-		int64_t gap_bp = 0;
-		for (k = 0; k < b->n_ev; ++k) {
-			int64_t g = b->ev[k] > 0? b->ev[k] : -b->ev[k];
-			if (g < QA_BIG_INDEL) gap_bp += g;
-		}
-		if (lr > 50 || la > 50) // tiny segments (between seeds) keep their best alignment as is
-			if (aln == 0 || (double)(aln - mm) < QA_MIN_ID * (aln + gap_bp)) return 0;
-	}
-	st->aln += aln, st->snp += mm;
-	for (k = 0; k < b->n_pv; ++k) qa_var_push(&b->v, &b->n_v, &b->m_v, b->pv[k].pos, 1, 1, b->pv[k].r, b->pv[k].a, QA_VSNP);
-	for (k = 0; k < b->n_ev; ++k)
-		if (b->ev[k] > 0) qa_event(st, b->ev[k], 0);
-		else qa_event(st, -b->ev[k], 1);
+	st->snp += n_snp;
+	qa_snp_classes(sp, n_snp, st);
+	kfree(0, ez.cigar);
+	free(sp); free(t);
 	return 1;
 }
 
@@ -248,16 +239,16 @@ static int qa_cmp_u64(const void *a, const void *b)
 }
 
 // k-mers occurring exactly once in s[0,l): packed (code << 30 | pos), sorted by code; returns count
-static int64_t qa_uniq_kmers(const uint8_t *s, int64_t l, uint64_t **buf, int64_t *m)
+static int64_t qa_uniq_kmers(const uint8_t *s, int64_t l, int32_t sk, uint64_t **buf, int64_t *m)
 {
 	int64_t i, n = 0, w = 0, len = 0;
-	uint64_t code = 0, mask = (1ULL << (2 * QA_SK)) - 1;
-	if (l < QA_SK) return 0;
+	uint64_t code = 0, mask = (1ULL << (2 * sk)) - 1;
+	if (l < sk) return 0;
 	if (l > *m) *m = l, *buf = (uint64_t*)realloc(*buf, l * sizeof(uint64_t));
 	for (i = 0; i < l; ++i) {
 		if (!qa_acgt(s[i])) { len = 0, code = 0; continue; }
 		code = (code << 2 | (uint64_t)(s[i] - 1)) & mask;
-		if (++len >= QA_SK) (*buf)[n++] = code << 30 | (uint64_t)(i - QA_SK + 1);
+		if (++len >= sk) (*buf)[n++] = code << 30 | (uint64_t)(i - sk + 1);
 	}
 	qsort(*buf, n, sizeof(uint64_t), qa_cmp_u64);
 	for (i = 0; i < n; ) { // keep codes that occur once
@@ -271,20 +262,90 @@ static int64_t qa_uniq_kmers(const uint8_t *s, int64_t l, uint64_t **buf, int64_
 
 static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0);
 
+/* Lopsided or repetitive gap with no shared unique seeds (e.g. a full TE in the reference, a solo LTR in
+ * the assembly): find where the shorter sequence sits in the longer one by voting on diagonals with
+ * (possibly repeated) QA_VK-mers, align it to that window, and count the rest of the longer sequence as
+ * one deletion (reference longer) or insertion (assembly longer) on each side. Returns 1 if aligned. */
+static int qa_diag(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa_buf_t *b, qa_stat_t *st, int64_t r0)
+{
+	int ref_long = lr >= la;
+	const uint8_t *S = ref_long? A : R, *L = ref_long? R : A;
+	int64_t ls = ref_long? la : lr, ll = ref_long? lr : la, i, n = 0, nb, best = -1, bv = 0, tot = 0, ws, we;
+	uint64_t code = 0, mask = (1ULL << (2 * QA_VK)) - 1;
+	int32_t len = 0, *votes;
+	int r;
+	if (ls < 200 || ls > QA_MAX_LEN || ll > 50 * (int64_t)QA_MAX_LEN) return 0;
+	if (ls > b->m_ka) b->m_ka = ls, b->ka = (uint64_t*)realloc(b->ka, ls * sizeof(uint64_t));
+	for (i = 0; i < ls; ++i) { // k-mers of the shorter sequence: (code << 30 | pos), sorted
+		if (!qa_acgt(S[i])) { len = 0, code = 0; continue; }
+		code = (code << 2 | (uint64_t)(S[i] - 1)) & mask;
+		if (++len >= QA_VK) b->ka[n++] = code << 30 | (uint64_t)(i - QA_VK + 1);
+	}
+	if (n == 0) return 0;
+	qsort(b->ka, n, sizeof(uint64_t), qa_cmp_u64);
+	nb = (ll + ls) / QA_VBIN + 2; // diagonal = posL - posS + ls, binned
+	votes = (int32_t*)calloc(nb, sizeof(int32_t));
+	len = 0, code = 0;
+	for (i = 0; i < ll; ++i) {
+		int64_t lo, hi, j;
+		if (!qa_acgt(L[i])) { len = 0, code = 0; continue; }
+		code = (code << 2 | (uint64_t)(L[i] - 1)) & mask;
+		if (++len < QA_VK) continue;
+		{ // range of this code among S's k-mers
+			uint64_t key = code << 30;
+			int64_t a0 = 0, a1 = n;
+			while (a0 < a1) { int64_t m = (a0 + a1) >> 1; if (b->ka[m] < key) a0 = m + 1; else a1 = m; }
+			lo = a0, hi = a0;
+			while (hi < n && b->ka[hi] >> 30 == code) ++hi;
+		}
+		if (hi - lo == 0 || hi - lo > QA_VOCC) continue;
+		for (j = lo; j < hi; ++j) {
+			int64_t d = (i - QA_VK + 1) - (int64_t)(b->ka[j] & 0x3fffffff) + ls;
+			votes[d / QA_VBIN]++, ++tot;
+		}
+	}
+	for (i = 0; i < nb; ++i) { // best pair of adjacent bins (an indel can split a diagonal)
+		int64_t v = votes[i] + (i + 1 < nb? votes[i + 1] : 0);
+		if (v > bv) bv = v, best = i;
+	}
+	free(votes);
+	// require a clear diagonal: >= 10 votes and well above an even spread
+	if (best < 0 || bv < 10 || bv * nb < 20 * tot) return 0;
+	{
+		int64_t d0 = best * QA_VBIN - ls; // posL - posS at the bin start
+		ws = d0 - QA_VPAD; we = d0 + QA_VBIN * 2 + ls + QA_VPAD;
+		if (ws < 0) ws = 0;
+		if (we > ll) we = ll;
+		if (we - ws < ls / 2) return 0;
+	}
+	r = ref_long? qa_ksw(R + ws, we - ws, A, la, b, st, r0 + ws, 1)
+	             : qa_ksw(R, lr, A + ws, we - ws, b, st, r0, 1);
+	if (r != 1) return 0;
+	if (ref_long) { if (ws > 0) qa_event(st, ws, 1); if (ll - we > 0) qa_event(st, ll - we, 1); }
+	else { if (ws > 0) qa_event(st, ws, 0); if (ll - we > 0) qa_event(st, ll - we, 0); }
+	return 1;
+}
+
 static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
 {
 	int64_t nr, na, i, j, ns = 0, *sr, *sa, *tail, *prev, nl = 0, *keep, nk, pr, pa, rb = r0;
-	nr = qa_uniq_kmers(R, lr, &b->ka, &b->m_ka);
-	na = qa_uniq_kmers(A, la, &b->kb, &b->m_kb);
-	sr = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
-	sa = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
-	for (i = j = 0; i < nr && j < na; ) { // shared unique k-mers
-		uint64_t ci = b->ka[i] >> 30, cj = b->kb[j] >> 30;
-		if (ci < cj) ++i;
-		else if (ci > cj) ++j;
-		else sr[ns] = (int64_t)(b->ka[i] & 0x3fffffff), sa[ns] = (int64_t)(b->kb[j] & 0x3fffffff), ++ns, ++i, ++j;
+	int32_t sk = QA_SK, pass;
+	sr = sa = 0;
+	for (pass = 0; pass < 2 && ns == 0; ++pass) { // unique 17-mers; if none are shared, unique 13-mers
+		sk = pass == 0? QA_SK : QA_SK2;
+		nr = qa_uniq_kmers(R, lr, sk, &b->ka, &b->m_ka);
+		na = qa_uniq_kmers(A, la, sk, &b->kb, &b->m_kb);
+		free(sr); free(sa);
+		sr = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
+		sa = (int64_t*)malloc((nr < na? nr : na) * sizeof(int64_t) + 8);
+		for (i = j = 0; i < nr && j < na; ) { // shared unique k-mers
+			uint64_t ci = b->ka[i] >> 30, cj = b->kb[j] >> 30;
+			if (ci < cj) ++i;
+			else if (ci > cj) ++j;
+			else sr[ns] = (int64_t)(b->ka[i] & 0x3fffffff), sa[ns] = (int64_t)(b->kb[j] & 0x3fffffff), ++ns, ++i, ++j;
+		}
 	}
-	if (ns == 0) { free(sr); free(sa); qa_replace(st, lr, la, b, r0); return; }
+	if (ns == 0) { free(sr); free(sa); if (!qa_diag(R, lr, A, la, b, st, r0) && qa_ksw(R, lr, A, la, b, st, r0, 1) != 1) qa_replace(st, lr, la, b, r0, 1); return; }
 	{ // order by reference position, then longest increasing subsequence on assembly position
 		uint64_t *o = (uint64_t*)malloc(ns * sizeof(uint64_t));
 		int64_t *tr = (int64_t*)malloc(ns * sizeof(int64_t)), *ta = (int64_t*)malloc(ns * sizeof(int64_t));
@@ -307,45 +368,102 @@ static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la
 	// walk the seeds; merge overlapping seeds on one diagonal, drop other overlaps, recurse into gaps
 	pr = 0, pa = 0;
 	for (i = 0; i < nl; ++i) {
-		int64_t r0 = sr[keep[i]], a0 = sa[keep[i]], r1 = r0 + QA_SK, a1 = a0 + QA_SK;
+		int64_t r0 = sr[keep[i]], a0 = sa[keep[i]], r1 = r0 + sk, a1 = a0 + sk;
 		if (r0 < pr || a0 < pa) {
 			if (r0 - a0 == pr - pa && r1 > pr) { st->aln += r1 - pr; pr = r1, pa = a1; } // same diagonal: extend
 			continue;
 		}
 		qa_align(R + pr, r0 - pr, A + pa, a0 - pa, depth + 1, b, st, rb + pr);
-		st->aln += QA_SK;
+		st->aln += sk;
 		pr = r1, pa = a1;
 	}
 	qa_align(R + pr, lr - pr, A + pa, la - pa, depth + 1, b, st, rb + pr);
 	free(sr); free(sa); free(tail); free(prev); free(keep);
 }
 
+/* Extend from the start of R/A (or from the end when rev) with z-drop: SNPs and small indels are
+ * crossed, extension stops where similarity collapses (an indel / rearrangement breakpoint).
+ * Extension needs a positive match score; the extended pieces are re-aligned with AnchorWave's
+ * scoring afterwards. Sets *er, *ea to the extended lengths. */
+#define QA_EXT_MATCH 2
+#define QA_EXT_ZDROP 200
+#define QA_EXT_W     500
+static void qa_extend(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int rev, int64_t *er, int64_t *ea)
+{
+	static const int8_t mat[25] = { QA_EXT_MATCH,-QA_KSW_MIS,-QA_KSW_MIS,-QA_KSW_MIS,-1, -QA_KSW_MIS,QA_EXT_MATCH,-QA_KSW_MIS,-QA_KSW_MIS,-1,
+		-QA_KSW_MIS,-QA_KSW_MIS,QA_EXT_MATCH,-QA_KSW_MIS,-1, -QA_KSW_MIS,-QA_KSW_MIS,-QA_KSW_MIS,QA_EXT_MATCH,-1, -1,-1,-1,-1,-1 };
+	int64_t i, nr = lr < INT32_MAX / 4? lr : INT32_MAX / 4, na = la < INT32_MAX / 4? la : INT32_MAX / 4;
+	uint8_t *t = (uint8_t*)malloc(nr + na + 2), *qs = t + nr + 1;
+	ksw_extz_t ez;
+	*er = *ea = 0;
+	for (i = 0; i < nr; ++i) { uint8_t c = rev? R[lr - 1 - i] : R[i]; t[i] = qa_acgt(c)? c - 1 : 4; }
+	for (i = 0; i < na; ++i) { uint8_t c = rev? A[la - 1 - i] : A[i]; qs[i] = qa_acgt(c)? c - 1 : 4; }
+	memset(&ez, 0, sizeof(ez));
+	ksw_extd2_sse(0, (int)na, qs, (int)nr, t, 5, mat, QA_KSW_GO1, QA_KSW_GE1, QA_KSW_GO2, QA_KSW_GE2, QA_EXT_W, QA_EXT_ZDROP, 0,
+				  KSW_EZ_EXTZ_ONLY | KSW_EZ_SCORE_ONLY, &ez);
+	if (ez.max > 0) *er = ez.max_t + 1, *ea = ez.max_q + 1;
+	kfree(0, ez.cigar); free(t);
+}
+
 static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
 {
-	int r;
+	int64_t i, Lr, La, Rr, Ra;
 	if (lr <= 0 && la <= 0) return;
 	if (lr <= 0) { qa_event(st, la, 0); return; }
 	if (la <= 0) { qa_event(st, lr, 1); return; }
 	if (lr == la) { // gapless fast path
-		int64_t i, mm = 0, lim = (int64_t)(QA_GAPLESS_MM * lr);
+		int64_t mm = 0, lim = (int64_t)(QA_GAPLESS_MM * lr);
 		for (i = 0; i < lr && mm <= lim; ++i)
 			if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) ++mm;
 		if (mm <= lim) {
 			st->aln += lr, st->snp += mm;
-			if (b->dump && mm)
+			if (mm) {
+				int64_t *sp = (int64_t*)malloc(mm * sizeof(int64_t)), n = 0;
 				for (i = 0; i < lr; ++i)
-					if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) qa_var_push(&b->v, &b->n_v, &b->m_v, r0 + i, 1, 1, R[i], A[i], QA_VSNP);
+					if (R[i] != A[i] && qa_acgt(R[i]) && qa_acgt(A[i])) {
+						sp[n++] = r0 + i;
+						if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0 + i, 1, 1, R[i], A[i], QA_VSNP);
+					}
+				qa_snp_classes(sp, n, st);
+				free(sp);
+			}
 			return;
 		}
 	}
-	r = qa_dp(R, (int32_t)lr, A, (int32_t)la, b, st, r0, QA_W);
-	if (r == 0) { // rejected: retry once with a wide band (compensating indels further apart than QA_W)
-		int r2 = qa_dp(R, (int32_t)lr, A, (int32_t)la, b, st, r0, QA_W2);
-		if (r2 == 1) return;
+	// small and near-diagonal: one global alignment (or a replacement if that scores better)
+	if (lr <= 2000 && la <= 2000 && (lr > la? lr - la : la - lr) <= QA_KSW_W) {
+		if (qa_ksw(R, lr, A, la, b, st, r0, 1) == 1) return;
+		if (depth > 0) { qa_replace(st, lr, la, b, r0, 3); return; }
 	}
-	if (r == 1) return;
-	if (depth >= 3 || (r == 0 && (lr < 1000 || la < 1000))) { qa_replace(st, lr, la, b, r0); return; }
-	qa_seeded(R, lr, A, la, depth, b, st, r0);
+	// breakpoints: extend from both flanking anchors
+	qa_extend(R, lr, A, la, 0, &Lr, &La);
+	if (Lr >= lr && La >= la) { // the extension crossed the whole gap
+		if (qa_ksw(R, lr, A, la, b, st, r0, 1) != 1) qa_replace(st, lr, la, b, r0, 3);
+		return;
+	}
+	if (Lr >= lr || La >= la) { // one side used up: aligned piece, then the rest of the other side is one indel
+		if (qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace(st, Lr, La, b, r0, 3);
+		if (lr > Lr) qa_event(st, lr - Lr, 1);
+		if (la > La) qa_event(st, la - La, 0);
+		return;
+	}
+	qa_extend(R + Lr, lr - Lr, A + La, la - La, 1, &Rr, &Ra);
+	if (Lr > 0 && qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace(st, Lr, La, b, r0, 3);
+	if (Rr > 0 && qa_ksw(R + lr - Rr, Rr, A + la - Ra, Ra, b, st, r0 + lr - Rr, 0) != 1) qa_replace(st, Rr, Ra, b, r0 + lr - Rr, 3);
+	{ // the middle, between the two breakpoints
+		const uint8_t *MR = R + Lr, *MA = A + La;
+		int64_t mr = lr - Lr - Rr, ma = la - La - Ra, m0 = r0 + Lr;
+		if (mr <= 0 || ma <= 0) { // a clean indel (one side empty)
+			if (mr > 0) qa_event(st, mr, 1);
+			if (ma > 0) qa_event(st, ma, 0);
+			return;
+		}
+		if (depth >= 3 || (Lr == 0 && Rr == 0 && depth > 0)) { // nothing more to find: best of alignment vs replacement
+			if (qa_ksw(MR, mr, MA, ma, b, st, m0, 1) != 1) qa_replace(st, mr, ma, b, m0, depth >= 3? 2 : 1);
+			return;
+		}
+		qa_seeded(MR, mr, MA, ma, depth, b, st, m0);
+	}
 }
 
 /* Compare the gap between consecutive chain anchors u -> v (reference ascending). */
@@ -641,7 +759,10 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 	}
 	// base level (asmqc-fa): like AnchorWave, every reference base gets at most one alignment.
 	// Inverted syntenic chains claim their gaps first (AnchorWave aligns inversions), then forward
-	// chains by anchor count; an anchor or gap already >= half claimed (per base) is skipped.
+	// chains by anchor count; an anchor or gap already >= half claimed (per base) is skipped. Two passes:
+	// anchors and balanced gaps first, then lopsided gaps (> 2 kb, one side < half the other) -- so a
+	// transposed or rearranged block inside a long gap of the main chain is aligned by its own chain, and
+	// the main chain's gap only deletes what is left unclaimed.
 	if (q->seq && is_syn && n_ch > 0) {
 		int64_t nb = q->sid->len[rsid] + 2, z;
 		uint64_t *cl = (uint64_t*)calloc(nb / 64 + 1, 8);
@@ -656,28 +777,48 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 		}
 #define QC_CLAIMED(x) (cl[(x) >> 6] >> ((x) & 63) & 1)
 #define QC_CLAIM(x)   (cl[(x) >> 6] |= 1ULL << ((x) & 63))
-		for (z = 0; z < no; ++z) {
-			qc_chain_t *c = &ch[ord[z]];
-			for (j = 0; j < c->n_idx; ++j) {
-				const qc_pt_t *v = &pts[c->idx[j]];
-				int64_t b0, b1, x, tot, got;
-				if (j > 0) { // the gap before this anchor
-					const qc_pt_t *u = &pts[c->idx[j-1]];
-					int64_t g0 = u->r + k, g1 = v->r, skip = 0;
-					if (g1 > g0) {
-						tot = g1 - g0;
-						for (x = g0, got = 0; x < g1; ++x) got += QC_CLAIMED(x);
-						if (got * 2 >= tot) skip = 1;
-						else for (x = g0; x < g1; ++x) QC_CLAIM(x);
+		{
+			int pass2;
+			for (pass2 = 0; pass2 < 2; ++pass2) // 0: anchors + balanced gaps; 1: lopsided gaps
+			for (z = 0; z < no; ++z) {
+				qc_chain_t *c = &ch[ord[z]];
+				for (j = 0; j < c->n_idx; ++j) {
+					const qc_pt_t *v = &pts[c->idx[j]];
+					int64_t b0, b1, x, tot, got;
+					if (j > 0) { // the gap before this anchor
+						const qc_pt_t *u = &pts[c->idx[j-1]];
+						int64_t g0 = u->r + k, g1 = v->r, la = c->s? u->c - (v->c + k) : v->c - (u->c + k), lr = g1 - g0;
+						int64_t mx = lr > la? lr : la, mn = lr < la? lr : la;
+						int lopsided = mx > 2000 && mn * 2 < mx;
+						if (lopsided == pass2) {
+							int skip = 0, partial = 0;
+							if (g1 > g0) {
+								tot = g1 - g0;
+								for (x = g0, got = 0; x < g1; ++x) got += QC_CLAIMED(x);
+								if (got * 2 >= tot) skip = 1;
+								else if (pass2 && got * 10 >= tot) partial = 1;
+							}
+							if (partial) { // other chains aligned part of it: delete only what is left
+								int64_t run = 0;
+								for (x = g0; x <= g1; ++x) {
+									if (x < g1 && !QC_CLAIMED(x)) { QC_CLAIM(x); ++run; continue; }
+									if (run > 0) qa_event(&a->b, run, 1), run = 0;
+								}
+								if (la > 0) qa_event(&a->b, la, 0);
+							} else if (!skip) {
+								for (x = g0; x < g1; ++x) QC_CLAIM(x);
+								qa_gap(q->seq[rsid], q->seq[csid], u->r, u->c, v->r, v->c, c->s, k, qb, &a->b);
+							}
+						}
 					}
-					if (!skip) qa_gap(q->seq[rsid], q->seq[csid], u->r, u->c, v->r, v->c, c->s, k, qb, &a->b);
-				}
-				// the anchor itself (exact match)
-				b0 = v->r, b1 = v->r + k;
-				for (x = b0, got = 0; x < b1; ++x) got += QC_CLAIMED(x);
-				if (got * 2 < k) {
-					a->b.aln += k;
-					for (x = b0; x < b1; ++x) QC_CLAIM(x);
+					if (pass2 == 0) { // the anchor itself (exact match)
+						b0 = v->r, b1 = v->r + k;
+						for (x = b0, got = 0; x < b1; ++x) got += QC_CLAIMED(x);
+						if (got * 2 < k) {
+							a->b.aln += k;
+							for (x = b0; x < b1; ++x) QC_CLAIM(x);
+						}
+					}
 				}
 			}
 		}
@@ -693,7 +834,7 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 				if (w->type == QA_VSNP)
 					fprintf(qc_var_fp, "%s\t%s\t%ld\tSNP\t%c\t%c\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, nt[w->r < 6? w->r : 5], nt[w->a < 6? w->a : 5]);
 				else
-					fprintf(qc_var_fp, "%s\t%s\t%ld\tREP\t%ld\t%ld\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, (long)w->rlen, (long)w->alen);
+					fprintf(qc_var_fp, "%s\t%s\t%ld\tREP\t%ld\t%ld\t%d\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, (long)w->rlen, (long)w->alen, w->r);
 			}
 			pthread_mutex_unlock(&qc_chain_lock);
 			qb->n_v = 0;
@@ -713,7 +854,7 @@ static void qc_acc_merge(qc_acc_t *d, const qc_acc_t *x)
 	if (x->del_max > d->del_max) d->del_max = x->del_max;
 	d->tight_bp += x->tight_bp, d->tight_present += x->tight_present, d->tight_missing += x->tight_missing;
 	for (i = 0; i < x->n_ivl; ++i) qc_add_ivl(d, x->ivl[i].st, x->ivl[i].en, x->ivl[i].cls);
-	d->b.aln += x->b.aln, d->b.snp += x->b.snp, d->b.rep_n += x->b.rep_n;
+	d->b.aln += x->b.aln, d->b.snp += x->b.snp, d->b.rep_n += x->b.rep_n, d->b.snp_d10 += x->b.snp_d10, d->b.snp_d40 += x->b.snp_d40;
 	d->b.ins_n += x->b.ins_n, d->b.ins_bp += x->b.ins_bp, d->b.del_n += x->b.del_n, d->b.del_bp += x->b.del_bp;
 	if (x->b.ins_max > d->b.ins_max) d->b.ins_max = x->b.ins_max;
 	if (x->b.del_max > d->b.del_max) d->b.del_max = x->b.del_max;
@@ -794,7 +935,7 @@ static void qc_print_row(FILE *fp, const char *taxon, const char *chrom, int64_t
 		}
 	}
 	fprintf(fp, "%s\t%s\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%ld\t%ld\t%.6f\t%.6f"
-			"\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%.6f\t%.6f\t%.3f\t%ld\t%ld\t%ld\t%ld\t%ld\n",
+			"\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%.6f\t%.6f\t%.6f\t%.3f\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\t%ld\n",
 			taxon, chrom, (long)len, (long)n_anch, (long)a->n_pts, (long)mapped, len? (double)mapped / len : 0.0,
 			(long)inv, (long)other, (long)scaf, (long)(len - mapped), (long)a->n_chain, (long)a->n_chain_inv,
 			(long)a->ins_n, (long)a->ins_bp, (long)a->ins_max, (long)a->del_n, (long)a->del_bp, (long)a->del_max,
@@ -802,7 +943,7 @@ static void qc_print_row(FILE *fp, const char *taxon, const char *chrom, int64_t
 			(long)bs->snp, (long)ni, (long)bs->ins_n, (long)bs->del_n, (long)bs->ins_bp, (long)bs->del_bp,
 			len? (double)bs->aln / len : 0.0, len? (double)bs->del_bp / len : 0.0, len? (double)bs->ins_bp / len : 0.0,
 			ni? (double)(bs->ins_bp + bs->del_bp) / ni : 0.0, (long)q1, (long)q2, (long)q3,
-			(long)(bs->ins_max > bs->del_max? bs->ins_max : bs->del_max), (long)bs->rep_n);
+			(long)(bs->ins_max > bs->del_max? bs->ins_max : bs->del_max), (long)bs->rep_n, (long)bs->snp_d10, (long)bs->snp_d40);
 }
 
 
@@ -886,7 +1027,8 @@ static int qc_run(const qc_opt_t *opt, const rb3_sid_t *sid, const char *ref_pre
 		   "\tn_chain\tn_chain_inv\tins_n\tins_bp_lb\tins_max\tdel_n\tdel_bp_lb\tdel_max"
 		   "\ttight_bp\tfrac_tight\ttight_present\ttight_missing\tfrac_intact\tdiv_est"
 		   "\tnumSNPs\tnumIndels\tnumIns\tnumDel\tnumBasesInserted\tnumBasesDeleted\tpercentRefAligned\tpercentRefDeleted"
-		   "\tpercentRefInserted\tmeanIndelSize\tlowerQuartileIndelSize\tmedianIndelSize\tupperQuartileIndelSize\tlargestIndel\tnumReplacements\n");
+		   "\tpercentRefInserted\tmeanIndelSize\tlowerQuartileIndelSize\tmedianIndelSize\tupperQuartileIndelSize\tlargestIndel\tnumReplacements"
+		   "\tnumSNPs_localMismatch10\tnumSNPs_localMismatch40\n");
 	for (t = 0; t < q.n_taxa; ++t) {
 		qc_acc_t tot;
 		int64_t tl = 0, tanch = 0, tm = 0, tinv = 0, toth = 0, tsc = 0;

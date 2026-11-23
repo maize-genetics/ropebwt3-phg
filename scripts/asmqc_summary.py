@@ -67,6 +67,15 @@ def mb(x):
     return round(float(x) / 1e6, 2)
 
 
+def base_metrics(r):
+    """Base-level (asmqc-fa) columns, AnchorWave names; empty when the run had no base level."""
+    if 'numSNPs' not in r or (r.get('percentRefAligned') in (None, '', '0.000000')):
+        return {}
+    return {'snps': int(r['numSNPs']), 'indels': int(r['numIndels']), 'aligned': round(float(r['percentRefAligned']), 4),
+            'deleted': round(float(r['percentRefDeleted']), 4), 'bp_ins_mb': mb(r['numBasesInserted']),
+            'bp_del_mb': mb(r['numBasesDeleted']), 'median_indel': int(r['medianIndelSize']), 'largest_indel_mb': mb(r['largestIndel'])}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--qc', required=True)
@@ -108,8 +117,11 @@ def main():
             entry = {'chrom': n, 'ref_len_mb': mb(r['ref_len']), 'mapped': round(fm, 4),
                      'inv_mb': mb(r['inv_bp']), 'other_mb': mb(r['other_chr_bp']), 'scaf_mb': mb(r['scaf_bp']),
                      'ins_mb': mb(r['ins_bp_lb']), 'del_mb': mb(r['del_bp_lb']), 'div_est': float(r['div_est'])}
+            entry.update(base_metrics(r))
             awc = aw.get(taxon, {}).get(str(n))
             if awc:
+                entry['aw_deleted'] = round(float(awc['percentRefDeleted']), 4)
+                entry['aw_indels'] = int(float(awc['numIndels']))
                 entry['aw_mapped'] = round(float(awc['percentRefMapped']), 4)
                 entry['aw_aligned'] = round(float(awc['percentRefAligned']), 4)
                 entry['aw_snps'] = int(float(awc['numSNPs']))
@@ -160,11 +172,12 @@ def main():
                'n_check': n_check, 'n_note': n_note,
                'genome': {'mapped': round(gm, 4), 'inv_mb': mb(g['inv_bp']) if g else 0, 'other_mb': mb(g['other_chr_bp']) if g else 0,
                           'scaf_mb': mb(g['scaf_bp']) if g else 0, 'ins_mb': mb(g['ins_bp_lb']) if g else 0,
-                          'del_mb': mb(g['del_bp_lb']) if g else 0, 'div_est': dv},
+                          'del_mb': mb(g['del_bp_lb']) if g else 0, 'div_est': dv, **(base_metrics(g) if g else {})},
                'flags': flags, 'chroms': per}
         awg = aw.get(taxon, {}).get('ALL')
         if awg:
             rec['aw_genome'] = {'mapped': round(float(awg['percentRefMapped']), 4), 'aligned': round(float(awg['percentRefAligned']), 4),
+                                'deleted': round(float(awg['percentRefDeleted']), 4), 'median_indel': int(float(awg['medianIndelSize'])),
                                 'snps': int(float(awg['numSNPs'])), 'indels': int(float(awg['numIndels'])),
                                 'ins_mb': mb(awg['numBasesInserted']), 'del_mb': mb(awg['numBasesDeleted'])}
         out.append(rec)
@@ -174,11 +187,12 @@ def main():
     if a.out_json:
         json.dump({'thresholds': vars(a), 'div_median': med, 'div_mad': mad, 'lines': out}, open(a.out_json, 'w'), indent=1)
     fo = open(a.out_tsv, 'w') if a.out_tsv else sys.stdout
-    fo.write('line\tstatus\tn_check\tn_note\tgenome_mapped\tinv_mb\tother_chr_mb\tscaf_mb\tins_mb_lb\tdel_mb_lb\tdiv_est_per_kb\tflags\n')
+    fo.write('line\tstatus\tn_check\tn_note\tgenome_mapped\tinv_mb\tother_chr_mb\tscaf_mb\tins_mb_lb\tdel_mb_lb\tdiv_est_per_kb\tSNPs\taligned\tbp_ins_mb\tbp_del_mb\tflags\n')
     for r in out:
         g = r['genome']
         fo.write(f"{r['line']}\t{r['status']}\t{r['n_check']}\t{r['n_note']}\t{g['mapped']:.4f}\t{g['inv_mb']}\t{g['other_mb']}\t{g['scaf_mb']}"
-                 f"\t{g['ins_mb']}\t{g['del_mb']}\t{g['div_est']*1e3:.2f}\t{'; '.join(f['sev'].upper()+': '+f['text'] for f in r['flags'])}\n")
+                 f"\t{g['ins_mb']}\t{g['del_mb']}\t{g['div_est']*1e3:.2f}\t{g.get('snps','')}\t{g.get('aligned','')}\t{g.get('bp_ins_mb','')}\t{g.get('bp_del_mb','')}"
+                 f"\t{'; '.join(f['sev'].upper()+': '+f['text'] for f in r['flags'])}\n")
 
 
 if __name__ == '__main__':
