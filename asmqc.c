@@ -262,6 +262,83 @@ static int64_t qa_uniq_kmers(const uint8_t *s, int64_t l, int32_t sk, uint64_t *
 
 static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0);
 
+/* Seeds for a gap the way an FM-index / minimap2 sees it: every shared QA_CK-mer, repeats included
+ * (capped at QA_COCC copies per side), chained by dynamic programming (gain = newly matched bases,
+ * gap cost 0.01*k*|d| + 0.5*log2|d|) -- unique-k-mer seeding finds nothing in TE-rich gaps where
+ * every k-mer repeats. Returns the best chain's anchors, ascending in both coordinates. */
+static int QA_CK = 19, QA_COCC = 32; // tunable for experiments (env QA_CK / QA_COCC / QA_CMIN)
+static double QA_CMIN = 0.0;          // minimum chain score as a fraction of the shorter side
+#define QA_CMAXP 4000000
+#define QA_CH    64
+#define QA_CMAXD 5000
+static int64_t qa_kmers_all(const uint8_t *s, int64_t l, int32_t k, uint64_t **buf, int64_t *m)
+{
+	int64_t i, n = 0, len = 0;
+	uint64_t code = 0, mask = (1ULL << (2 * k)) - 1;
+	if (l < k) return 0;
+	if (l > *m) *m = l, *buf = (uint64_t*)realloc(*buf, l * sizeof(uint64_t));
+	for (i = 0; i < l; ++i) {
+		if (!qa_acgt(s[i])) { len = 0, code = 0; continue; }
+		code = (code << 2 | (uint64_t)(s[i] - 1)) & mask;
+		if (++len >= k) (*buf)[n++] = code << 30 | (uint64_t)(i - k + 1);
+	}
+	qsort(*buf, n, sizeof(uint64_t), qa_cmp_u64);
+	return n;
+}
+
+static int64_t qa_chain_kmers(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa_buf_t *b, int64_t **sr_, int64_t **sa_)
+{
+	int64_t nr, na, i, j, np = 0, best = -1, n, *pv;
+	uint64_t *pr;
+	double *f, bf = 0;
+	*sr_ = *sa_ = 0;
+	if (lr >= (1LL << 30) || la >= (1LL << 30)) return 0;
+	{ static int init = 0; if (!init) { char *e; init = 1;
+		if ((e = getenv("QA_CK"))) QA_CK = atoi(e);
+		if ((e = getenv("QA_COCC"))) QA_COCC = atoi(e);
+		if ((e = getenv("QA_CMIN"))) QA_CMIN = atof(e); } }
+	nr = qa_kmers_all(R, lr, QA_CK, &b->ka, &b->m_ka);
+	na = qa_kmers_all(A, la, QA_CK, &b->kb, &b->m_kb);
+	pr = (uint64_t*)malloc(QA_CMAXP * sizeof(uint64_t));
+	for (i = j = 0; i < nr && j < na && np < QA_CMAXP; ) {
+		uint64_t ci = b->ka[i] >> 30, cj = b->kb[j] >> 30;
+		int64_t i2 = i, j2 = j, x, y;
+		if (ci < cj) { while (i < nr && b->ka[i] >> 30 == ci) ++i; continue; }
+		if (ci > cj) { while (j < na && b->kb[j] >> 30 == cj) ++j; continue; }
+		while (i2 < nr && b->ka[i2] >> 30 == ci) ++i2;
+		while (j2 < na && b->kb[j2] >> 30 == cj) ++j2;
+		if (i2 - i <= QA_COCC && j2 - j <= QA_COCC)
+			for (x = i; x < i2; ++x) for (y = j; y < j2 && np < QA_CMAXP; ++y)
+				pr[np++] = (b->ka[x] & 0x3fffffff) << 32 | (b->kb[y] & 0x3fffffff);
+		i = i2, j = j2;
+	}
+	if (np == 0) { free(pr); return 0; }
+	qsort(pr, np, sizeof(uint64_t), qa_cmp_u64);
+	f = (double*)malloc(np * sizeof(double)), pv = (int64_t*)malloc(np * sizeof(int64_t));
+	for (i = 0; i < np; ++i) {
+		int64_t ri = (int64_t)(pr[i] >> 32), ai = (int64_t)(pr[i] & 0xffffffff);
+		double fi = QA_CK; int64_t pi = -1;
+		for (j = i - 1; j >= 0 && i - j <= QA_CH; --j) {
+			int64_t dr = ri - (int64_t)(pr[j] >> 32), da = ai - (int64_t)(pr[j] & 0xffffffff), d, g;
+			double sc;
+			if (dr <= 0 || da <= 0) continue;
+			d = dr > da? dr - da : da - dr;
+			if (d > QA_CMAXD) continue;
+			g = dr < da? dr : da; if (g > QA_CK) g = QA_CK;
+			sc = f[j] + g - (d? 0.01 * QA_CK * d + 0.5 * log2((double)d) : 0.0);
+			if (sc > fi) fi = sc, pi = j;
+		}
+		f[i] = fi, pv[i] = pi;
+		if (fi > bf) bf = fi, best = i;
+	}
+	if (best < 0 || bf < QA_CMIN * (lr < la? lr : la)) { free(pr); free(f); free(pv); return 0; }
+	for (n = 0, i = best; i >= 0; i = pv[i]) ++n;
+	*sr_ = (int64_t*)malloc(n * sizeof(int64_t)), *sa_ = (int64_t*)malloc(n * sizeof(int64_t));
+	for (j = n, i = best; i >= 0; i = pv[i]) --j, (*sr_)[j] = (int64_t)(pr[i] >> 32), (*sa_)[j] = (int64_t)(pr[i] & 0xffffffff);
+	free(pr); free(f); free(pv);
+	return n;
+}
+
 /* Lopsided or repetitive gap with no shared unique seeds (e.g. a full TE in the reference, a solo LTR in
  * the assembly): find where the shorter sequence sits in the longer one by voting on diagonals with
  * (possibly repeated) QA_VK-mers, align it to that window, and count the rest of the longer sequence as
@@ -329,9 +406,13 @@ static int qa_diag(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, q
 static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
 {
 	int64_t nr, na, i, j, ns = 0, *sr, *sa, *tail, *prev, nl = 0, *keep, nk, pr, pa, rb = r0;
-	int32_t sk = QA_SK, pass;
+	int32_t sk = QA_CK, pass, chained;
 	sr = sa = 0;
-	for (pass = 0; pass < 2 && ns == 0; ++pass) { // unique 17-mers; if none are shared, unique 13-mers
+	// experimental (off by default, QA_CHAIN=1): all shared k-mers incl. repeats, best chain; on Oh43 chr10
+	// it did not recover more AnchorWave SNPs than unique-k-mer seeding (k=11-19 tried)
+	ns = getenv("QA_CHAIN")? qa_chain_kmers(R, lr, A, la, b, &sr, &sa) : 0;
+	chained = ns > 0;
+	for (pass = 0; pass < 2 && ns == 0; ++pass) { // fallback: unique 17-mers; if none are shared, unique 13-mers
 		sk = pass == 0? QA_SK : QA_SK2;
 		nr = qa_uniq_kmers(R, lr, sk, &b->ka, &b->m_ka);
 		na = qa_uniq_kmers(A, la, sk, &b->kb, &b->m_kb);
@@ -346,7 +427,7 @@ static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la
 		}
 	}
 	if (ns == 0) { free(sr); free(sa); if (!qa_diag(R, lr, A, la, b, st, r0) && qa_ksw(R, lr, A, la, b, st, r0, 1) != 1) qa_replace(st, lr, la, b, r0, 1); return; }
-	{ // order by reference position, then longest increasing subsequence on assembly position
+	if (!chained) { // order by reference position, then longest increasing subsequence on assembly position
 		uint64_t *o = (uint64_t*)malloc(ns * sizeof(uint64_t));
 		int64_t *tr = (int64_t*)malloc(ns * sizeof(int64_t)), *ta = (int64_t*)malloc(ns * sizeof(int64_t));
 		for (i = 0; i < ns; ++i) o[i] = (uint64_t)sr[i] << 32 | (uint64_t)i;
@@ -356,7 +437,10 @@ static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la
 		free(o); free(tr); free(ta);
 	}
 	tail = (int64_t*)malloc(ns * sizeof(int64_t)), prev = (int64_t*)malloc(ns * sizeof(int64_t));
-	for (i = 0; i < ns; ++i) {
+	if (chained) { // the chain is already collinear: keep every anchor
+		for (i = 0; i < ns; ++i) tail[i] = i, prev[i] = i - 1;
+		nl = ns;
+	} else for (i = 0; i < ns; ++i) {
 		int64_t lo = 0, hi = nl;
 		while (lo < hi) { int64_t mid = (lo + hi) >> 1; if (sa[tail[mid]] < sa[i]) lo = mid + 1; else hi = mid; }
 		prev[i] = lo > 0? tail[lo - 1] : -1;
