@@ -100,6 +100,8 @@ typedef struct {
 } qa_buf_t;
 #define QA_VSNP 0
 #define QA_VREP 1
+#define QA_VINS 2
+#define QA_VDEL 3
 
 static inline void qa_var_push(qa_var_t **v, int64_t *n, int64_t *m, int64_t pos, int64_t rlen, int64_t alen, uint8_t r, uint8_t a, uint8_t type)
 {
@@ -120,8 +122,9 @@ static void qa_buf_free(qa_buf_t *b)
 	memset(b, 0, sizeof(*b));
 }
 
-static inline void qa_event(qa_stat_t *st, int64_t len, int is_del)
+static inline void qa_event(qa_stat_t *st, int64_t len, int is_del, qa_buf_t *b, int64_t pos) // pos: reference position (0-based)
 {
+	if (len > 0 && b && b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, pos, is_del? len : 0, is_del? 0 : len, 0, 0, is_del? QA_VDEL : QA_VINS);
 	int64_t bin = len < QA_HIST? len : QA_HIST - 1;
 	if (len <= 0) return;
 	if (st->hist == 0) st->hist = (int64_t*)calloc(2 * QA_HIST, sizeof(int64_t));
@@ -133,8 +136,8 @@ static inline void qa_event(qa_stat_t *st, int64_t len, int is_del)
 static void qa_replace(qa_stat_t *st, int64_t lr, int64_t la, qa_buf_t *b, int64_t r0, int why)
 {
 	if (b->dump) qa_var_push(&b->v, &b->n_v, &b->m_v, r0, lr, la, (uint8_t)why, 0, QA_VREP);
-	if (lr > 0) qa_event(st, lr, 1);
-	if (la > 0) qa_event(st, la, 0);
+	if (lr > 0) qa_event(st, lr, 1, 0, r0); // the REP record already describes it
+	if (la > 0) qa_event(st, la, 0, 0, r0);
 	if (lr > 0 && la > 0) st->rep_n++;
 }
 
@@ -222,8 +225,8 @@ static int qa_ksw(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa
 				}
 			}
 			st->aln += len;
-		} else if (op == 1) { qa_event(st, len, 0); j += len; } // I: assembly has extra bases
-		else if (op == 2) { qa_event(st, len, 1); i += len; }   // D: reference bases missing
+		} else if (op == 1) { qa_event(st, len, 0, b, r0 + i); j += len; } // I: assembly has extra bases
+		else if (op == 2) { qa_event(st, len, 1, b, r0 + i); i += len; }   // D: reference bases missing
 	}
 	st->snp += n_snp;
 	qa_snp_classes(sp, n_snp, st);
@@ -398,8 +401,8 @@ static int qa_diag(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, q
 	r = ref_long? qa_ksw(R + ws, we - ws, A, la, b, st, r0 + ws, 1)
 	             : qa_ksw(R, lr, A + ws, we - ws, b, st, r0, 1);
 	if (r != 1) return 0;
-	if (ref_long) { if (ws > 0) qa_event(st, ws, 1); if (ll - we > 0) qa_event(st, ll - we, 1); }
-	else { if (ws > 0) qa_event(st, ws, 0); if (ll - we > 0) qa_event(st, ll - we, 0); }
+	if (ref_long) { if (ws > 0) qa_event(st, ws, 1, b, r0); if (ll - we > 0) qa_event(st, ll - we, 1, b, r0 + we); }
+	else { if (ws > 0) qa_event(st, ws, 0, b, r0); if (ll - we > 0) qa_event(st, ll - we, 0, b, r0 + lr); }
 	return 1;
 }
 
@@ -493,8 +496,8 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 {
 	int64_t i, Lr, La, Rr, Ra;
 	if (lr <= 0 && la <= 0) return;
-	if (lr <= 0) { qa_event(st, la, 0); return; }
-	if (la <= 0) { qa_event(st, lr, 1); return; }
+	if (lr <= 0) { qa_event(st, la, 0, b, r0); return; }
+	if (la <= 0) { qa_event(st, lr, 1, b, r0); return; }
 	if (lr == la) { // gapless fast path
 		int64_t mm = 0, lim = (int64_t)(QA_GAPLESS_MM * lr);
 		for (i = 0; i < lr && mm <= lim; ++i)
@@ -527,8 +530,8 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 	}
 	if (Lr >= lr || La >= la) { // one side used up: aligned piece, then the rest of the other side is one indel
 		if (qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace(st, Lr, La, b, r0, 3);
-		if (lr > Lr) qa_event(st, lr - Lr, 1);
-		if (la > La) qa_event(st, la - La, 0);
+		if (lr > Lr) qa_event(st, lr - Lr, 1, b, r0 + Lr);
+		if (la > La) qa_event(st, la - La, 0, b, r0 + Lr);
 		return;
 	}
 	qa_extend(R + Lr, lr - Lr, A + La, la - La, 1, &Rr, &Ra);
@@ -538,8 +541,8 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 		const uint8_t *MR = R + Lr, *MA = A + La;
 		int64_t mr = lr - Lr - Rr, ma = la - La - Ra, m0 = r0 + Lr;
 		if (mr <= 0 || ma <= 0) { // a clean indel (one side empty)
-			if (mr > 0) qa_event(st, mr, 1);
-			if (ma > 0) qa_event(st, ma, 0);
+			if (mr > 0) qa_event(st, mr, 1, b, m0);
+			if (ma > 0) qa_event(st, ma, 0, b, m0);
 			return;
 		}
 		if (depth >= 3 || (Lr == 0 && Rr == 0 && depth > 0)) { // nothing more to find: best of alignment vs replacement
@@ -568,7 +571,7 @@ static void qa_gap(const uint8_t *rs, const uint8_t *cs, int64_t ur, int64_t uc,
 	}
 	if (lr < 0 || la < 0) { // anchors overlap on one side: net indel only
 		int64_t d = la - lr; // = delta_asm - delta_ref
-		if (d > 0) qa_event(st, d, 0); else if (d < 0) qa_event(st, -d, 1);
+		if (d > 0) qa_event(st, d, 0, b, ur + k); else if (d < 0) qa_event(st, -d, 1, b, ur + k);
 		return;
 	}
 	qa_align(R, lr, A, la, 0, b, st, ur + k);
@@ -886,9 +889,9 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 								int64_t run = 0;
 								for (x = g0; x <= g1; ++x) {
 									if (x < g1 && !QC_CLAIMED(x)) { QC_CLAIM(x); ++run; continue; }
-									if (run > 0) qa_event(&a->b, run, 1), run = 0;
+									if (run > 0) qa_event(&a->b, run, 1, qb, x - run), run = 0;
 								}
-								if (la > 0) qa_event(&a->b, la, 0);
+								if (la > 0) qa_event(&a->b, la, 0, qb, g0);
 							} else if (!skip) {
 								for (x = g0; x < g1; ++x) QC_CLAIM(x);
 								qa_gap(q->seq[rsid], q->seq[csid], u->r, u->c, v->r, v->c, c->s, k, qb, &a->b);
@@ -917,8 +920,10 @@ static void qc_chain_group(const qc_ctx_t *q, qc_acc_t *a, int32_t csid, int32_t
 				const qa_var_t *w = &qb->v[z2];
 				if (w->type == QA_VSNP)
 					fprintf(qc_var_fp, "%s\t%s\t%ld\tSNP\t%c\t%c\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, nt[w->r < 6? w->r : 5], nt[w->a < 6? w->a : 5]);
-				else
+				else if (w->type == QA_VREP)
 					fprintf(qc_var_fp, "%s\t%s\t%ld\tREP\t%ld\t%ld\t%d\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, (long)w->rlen, (long)w->alen, w->r);
+				else
+					fprintf(qc_var_fp, "%s\t%s\t%ld\t%s\t%ld\t%ld\n", q->sid->name[csid], q->sid->name[rsid], (long)w->pos + 1, w->type == QA_VDEL? "DEL" : "INS", (long)w->rlen, (long)w->alen);
 			}
 			pthread_mutex_unlock(&qc_chain_lock);
 			qb->n_v = 0;
