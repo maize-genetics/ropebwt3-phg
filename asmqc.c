@@ -406,6 +406,18 @@ static int qa_diag(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, q
 	return 1;
 }
 
+/* Before calling a segment replaced: if the two sides share sequence on some diagonal (11-mer voting,
+ * repeats allowed), align that window with AnchorWave's scoring and keep it when it beats replacement;
+ * the rest of the longer side is one indel. Off by default (QA_RESCUE=1): on Oh43 chr10 it added only
+ * 0.1% shared AnchorWave SNPs (684,773 -> 685,382). */
+static void qa_replace_or_rescue(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, qa_buf_t *b, qa_stat_t *st, int64_t r0, int why)
+{
+	static int on = -1;
+	if (on < 0) { char *e = getenv("QA_RESCUE"); on = e? atoi(e) : 0; }
+	if (on && lr >= 200 && la >= 200 && qa_diag(R, lr, A, la, b, st, r0)) return;
+	qa_replace(st, lr, la, b, r0, why);
+}
+
 static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
 {
 	int64_t nr, na, i, j, ns = 0, *sr, *sa, *tail, *prev, nl = 0, *keep, nk, pr, pa, rb = r0;
@@ -520,23 +532,23 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 	// small and near-diagonal: one global alignment (or a replacement if that scores better)
 	if (lr <= 2000 && la <= 2000 && (lr > la? lr - la : la - lr) <= QA_KSW_W) {
 		if (qa_ksw(R, lr, A, la, b, st, r0, 1) == 1) return;
-		if (depth > 0) { qa_replace(st, lr, la, b, r0, 3); return; }
+		if (depth > 0) { qa_replace_or_rescue(R, lr, A, la, b, st, r0, 3); return; }
 	}
 	// breakpoints: extend from both flanking anchors
 	qa_extend(R, lr, A, la, 0, &Lr, &La);
 	if (Lr >= lr && La >= la) { // the extension crossed the whole gap
-		if (qa_ksw(R, lr, A, la, b, st, r0, 1) != 1) qa_replace(st, lr, la, b, r0, 3);
+		if (qa_ksw(R, lr, A, la, b, st, r0, 1) != 1) qa_replace_or_rescue(R, lr, A, la, b, st, r0, 3);
 		return;
 	}
 	if (Lr >= lr || La >= la) { // one side used up: aligned piece, then the rest of the other side is one indel
-		if (qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace(st, Lr, La, b, r0, 3);
+		if (qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace_or_rescue(R, Lr, A, La, b, st, r0, 3);
 		if (lr > Lr) qa_event(st, lr - Lr, 1, b, r0 + Lr);
 		if (la > La) qa_event(st, la - La, 0, b, r0 + Lr);
 		return;
 	}
 	qa_extend(R + Lr, lr - Lr, A + La, la - La, 1, &Rr, &Ra);
-	if (Lr > 0 && qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace(st, Lr, La, b, r0, 3);
-	if (Rr > 0 && qa_ksw(R + lr - Rr, Rr, A + la - Ra, Ra, b, st, r0 + lr - Rr, 0) != 1) qa_replace(st, Rr, Ra, b, r0 + lr - Rr, 3);
+	if (Lr > 0 && qa_ksw(R, Lr, A, La, b, st, r0, 0) != 1) qa_replace_or_rescue(R, Lr, A, La, b, st, r0, 3);
+	if (Rr > 0 && qa_ksw(R + lr - Rr, Rr, A + la - Ra, Ra, b, st, r0 + lr - Rr, 0) != 1) qa_replace_or_rescue(R + lr - Rr, Rr, A + la - Ra, Ra, b, st, r0 + lr - Rr, 3);
 	{ // the middle, between the two breakpoints
 		const uint8_t *MR = R + Lr, *MA = A + La;
 		int64_t mr = lr - Lr - Rr, ma = la - La - Ra, m0 = r0 + Lr;
@@ -546,7 +558,7 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 			return;
 		}
 		if (depth >= 3 || (Lr == 0 && Rr == 0 && depth > 0)) { // nothing more to find: best of alignment vs replacement
-			if (qa_ksw(MR, mr, MA, ma, b, st, m0, 1) != 1) qa_replace(st, mr, ma, b, m0, depth >= 3? 2 : 1);
+			if (qa_ksw(MR, mr, MA, ma, b, st, m0, 1) != 1) qa_replace_or_rescue(MR, mr, MA, ma, b, st, m0, depth >= 3? 2 : 1);
 			return;
 		}
 		qa_seeded(MR, mr, MA, ma, depth, b, st, m0);
