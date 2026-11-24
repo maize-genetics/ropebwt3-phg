@@ -1,5 +1,8 @@
 # asmqc: fast assembly-vs-reference QC
 
+> New to asmqc? Read the user guide first: [asmqc-guide.md](asmqc-guide.md). This page is the technical
+> reference (method, columns, validation, options).
+
 `ropebwt3 asmqc` and `ropebwt3 asmqc-fa` compare genome assemblies with a reference (e.g. B73) and report
 the same kind of numbers PHGv2 computes from an AnchorWave alignment — mapped / identical / deleted /
 inserted bp, SNPs, indels — plus structural flags (low coverage, inversions, sequence on other chromosomes

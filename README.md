@@ -2,8 +2,9 @@
 > Heng Li (MIT licensed). It adds [`refmap`](#refmap) for placing pangenome queries
 > on a designated reference genome, [`chain`](#chain) for uniting an RNAseq read's
 > SMEMs across splice junctions, [`lift`](#refmap) for building the
-> assembly→reference coordinate map both rely on, and [`extract`/`isa`](#extract) for
-> reading sequence out of the index by coordinate. It also adds paired-end input
+> assembly→reference coordinate map both rely on, [`extract`/`isa`](#extract) for
+> reading sequence out of the index by coordinate, and [`asmqc`/`asmqc-fa`](#asmqc) for
+> fast assembly QC against a reference ([user guide](docs/asmqc-guide.md)). It also adds paired-end input
 > (`--paired`) to `refmap`, `mem`, `sw` and `chain`, plus the read filters used by the
 > [GRITS pipeline](#grits); [docs/grits-overview.md](docs/grits-overview.md) summarises
 > them in plain language. The original code and license are unchanged — see
@@ -705,14 +706,36 @@ Design notes and measured results:
 
 ### <a name="asmqc"></a>Assembly QC against a reference (`asmqc`, `asmqc-fa`)
 
-`ropebwt3 asmqc-fa B73.fa line1.fa line2.fa ...` screens assemblies against a reference
-straight from FASTA (no index build; ~2.3 min and ~7.5 GB per maize line at 24 threads):
-mapped / identical / inserted / deleted bp, SNPs and indels with AnchorWave's 2-piece
-affine gap model, plus inversions, translocations and sequence left on scaffolds.
-`ropebwt3 asmqc` gives the anchor-level (structural) part in seconds from an existing
-index's `.lift`. Use it to decide which assemblies go into a pangenome index before
-building it. See [docs/asmqc.md](docs/asmqc.md) for usage, method, output columns and
-the comparison with AnchorWave on 24 NAM founders.
+Check new genome assemblies against a reference **before** they go into a pangenome index. For each
+assembly and chromosome, `asmqc-fa` reports how much of the reference is found in order (mapped), what is
+inverted, on another chromosome or left on unplaced scaffolds, and the SNPs, insertions and deletions —
+the same kind of numbers PHGv2 gets from an AnchorWave alignment, in about 2–3 minutes and ~7.5 GB per
+maize assembly (24 threads) instead of ~1.5–2 hours and ~280 GB.
+
+```sh
+# screen a batch of candidates against B73 (no index needed)
+ropebwt3 asmqc-fa -t 24 --chains batch.chains.tsv B73.fa lineA.fa lineB.fa > batch.qc.tsv
+# one row per line with check / note flags for review
+python3 scripts/asmqc_summary.py --qc batch.qc.tsv --chains batch.chains.tsv --out-tsv batch.summary.tsv
+```
+
+```
+Oh7B    check  CHECK: chr10: only 71.2% of B73 in syntenic chains; CHECK: chr10: 44.2 Mb on other chromosomes; ...
+Tzi8    check  CHECK: chr7: 38.5 Mb on unplaced scaffolds
+B97     clean
+```
+
+* `asmqc-fa ref.fa asm.fa...` — from FASTA: anchors, chains, and base-level alignment between anchors with
+  AnchorWave's 2-piece affine gap model (ksw2). `--chains` / `--variants` write where each reference
+  region went and every SNP/INS/DEL with its position.
+* `asmqc --ref-prefix=B73 -k K -s S idx.lift idx.fmd.len.gz` — the structural part only, in seconds, from
+  an existing index's `.lift` (no SNPs).
+* `scripts/asmqc_summary.py`, `scripts/asmqc_vs_anchorwave.py` — review flags; agreement with
+  `phg calc-vcf-metrics` output.
+
+Start with the user guide, [docs/asmqc-guide.md](docs/asmqc-guide.md) (what it does, quick start, reading
+the output and flags, review workflow, FAQ). The method, all output columns, the validation against
+AnchorWave on 24 NAM founders and the experimental switches are in [docs/asmqc.md](docs/asmqc.md).
 
 ### <a name="deprecated"></a>Deprecated
 
