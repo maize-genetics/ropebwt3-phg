@@ -703,6 +703,17 @@ Design notes and measured results:
 [Extracting sequence by coordinate](#extract) (`isa`/`extract`), and
 [docs/lift-second-ssa.md](docs/lift-second-ssa.md) (the lift).
 
+### <a name="asmqc"></a>Assembly QC against a reference (`asmqc`, `asmqc-fa`)
+
+`ropebwt3 asmqc-fa B73.fa line1.fa line2.fa ...` screens assemblies against a reference
+straight from FASTA (no index build; ~2.3 min and ~7.5 GB per maize line at 24 threads):
+mapped / identical / inserted / deleted bp, SNPs and indels with AnchorWave's 2-piece
+affine gap model, plus inversions, translocations and sequence left on scaffolds.
+`ropebwt3 asmqc` gives the anchor-level (structural) part in seconds from an existing
+index's `.lift`. Use it to decide which assemblies go into a pangenome index before
+building it. See [docs/asmqc.md](docs/asmqc.md) for usage, method, output columns and
+the comparison with AnchorWave on 24 NAM founders.
+
 ### <a name="deprecated"></a>Deprecated
 
 These paths are superseded and will be removed. They are documented here only so

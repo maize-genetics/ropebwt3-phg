@@ -91,6 +91,7 @@ test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing 
 		./test/test_errprof
 		./test/test_edstats
 		cd test && ./run_integration.sh
+		cd test && ./run_asmqc.sh
 
 clean:
 		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/test_errprof test/test_edstats test/output test/tmp

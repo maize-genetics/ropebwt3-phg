@@ -39,6 +39,7 @@ experiments/ref-sensitivity/e4/*.log
 /test/test_extract
 /test/output/
 /test/tmp/
+/test/tmp_asmqc/
 test/test_pairing
 test/test_errprof
 test/test_edstats
