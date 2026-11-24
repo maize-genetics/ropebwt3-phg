@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Agreement between `ropebwt3 asmqc-fa` output and PHGv2 AnchorWave assembly metrics.
+"""Agreement between `ropebwt3 asmqc-fa` output and PHGv2 AnchorWave assembly metrics
+(`phg calc-vcf-metrics` TSV, or the older PHG metrics CSV).
 
 Usage:
   asmqc_vs_anchorwave.py --qc asmqc.tsv --anchorwave phg_metrics.csv [--json out.json]
@@ -39,10 +40,23 @@ def main():
     ap.add_argument('--qc', required=True); ap.add_argument('--anchorwave', required=True); ap.add_argument('--json')
     a = ap.parse_args()
     aw = {}
-    rows = list(csv.reader(open(a.anchorwave))); hdr = rows[0]
-    for r in rows[1:]:
-        if len(r) > 4 and r[2].isdigit() and r[1]:
-            aw[(r[0], int(r[2]))] = {h: r[i] for i, h in enumerate(hdr) if i >= 4 and h}
+    if open(a.anchorwave).readline().startswith('taxa\t'):  # phg calc-vcf-metrics TSV
+        for r in csv.DictReader(open(a.anchorwave), delimiter='\t'):
+            n = chrom_num(r['chrom'])
+            if n is None:
+                continue
+            L = float(r['refLength'])
+            aw[(r['taxa'], n)] = {'totalBases': r['refLength'], 'percentRefMapped': r['percentMappedToRef'],
+                                  # aligned columns = identical + mismatched bases
+                                  'percentRefAligned': str(float(r['percentIdentityWithRef']) + int(r['numSNPs']) / L),
+                                  'percentRefDeleted': str(int(r['numBasesDeleted']) / L),
+                                  'numBasesInserted': r['numBasesInserted'], 'numBasesDeleted': r['numBasesDeleted'],
+                                  'numIndels': str(int(r['numIns']) + int(r['numDel'])), 'numSNPs': r['numSNPs']}
+    else:  # older PHG metrics CSV: name, method, chrom, '', metrics...
+        rows = list(csv.reader(open(a.anchorwave))); hdr = rows[0]
+        for r in rows[1:]:
+            if len(r) > 4 and r[2].isdigit() and r[1]:
+                aw[(r[0], int(r[2]))] = {h: r[i] for i, h in enumerate(hdr) if i >= 4 and h}
     qc = {}
     for r in csv.DictReader(open(a.qc), delimiter='\t'):
         n = chrom_num(r['chrom'])

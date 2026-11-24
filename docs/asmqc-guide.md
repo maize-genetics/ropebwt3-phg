@@ -201,7 +201,7 @@ python3 scripts/asmqc_vs_anchorwave.py --qc batch.qc.tsv --anchorwave aw_metrics
 
 What to expect (24 NAM founders, details in [asmqc.md](asmqc.md)): mapped, identical, inserted and
 deleted bp agree with AnchorWave within a few percent and correlate at r ≥ 0.98; insertion/deletion event
-counts are ~0.84×; **SNP counts are lower, at a near-constant ratio** across lines, so lines rank the same.
+counts are ~0.77×; **SNP counts are lower, at a near-constant ratio** across lines, so lines rank the same.
 Only compare against AnchorWave runs on the *same* assembly files — metrics from older runs can differ by
 >15% in SNP count by themselves.
 

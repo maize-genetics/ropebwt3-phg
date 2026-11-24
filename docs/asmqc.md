@@ -13,7 +13,7 @@ the lines that pass.
 | | `asmqc-fa` | AnchorWave + gVCF (PHGv2 `align-assemblies`) |
 |---|---|---|
 | Input | reference FASTA + assembly FASTA(s) | same |
-| Time per maize line, 24 threads | ~2.3 min | 90–108 min |
+| Time per maize line, 24 threads | ~2.2 min | 90–108 min |
 | Peak memory | ~7.5 GB | ~278 GB |
 
 ## Two modes
@@ -103,10 +103,10 @@ review.
 | Identical bp | 1.02 (1.00–1.03) | 0.984 | 0.997 |
 | Inserted bp | 1.02 (1.00–1.03) | 0.991 | 0.994 |
 | Deleted bp | 1.01 (0.99–1.02) | 0.991 | 0.995 |
-| Insertion + deletion events | 0.84 (0.82–0.86) | 0.984 | 0.990 |
-| SNPs | 0.75 (0.72–0.76) | 0.949 | 0.969 |
+| Insertion + deletion events | 0.77 (0.76–0.78) | 0.986 | 0.991 |
+| SNPs | 0.72 (0.69–0.74) | 0.946 | 0.969 |
 
-**Why SNPs are ~0.75×.** On Oh43 chr10, ~90% of the AnchorWave SNPs asmqc does not call lie in reference
+**Why SNPs are ~0.72×.** On Oh43 chr10, ~90% of the AnchorWave SNPs asmqc does not call lie in reference
 sequence asmqc reports as deleted or replaced. Mapping those reference segments to the whole Oh43 genome
 (minimap2, evaluation only): for 87% of those SNPs the sequence's ≥90%-identity copy is elsewhere in
 Oh43 (> 200 kb away or another chromosome) — it is a TE-type sequence absent at that locus, which
