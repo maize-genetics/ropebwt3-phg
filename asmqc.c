@@ -482,6 +482,35 @@ static void qa_seeded(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la
 	free(sr); free(sa); free(tail); free(prev); free(keep);
 }
 
+static void qa_stat_add(qa_stat_t *d, const qa_stat_t *x)
+{
+	int64_t i;
+	d->aln += x->aln, d->snp += x->snp, d->rep_n += x->rep_n, d->pen += x->pen, d->snp_d10 += x->snp_d10, d->snp_d40 += x->snp_d40;
+	d->ins_n += x->ins_n, d->ins_bp += x->ins_bp, d->del_n += x->del_n, d->del_bp += x->del_bp;
+	if (x->ins_max > d->ins_max) d->ins_max = x->ins_max;
+	if (x->del_max > d->del_max) d->del_max = x->del_max;
+	if (x->hist) {
+		if (d->hist == 0) d->hist = (int64_t*)calloc(2 * QA_HIST, sizeof(int64_t));
+		for (i = 0; i < 2 * QA_HIST; ++i) d->hist[i] += x->hist[i];
+	}
+}
+
+/* Seed-split-and-recurse is a sequence of locally optimal choices; a chance seed between unrelated
+ * sequences can make the sum worse than replacing the whole segment. Keep whichever has the lower
+ * AnchorWave penalty (variant records of the discarded option are rolled back). */
+static void qa_seeded_or_replace(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la, int depth, qa_buf_t *b, qa_stat_t *st, int64_t r0)
+{
+	qa_stat_t t;
+	int64_t n_v0 = b->n_v;
+	memset(&t, 0, sizeof(t));
+	qa_seeded(R, lr, A, la, depth, b, &t, r0);
+	if (t.pen > qa_gapcost(lr) + qa_gapcost(la)) {
+		b->n_v = n_v0;
+		qa_replace(st, lr, la, b, r0, 1);
+	} else qa_stat_add(st, &t);
+	free(t.hist);
+}
+
 /* Extend from the start of R/A (or from the end when rev) with z-drop: SNPs and small indels are
  * crossed, extension stops where similarity collapses (an indel / rearrangement breakpoint).
  * Extension needs a positive match score; the extended pieces are re-aligned with AnchorWave's
@@ -563,7 +592,7 @@ static void qa_align(const uint8_t *R, int64_t lr, const uint8_t *A, int64_t la,
 			if (qa_ksw(MR, mr, MA, ma, b, st, m0, 1) != 1) qa_replace_or_rescue(MR, mr, MA, ma, b, st, m0, depth >= 3? 2 : 1);
 			return;
 		}
-		qa_seeded(MR, mr, MA, ma, depth, b, st, m0);
+		qa_seeded_or_replace(MR, mr, MA, ma, depth, b, st, m0);
 	}
 }
 

@@ -75,13 +75,20 @@ test/test_errprof.o:test/test_errprof.c
 test/test_errprof:test/test_errprof.o errprof.o
 		$(CC) $(CFLAGS) $^ -o $@ -lm
 
+test/test_asmqc.o:test/test_asmqc.c asmqc.c ksw2.h lift.h io.h
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
+
+# test_asmqc includes asmqc.c itself (its helpers are static), so it links asmqc.o's dependencies, not asmqc.o
+test/test_asmqc:test/test_asmqc.o ksw2_extd2_sse.o dawg.o libsais.o lift.o ps4g.o fm-index.o ssa.o kalloc.o kthread.o misc.o io.o rld0.o bre.o rle.o rope.o mrope.o
+		$(CC) $(CFLAGS) $^ -o $@ -lpthread -lz -lm
+
 test/test_edstats.o:test/test_edstats.c
 		$(CC) -c $(CFLAGS) $(CPPFLAGS) -I. $< -o $@
 
 test/test_edstats:test/test_edstats.o edstats.o errprof.o
 		$(CC) $(CFLAGS) $^ -o $@ -lm
 
-test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/test_errprof test/test_edstats
+test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/test_errprof test/test_edstats test/test_asmqc
 		@mkdir -p test/output
 		./test/test_ps4g test/output
 		./test/test_hitcount
@@ -90,11 +97,12 @@ test:$(PROG) test/test_ps4g test/test_hitcount test/test_lift test/test_pairing 
 		./test/test_extract test/output
 		./test/test_errprof
 		./test/test_edstats
+		./test/test_asmqc
 		cd test && ./run_integration.sh
 		cd test && ./run_asmqc.sh
 
 clean:
-		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/test_errprof test/test_edstats test/output test/tmp
+		rm -fr *.o a.out $(PROG) *~ *.a *.dSYM test/*.o test/test_ps4g test/test_hitcount test/test_lift test/test_pairing test/test_extract test/test_errprof test/test_edstats test/test_asmqc test/output test/tmp test/tmp_asmqc
 
 # Regenerate the header dependencies below (everything after "DO NOT DELETE") with the
 # compiler's -MM; run `make depend` after adding a source file or changing an #include.
