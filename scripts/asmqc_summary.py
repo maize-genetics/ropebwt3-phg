@@ -46,8 +46,34 @@ def load_chains(fn):
 
 
 def load_anchorwave(fn):
+    """PHGv2 metrics: the older CSV (name, method, chrom, '', ...) or `phg calc-vcf-metrics` TSV (taxa, chrom,
+    refLength, numSNPs, ...). The TSV is mapped onto the CSV column names; ALL = chr1-10 totals."""
     aw = {}
     if not fn:
+        return aw
+    first = open(fn).readline()
+    if first.startswith('taxa\t'):
+        tot = {}
+        for r in csv.DictReader(open(fn), delimiter='\t'):
+            n = chrom_num(r['chrom'])
+            if n is None or not 1 <= n <= 10:
+                continue
+            L = float(r['refLength'])
+            d = {'percentRefMapped': r['percentMappedToRef'], 'percentRefAligned': r['percentIdentityWithRef'],
+                 'percentRefDeleted': str(float(r['numBasesDeleted']) / L), 'numSNPs': r['numSNPs'],
+                 'numIndels': str(int(r['numIns']) + int(r['numDel'])), 'numBasesInserted': r['numBasesInserted'],
+                 'numBasesDeleted': r['numBasesDeleted'], 'largestDelSize': r['largestDeletion'],
+                 'medianIndelSize': r['medianDeletionSize'], 'totalBases': r['refLength']}
+            aw.setdefault(r['taxa'], {})[str(n)] = d
+            t = tot.setdefault(r['taxa'], {'L': 0, 'map': 0, 'ident': 0, 'snp': 0, 'ind': 0, 'ins': 0, 'del': 0, 'big': 0})
+            t['L'] += L; t['map'] += float(r['percentMappedToRef']) * L; t['ident'] += float(r['percentIdentityWithRef']) * L
+            t['snp'] += int(r['numSNPs']); t['ind'] += int(r['numIns']) + int(r['numDel'])
+            t['ins'] += int(r['numBasesInserted']); t['del'] += int(r['numBasesDeleted']); t['big'] = max(t['big'], int(r['largestDeletion']))
+        for taxon, t in tot.items():
+            aw[taxon]['ALL'] = {'percentRefMapped': str(t['map'] / t['L']), 'percentRefAligned': str(t['ident'] / t['L']),
+                                'percentRefDeleted': str(t['del'] / t['L']), 'numSNPs': str(t['snp']), 'numIndels': str(t['ind']),
+                                'numBasesInserted': str(t['ins']), 'numBasesDeleted': str(t['del']), 'largestDelSize': str(t['big']),
+                                'medianIndelSize': '0', 'totalBases': str(t['L'])}
         return aw
     rows = list(csv.reader(open(fn)))
     hdr = rows[0]
@@ -71,7 +97,9 @@ def base_metrics(r):
     """Base-level (asmqc-fa) columns, AnchorWave names; empty when the run had no base level."""
     if 'numSNPs' not in r or (r.get('percentRefAligned') in (None, '', '0.000000')):
         return {}
+    L = float(r['ref_len'])
     return {'snps': int(r['numSNPs']), 'indels': int(r['numIndels']), 'aligned': round(float(r['percentRefAligned']), 4),
+            'identity': round(float(r['percentRefAligned']) - int(r['numSNPs']) / L, 4) if L else 0,
             'deleted': round(float(r['percentRefDeleted']), 4), 'bp_ins_mb': mb(r['numBasesInserted']),
             'bp_del_mb': mb(r['numBasesDeleted']), 'median_indel': int(r['medianIndelSize']), 'largest_indel_mb': mb(r['largestIndel'])}
 
