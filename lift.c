@@ -30,13 +30,6 @@
 #include "kthread.h"
 #include "lift.h"
 
-typedef struct {          // one liftover point (flat build array + per-seq arrays)
-	int64_t cpos;         // assembly forward-strand start
-	int64_t rpos;         // reference forward-strand start
-	int32_t csid;         // assembly sequence index (in [0,n_seq))
-	int32_t rsid;         // reference sequence index
-} rb3_liftpt_t;
-
 struct rb3_lift_s {
 	int64_t n_seq;        // number of sequences (assembly keys)
 	int64_t *off;         // off[sid]..off[sid+1] is the point range for assembly sid
@@ -208,6 +201,13 @@ rb3_lift_t *rb3_lift_restore(const char *fn)
 }
 
 int64_t rb3_lift_n_seq(const rb3_lift_t *lf) { return lf ? lf->n_seq : 0; }
+
+const rb3_liftpt_t *rb3_lift_seq_points(const rb3_lift_t *lf, int64_t csid, int64_t *n)
+{
+	if (lf == 0 || csid < 0 || csid >= lf->n_seq) { *n = 0; return 0; }
+	*n = lf->off[csid + 1] - lf->off[csid];
+	return lf->pt + lf->off[csid];
+}
 
 /* ---- project ----------------------------------------------------------- */
 

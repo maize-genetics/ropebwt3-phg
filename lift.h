@@ -7,9 +7,20 @@
 // `ropebwt3 lift`, consulted by `refmap --lift`. See lift.c for the method.
 typedef struct rb3_lift_s rb3_lift_t;
 
+typedef struct {          // one liftover point (flat build array + per-seq arrays)
+	int64_t cpos;         // assembly forward-strand start
+	int64_t rpos;         // reference forward-strand start
+	int32_t csid;         // assembly sequence index (in [0,n_seq))
+	int32_t rsid;         // reference sequence index
+} rb3_liftpt_t;
+
 rb3_lift_t *rb3_lift_restore(const char *fn);
 void rb3_lift_destroy(rb3_lift_t *lf);
 int64_t rb3_lift_n_seq(const rb3_lift_t *lf);
+
+// Read-only view of the liftover points of assembly sequence csid, sorted by cpos.
+// Sets *n to the count; returns NULL (and *n=0) for an out-of-range csid.
+const rb3_liftpt_t *rb3_lift_seq_points(const rb3_lift_t *lf, int64_t csid, int64_t *n);
 
 // Project a assembly hit (csid, cpos) to a reference coordinate. Returns 1 and
 // sets *out_rsid,*out_rpos on success; 0 (NULL) when not confidently collinear.
