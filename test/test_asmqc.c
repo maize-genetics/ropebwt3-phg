@@ -291,6 +291,8 @@ static void test_names_and_intervals(void)
 	CHECK(qc_same_chrom("chr01", "chr1") && qc_same_chrom("Chr1", "chr1") && qc_same_chrom("chr10", "CHR10"), "qc_same_chrom: case and leading zeros ignored");
 	CHECK(!qc_same_chrom("chr1", "chr10") && !qc_same_chrom("chr1", "scaf_1"), "qc_same_chrom: chr1 != chr10, chr != scaffold");
 	CHECK(qc_is_chr("chr5") && qc_is_chr("Chr5") && !qc_is_chr("scaf_31") && !qc_is_chr("Pt"), "qc_is_chr");
+	CHECK(qc_is_chr("10") && qc_is_chr("1") && !qc_is_chr("100") && !qc_is_chr("1a") && qc_same_chrom("10", "chr10") && !qc_same_chrom("1", "chr10"),
+		  "qc_is_chr / qc_same_chrom: bare chromosome numbers (\"1\".. \"10\") are chromosomes");
 	CHECK(!strcmp(qc_suffix("Oh43_chr10"), "chr10") && !strcmp(qc_suffix("GEMS-0219_scaf_3"), "scaf_3"), "qc_suffix: label after the first '_'");
 	{
 		char *a = qf_taxon_from_path("/x/y/Oh7B_renamed.fa"), *b2 = qf_taxon_from_path("B73.fa.gz"), *c = qf_taxon_from_path("GEMS_0219.fasta");

@@ -689,7 +689,12 @@ static const char *qc_suffix(const char *name) // part after the first '_' (the 
 	return p? p + 1 : name;
 }
 
-static int qc_is_chr(const char *lab) { return strncasecmp(lab, "chr", 3) == 0; }
+// a chromosome label: "chr..." (any case), or a bare 1-2 digit number as some assemblies use ("1".."10")
+static int qc_is_chr(const char *lab)
+{
+	if (strncasecmp(lab, "chr", 3) == 0) return 1;
+	return lab[0] >= '0' && lab[0] <= '9' && (lab[1] == 0 || (lab[1] >= '0' && lab[1] <= '9' && lab[2] == 0));
+}
 
 // same chromosome label, ignoring a case-insensitive "chr" prefix and leading zeros ("chr01" == "chr1" == "Chr1")
 static int qc_same_chrom(const char *a, const char *b)
