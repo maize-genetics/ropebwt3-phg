@@ -699,8 +699,8 @@ static int qc_is_chr(const char *lab)
 // same chromosome label, ignoring a case-insensitive "chr" prefix and leading zeros ("chr01" == "chr1" == "Chr1")
 static int qc_same_chrom(const char *a, const char *b)
 {
-	if (qc_is_chr(a)) a += 3;
-	if (qc_is_chr(b)) b += 3;
+	if (strncasecmp(a, "chr", 3) == 0) a += 3; // strip a literal "chr" only (bare numbers count as chromosomes too)
+	if (strncasecmp(b, "chr", 3) == 0) b += 3;
 	while (*a == '0' && a[1] != 0) ++a;
 	while (*b == '0' && b[1] != 0) ++b;
 	return strcasecmp(a, b) == 0;
